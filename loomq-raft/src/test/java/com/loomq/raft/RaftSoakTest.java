@@ -102,7 +102,7 @@ class RaftSoakTest {
         // Commit and apply all
         long lastIndex = indices.get(indices.size() - 1);
         node.getReplication().advanceCommitIndex(
-            new long[]{lastIndex}, node.getElection().currentTerm());
+            new long[]{lastIndex}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         // Verify commit index advanced to last proposed
@@ -145,7 +145,7 @@ class RaftSoakTest {
             lastIdx1 = node.propose(encoded);
         }
         node.getReplication().advanceCommitIndex(
-            new long[]{lastIdx1}, node.getElection().currentTerm());
+            new long[]{lastIdx1}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         long lastApplied = node.getReplication().lastApplied();
@@ -169,7 +169,7 @@ class RaftSoakTest {
             assertTrue(lastIdx2 > lastIdx1, "post-compact index should be > pre-compact");
         }
         node.getReplication().advanceCommitIndex(
-            new long[]{lastIdx2}, node.getElection().currentTerm());
+            new long[]{lastIdx2}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         // Phase 4: Verify ALL intents in store
@@ -248,7 +248,7 @@ class RaftSoakTest {
         // Commit and apply all
         long maxIndex = allIndices.stream().mapToLong(Long::longValue).max().orElse(0);
         node.getReplication().advanceCommitIndex(
-            new long[]{maxIndex}, node.getElection().currentTerm());
+            new long[]{maxIndex}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         // Verify all intents in store
@@ -297,7 +297,7 @@ class RaftSoakTest {
         }
 
         node.getReplication().advanceCommitIndex(
-            new long[]{lastIndex}, node.getElection().currentTerm());
+            new long[]{lastIndex}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         // Verify all committed intents are in store

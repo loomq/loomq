@@ -52,20 +52,28 @@ public final class RaftWriteCoordinator implements WriteCoordinator {
     private final long acquireTimeoutMs;
     private final long writeTimeoutMs;
     private final long requestCacheTtlMs;
+    private final ReplicationMode replicationMode;
     private long pendingWrites;
 
     public RaftWriteCoordinator(RaftNode raftNode, IntentStore store) {
-        this(raftNode, store, DEFAULT_MAX_PENDING_WRITES, DEFAULT_BACKPRESSURE_TIMEOUT_MS, DEFAULT_WRITE_TIMEOUT_MS);
+        this(raftNode, store, DEFAULT_MAX_PENDING_WRITES, DEFAULT_BACKPRESSURE_TIMEOUT_MS,
+            DEFAULT_WRITE_TIMEOUT_MS, ReplicationMode.SYNC);
     }
 
     public RaftWriteCoordinator(RaftNode raftNode, IntentStore store, int maxPendingWrites,
                                 long acquireTimeoutMs, long writeTimeoutMs) {
+        this(raftNode, store, maxPendingWrites, acquireTimeoutMs, writeTimeoutMs, ReplicationMode.SYNC);
+    }
+
+    public RaftWriteCoordinator(RaftNode raftNode, IntentStore store, int maxPendingWrites,
+                                long acquireTimeoutMs, long writeTimeoutMs, ReplicationMode replicationMode) {
         this.raftNode = Objects.requireNonNull(raftNode, "raftNode");
         this.store = Objects.requireNonNull(store, "store");
         this.writePermits = new Semaphore(Math.max(1, maxPendingWrites));
         this.acquireTimeoutMs = Math.max(1L, acquireTimeoutMs);
         this.writeTimeoutMs = Math.max(1_000L, writeTimeoutMs);
         this.requestCacheTtlMs = DEFAULT_REQUEST_CACHE_TTL_MS;
+        this.replicationMode = replicationMode != null ? replicationMode : ReplicationMode.SYNC;
     }
 
     @Override
@@ -200,12 +208,19 @@ public final class RaftWriteCoordinator implements WriteCoordinator {
             }
 
             Intent snapshot = snapshotSupplier.get();
-            long index = raftNode.propose(IntentBinaryCodec.encode(snapshot));
-            boolean applied = raftNode.getReplication().awaitApplied(index, writeTimeoutMs);
-            if (!applied) {
-                metrics.incrementRaftWriteTimeouts();
-                throw new RaftWriteUnavailableException(operation, intentId,
-                    "Timed out waiting for Raft commit application");
+            long index;
+            if (replicationMode == ReplicationMode.ASYNC) {
+                // ASYNC: 立即提交到本地 WAL 并应用，后台异步复制
+                index = raftNode.proposeAsync(IntentBinaryCodec.encode(snapshot));
+            } else {
+                // SYNC: 写入本地 WAL，等待 quorum 确认后应用
+                index = raftNode.propose(IntentBinaryCodec.encode(snapshot));
+                boolean applied = raftNode.getReplication().awaitApplied(index, writeTimeoutMs);
+                if (!applied) {
+                    metrics.incrementRaftWriteTimeouts();
+                    throw new RaftWriteUnavailableException(operation, intentId,
+                        "Timed out waiting for Raft commit application");
+                }
             }
 
             if (!raftNode.isLeader()) {
@@ -252,7 +267,7 @@ public final class RaftWriteCoordinator implements WriteCoordinator {
             }
             updatePendingWrites(-1);
             // Cleanup stale intent locks (unlocked, no waiters)
-            if (needIntentLock && intentLock != null && !intentLock.isLocked() && !intentLock.hasQueuedThreads()) {
+            if (needIntentLock && intentLock != null && intentLock.getHoldCount() == 0) {
                 intentLocks.remove(intentId, intentLock);
             }
         }

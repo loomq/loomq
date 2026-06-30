@@ -8,9 +8,9 @@ import com.loomq.config.ServerConfig;
 import com.loomq.http.netty.IntentHandler;
 import com.loomq.http.netty.NettyHttpServer;
 import com.loomq.http.netty.RadixRouter;
+import com.loomq.raft.GrpcRaftTransport;
 import com.loomq.raft.RaftConfig;
 import com.loomq.raft.RaftNode;
-import com.loomq.raft.RaftTransport;
 import com.loomq.raft.RaftWriteCoordinator;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.RaftStatusProvider;
@@ -46,8 +46,9 @@ class RaftServerSmokeTest {
             .build();
 
         int raftPort = allocatePort();
-        RaftTransport transport = new RaftTransport("raft-smoke-node");
-        transport.listen("127.0.0.1", raftPort);
+        GrpcRaftTransport transport = new GrpcRaftTransport("raft-smoke-node");
+        transport.setListenAddress("127.0.0.1", raftPort);
+        transport.start();
         RaftNode raftNode = new RaftNode(
             new RaftConfig("raft-smoke-node", List.of(), walDir.toString(), 50, 100, 50),
             engine.getWalAccessor(),

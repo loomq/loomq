@@ -87,46 +87,76 @@ public class LoomqServerApplication {
             engine.registerObserver(globalObserver);
         }
 
-        // ---- Raft 共识模式（v0.9.2）----
+        // ---- 共识模式 ----
         final com.loomq.raft.RaftNode raftNode;
         final RaftRuntimeListener raftRuntimeListener;
         final WriteCoordinator writeCoordinator;
-        boolean raftEnabled = Boolean.parseBoolean(
-            resolveSetting("LOOMQ_RAFT_ENABLED", "loomq.raft.enabled", "false"));
-        if (raftEnabled) {
+        String mode = resolveSetting("LOOMQ_MODE", "loomq.mode", "standalone");
+
+        if ("distributed".equalsIgnoreCase(mode)) {
+            // ---- K8s Lease 选主 + 日志复制 ----
             engine.getScheduler().pause();
-            String raftNodeId = resolveSetting("LOOMQ_RAFT_NODE_ID", "loomq.raft.nodeId", nodeId);
-            String peersStr = resolveSetting("LOOMQ_RAFT_PEERS", "loomq.raft.peers", raftNodeId);
-            List<String> peers = parseRaftPeerIds(peersStr, raftNodeId);
-            List<RaftPeerTarget> peerTargets = parseRaftPeerTargets(peersStr, raftNodeId);
+            raftRuntimeListener = new RaftRuntimeBridge(engine);
+
+            String podName = resolveSetting("POD_NAME", "loomq.kubernetes.podName", nodeId);
+            String namespace = resolveSetting("LOOMQ_K8S_NAMESPACE", "loomq.kubernetes.lease.namespace", "default");
+            String leaseName = resolveSetting("LOOMQ_K8S_LEASE_NAME", "loomq.kubernetes.lease.leaseName", "loomq-leader");
+            int leaseDuration = Integer.parseInt(
+                resolveSetting("LOOMQ_K8S_LEASE_DURATION", "loomq.kubernetes.lease.durationSeconds", "10"));
+            int renewInterval = Integer.parseInt(
+                resolveSetting("LOOMQ_K8S_LEASE_RENEW_INTERVAL", "loomq.kubernetes.lease.renewIntervalSeconds", "3"));
+
+            com.loomq.raft.K8sLeaseConfig k8sConfig = new com.loomq.raft.K8sLeaseConfig(
+                leaseDuration, renewInterval, namespace, leaseName, podName);
+            com.loomq.raft.K8sLeaseElection k8sElection = new com.loomq.raft.K8sLeaseElection(
+                k8sConfig, engine.getWalAccessor());
+
+            // Raft node for log replication (no Raft election — K8s handles that)
+            String peersStr = resolveSetting("LOOMQ_PEERS", "loomq.peers", podName);
+            List<String> peers = parseRaftPeerIds(peersStr, podName);
             int raftPort = Integer.parseInt(
                 resolveSetting("LOOMQ_RAFT_PORT", "loomq.raft.port", "9928"));
 
-            validateRaftStartupConfig(raftNodeId, peers, peerTargets, raftPort, serverConfig);
-
-            raftRuntimeListener = new RaftRuntimeBridge(engine);
             com.loomq.raft.RaftConfig raftConfig = new com.loomq.raft.RaftConfig(
-                raftNodeId, peers, dataDir, 150, 300, 50);
-
-            com.loomq.raft.RaftTransport raftTransport = new com.loomq.raft.RaftTransport(raftNodeId);
-            raftTransport.listen("0.0.0.0", raftPort);
+                podName, peers, dataDir, 150, 300, 50);
+            com.loomq.raft.GrpcRaftTransport raftTransport = new com.loomq.raft.GrpcRaftTransport(podName);
+            raftTransport.setListenAddress("0.0.0.0", raftPort);
+            try {
+                raftTransport.start();
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to start Raft gRPC transport", e);
+            }
 
             raftNode = new com.loomq.raft.RaftNode(raftConfig,
-                engine.getWalAccessor(), engine.getIntentStoreInternal(), raftTransport, raftRuntimeListener);
-            if (peerTargets.isEmpty() && peers.size() > 1) {
-                logger.warn("Raft peers were configured without connectable endpoints; use peerId@host:port to enable peer connections");
-            }
-            connectRaftPeers(raftTransport, peerTargets, raftNodeId);
+                engine.getWalAccessor(), engine.getIntentStoreInternal(),
+                raftTransport, raftRuntimeListener, k8sElection);
+
+            List<RaftPeerTarget> peerTargets = parseRaftPeerTargets(peersStr, podName);
+            connectRaftPeers(raftTransport, peerTargets, podName);
+
+            String replicationModeStr = resolveSetting("LOOMQ_REPLICATION_MODE", "loomq.replication.mode", "ASYNC");
+            com.loomq.raft.ReplicationMode replicationMode = "SYNC".equalsIgnoreCase(replicationModeStr)
+                ? com.loomq.raft.ReplicationMode.SYNC : com.loomq.raft.ReplicationMode.ASYNC;
+
             writeCoordinator = new RaftWriteCoordinator(
                 raftNode,
                 engine.getIntentStoreInternal(),
                 serverConfig.maxConcurrentBusinessRequests(),
                 serverConfig.httpSemaphoreTimeoutMs(),
-                5_000L
+                5_000L,
+                replicationMode
             );
-            logger.info("Raft mode enabled: node={}, peers={}, connectablePeers={}",
-                raftNodeId, peers, peerTargets.size());
+            logger.info("Distributed mode (K8s Lease): pod={}, namespace={}, lease={}, peers={}, replicationMode={}",
+                podName, namespace, leaseName, peers, replicationMode);
+
+        } else if (Boolean.parseBoolean(
+                resolveSetting("LOOMQ_RAFT_ENABLED", "loomq.raft.enabled", "false"))) {
+            throw new IllegalStateException(
+                "loomq.raft.enabled=true is no longer supported. "
+                + "Use loomq.mode=distributed with K8s Lease for multi-node deployment. "
+                + "See migration guide: docs/superpowers/specs/2026-06-03-raft-code-review-fixes-design.md");
         } else {
+            // ---- 单机模式 ----
             raftNode = null;
             raftRuntimeListener = null;
             writeCoordinator = new DirectWriteCoordinator(
@@ -477,36 +507,6 @@ public class LoomqServerApplication {
         }
     }
 
-    static void validateRaftStartupConfig(String raftNodeId, List<String> peers,
-                                          List<RaftPeerTarget> peerTargets, int raftPort,
-                                          ServerConfig serverConfig) {
-        if (raftNodeId == null || raftNodeId.isBlank()) {
-            throw new IllegalStateException("Raft node id cannot be blank");
-        }
-        if (peers == null || peers.isEmpty()) {
-            throw new IllegalStateException("Raft peers cannot be empty");
-        }
-        if (!peers.contains(raftNodeId)) {
-            throw new IllegalStateException("Raft peer list must include the local node id: " + raftNodeId);
-        }
-        if (peers.size() > 1 && peerTargets.isEmpty()) {
-            throw new IllegalStateException(
-                "Raft cluster mode requires connectable peer endpoints; use peerId@host:port or peerId=host:port");
-        }
-        if (peerTargets.size() != Math.max(0, peers.size() - 1)) {
-            throw new IllegalStateException(
-                "Raft peer endpoints must cover every remote peer exactly once");
-        }
-        if (raftPort <= 0 || raftPort > 65535) {
-            throw new IllegalStateException("Raft port must be in range [1, 65535]");
-        }
-        if (serverConfig.port() > 0 && serverConfig.port() == raftPort) {
-            throw new IllegalStateException("Raft port must differ from HTTP server port");
-        }
-        if (serverConfig.nettyPort() > 0 && serverConfig.nettyPort() == raftPort) {
-            throw new IllegalStateException("Raft port must differ from Netty port");
-        }
-    }
 
     private static void connectRaftPeers(com.loomq.raft.RaftTransport transport,
                                          List<RaftPeerTarget> targets,
@@ -692,7 +692,7 @@ public class LoomqServerApplication {
         ready.put("nodeId", status.nodeId());
         ready.put("role", status.role().name());
         ready.put("leaderId", status.leaderId());
-        ready.put("term", status.term());
+        ready.put("epoch", status.epoch());
         ready.put("commitIndex", status.commitIndex());
         ready.put("lastApplied", status.lastApplied());
         ready.put("commitLag", status.commitLag());
@@ -732,7 +732,7 @@ public class LoomqServerApplication {
         raft.put("nodeId", status.nodeId());
         raft.put("role", status.role().name());
         raft.put("leaderId", status.leaderId());
-        raft.put("term", status.term());
+        raft.put("epoch", status.epoch());
         raft.put("commitIndex", status.commitIndex());
         raft.put("lastApplied", status.lastApplied());
         raft.put("commitLag", status.commitLag());

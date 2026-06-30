@@ -19,7 +19,7 @@ import org.slf4j.LoggerFactory;
  * WAL 负责保存对应的物理偏移。
  *
  * 每条 Raft log entry 的 WAL 格式：
- * [term (8B，大端) | payload (N)]，整体作为 WAL payload 写入。
+ * [epoch (8B，大端) | payload (N)]，整体作为 WAL payload 写入。
  * WAL 帧头 + CRC 由 SimpleWalWriter 自动封装。
  */
 public class RaftLog {
@@ -29,15 +29,15 @@ public class RaftLog {
     private final WalAccessor wal;
     private final Map<Long, Long> startPositions = new HashMap<>();
     private final Map<Long, Integer> recordLengths = new HashMap<>();
-    private final Map<Long, Long> entryTerms = new HashMap<>();
+    private final Map<Long, Long> entryEpochs = new HashMap<>();
     private volatile long lastLogIndex;
-    private volatile long lastLogTerm;
+    private volatile long lastLogEpoch;
 
     public RaftLog(WalAccessor wal) {
         this.wal = wal;
         long snapshotIndex = wal != null ? wal.getSnapshotIndex() : 0;
         this.lastLogIndex = snapshotIndex;
-        this.lastLogTerm = wal != null ? wal.getSnapshotTerm() : 0;
+        this.lastLogEpoch = wal != null ? wal.getSnapshotEpoch() : 0;
         recoverFromWal();
     }
 
@@ -45,25 +45,25 @@ public class RaftLog {
     public long firstIndex() {
         return wal != null ? wal.getFirstLogIndex() : (lastLogIndex > 0 ? 1 : 0);
     }
-    public long lastTerm() { return lastLogTerm; }
+    public long lastEpoch() { return lastLogEpoch; }
     public long commitIndex() { return lastLogIndex; }
 
-    public boolean isUpToDate(long candidateLastIndex, long candidateLastTerm) {
-        long myLastTerm = lastTerm();
-        return candidateLastTerm > myLastTerm
-            || (candidateLastTerm == myLastTerm && candidateLastIndex >= lastIndex());
+    public boolean isUpToDate(long candidateLastIndex, long candidateLastEpoch) {
+        long myLastEpoch = lastEpoch();
+        return candidateLastEpoch > myLastEpoch
+            || (candidateLastEpoch == myLastEpoch && candidateLastIndex >= lastIndex());
     }
 
     /**
      * 追加一条 Raft log entry。
      *
-     * @param term 当前 term
+     * @param epoch 当前 epoch
      * @param data 业务 payload
      * @return Raft 逻辑 index（从 1 开始，包含快照后的后续条目）
      */
-    public synchronized long appendEntry(long term, byte[] data) {
+    public synchronized long appendEntry(long epoch, byte[] data) {
         byte[] framed = new byte[TERM_PREFIX_SIZE + data.length];
-        ByteBuffer.wrap(framed).putLong(term).put(data);
+        ByteBuffer.wrap(framed).putLong(epoch).put(data);
         long walEnd = wal.writeEntry(framed);
         long index = ++lastLogIndex;
         // Compute start position for future readRecord() calls
@@ -72,9 +72,9 @@ public class RaftLog {
         long startPos = walEnd - recordLen;
         startPositions.put(index, startPos);
         recordLengths.put(index, recordLen);
-        entryTerms.put(index, term);
-        lastLogTerm = term;
-        log.debug("Appended Raft entry at index={}, term={}, size={}", index, term, data.length);
+        entryEpochs.put(index, epoch);
+        lastLogEpoch = epoch;
+        log.debug("Appended Raft entry at index={}, epoch={}, size={}", index, epoch, data.length);
         return index;
     }
 
@@ -84,16 +84,16 @@ public class RaftLog {
         }
 
         long snapshotIndex = wal.getSnapshotIndex();
-        long snapshotTerm = wal.getSnapshotTerm();
+        long snapshotEpoch = wal.getSnapshotEpoch();
         long snapshotOffset = wal.getSnapshotOffset();
         List<WalAccessor.WalSegment> segments = wal.listSegments();
         if (segments == null || segments.isEmpty()) {
             lastLogIndex = snapshotIndex;
-            lastLogTerm = snapshotTerm;
+            lastLogEpoch = snapshotEpoch;
             return;
         }
 
-        long recoveredLastTerm = snapshotTerm;
+        long recoveredLastEpoch = snapshotEpoch;
         long recoveredLastIndex = snapshotIndex;
         long physicalCount = 0;
         boolean useSnapshotOffset = snapshotOffset > 0;
@@ -165,10 +165,10 @@ public class RaftLog {
                     startPositions.put(recoveredLastIndex, recordStart);
                     recordLengths.put(recoveredLastIndex, (int) recordLen);
                     if (payload.length >= TERM_PREFIX_SIZE) {
-                        recoveredLastTerm = ByteBuffer.wrap(payload, 0, TERM_PREFIX_SIZE).getLong();
-                        entryTerms.put(recoveredLastIndex, recoveredLastTerm);
+                        recoveredLastEpoch = ByteBuffer.wrap(payload, 0, TERM_PREFIX_SIZE).getLong();
+                        entryEpochs.put(recoveredLastIndex, recoveredLastEpoch);
                     } else {
-                        entryTerms.put(recoveredLastIndex, 0L);
+                        entryEpochs.put(recoveredLastIndex, 0L);
                     }
                     localPos += recordLen;
                 }
@@ -179,7 +179,7 @@ public class RaftLog {
         }
 
         lastLogIndex = recoveredLastIndex;
-        lastLogTerm = recoveredLastTerm;
+        lastLogEpoch = recoveredLastEpoch;
     }
 
     private long resolveSnapshotOffset(long snapshotIndex) {
@@ -205,21 +205,21 @@ public class RaftLog {
     }
 
     /**
-     * 读取指定 index 处 entry 的 term。
+     * 读取指定 index 处 entry 的 epoch。
      *
      * @param index log index
-     * @return term，读取失败返回 -1
+     * @return epoch，读取失败返回 -1
      */
-    public synchronized long readEntryTerm(long index) {
-        Long cachedTerm = entryTerms.get(index);
-        if (cachedTerm != null) {
-            return cachedTerm;
+    public synchronized long readEntryEpoch(long index) {
+        Long cachedEpoch = entryEpochs.get(index);
+        if (cachedEpoch != null) {
+            return cachedEpoch;
         }
         Long startPos = startPositions.get(index);
         Integer recordLen = recordLengths.get(index);
         if (startPos == null || recordLen == null) {
             if (wal != null && wal.getSnapshotIndex() > 0 && index == wal.getSnapshotIndex()) {
-                return wal.getSnapshotTerm();
+                return wal.getSnapshotEpoch();
             }
             return -1;
         }
@@ -227,18 +227,18 @@ public class RaftLog {
             byte[] framed = wal.readRecord(startPos, recordLen);
             return ByteBuffer.wrap(framed).getLong();
         } catch (IOException e) {
-            log.error("Failed to read entry term at index={}", index, e);
+            log.error("Failed to read entry epoch at index={}", index, e);
             return -1;
         }
     }
 
     /**
-     * 读取指定 index 处 entry 的完整 framed 数据（含 8 字节 term 前缀）。
+     * 读取指定 index 处 entry 的完整 framed 数据（含 8 字节 epoch 前缀）。
      *
-     * 用于 leader 复制日志条目到 follower 时保留原始 term 信息。
+     * 用于 leader 复制日志条目到 follower 时保留原始 epoch 信息。
      *
      * @param index log index
-     * @return 完整 framed 数据（term prefix + payload），读取失败返回 null
+     * @return 完整 framed 数据（epoch prefix + payload），读取失败返回 null
      */
     public synchronized byte[] readEntryRaw(long index) {
         Long startPos = startPositions.get(index);
@@ -253,7 +253,7 @@ public class RaftLog {
     }
 
     /**
-     * 读取指定 index 处 entry 的 payload（不含 term 前缀）。
+     * 读取指定 index 处 entry 的 payload（不含 epoch 前缀）。
      *
      * @param index log index
      * @return 业务 payload，读取失败返回 null
@@ -301,7 +301,7 @@ public class RaftLog {
             return; // nothing to truncate
         }
 
-        long lastValidTerm = 0;
+        long lastValidEpoch = 0;
         long snapshotIndex = wal != null ? wal.getSnapshotIndex() : 0;
         if (index < snapshotIndex) {
             log.warn("Ignoring truncateAfter({}) before snapshot index {}", index, snapshotIndex);
@@ -312,16 +312,16 @@ public class RaftLog {
         Integer recLen = recordLengths.get(index);
         long resetPos = 0;
         if (startPos != null && recLen != null) {
-            // Read the term of the entry being kept as the anchor
+            // Read the epoch of the entry being kept as the anchor
             try {
                 byte[] framed = wal.readRecord(startPos, recLen);
-                lastValidTerm = java.nio.ByteBuffer.wrap(framed).getLong();
+                lastValidEpoch = java.nio.ByteBuffer.wrap(framed).getLong();
                 resetPos = startPos + recLen;
             } catch (IOException e) {
-                log.warn("Could not read term at index {} during truncation", index, e);
+                log.warn("Could not read epoch at index {} during truncation", index, e);
             }
         } else if (index == snapshotIndex) {
-            lastValidTerm = wal.getSnapshotTerm();
+            lastValidEpoch = wal.getSnapshotEpoch();
             Long nextStart = startPositions.get(index + 1);
             if (nextStart != null) {
                 resetPos = nextStart;
@@ -341,15 +341,15 @@ public class RaftLog {
         // Remove all map entries with key > index
         startPositions.keySet().removeIf(k -> k > index);
         recordLengths.keySet().removeIf(k -> k > index);
-        entryTerms.keySet().removeIf(k -> k > index);
+        entryEpochs.keySet().removeIf(k -> k > index);
 
         // Rewind WAL to discard orphaned data past this index
         // (resetPos is the end position of the last valid record = start of next write)
         wal.resetTo(resetPos);
 
         lastLogIndex = index;
-        lastLogTerm = lastValidTerm;
-        log.debug("Truncated log after index={}, new lastTerm={}", index, lastValidTerm);
+        lastLogEpoch = lastValidEpoch;
+        log.debug("Truncated log after index={}, new lastEpoch={}", index, lastValidEpoch);
     }
 
     /**
@@ -363,18 +363,18 @@ public class RaftLog {
      * @return physical snapshot boundary offset
      */
     public synchronized long compactThrough(long snapshotIndex) {
-        long snapshotTerm = snapshotIndex > 0 ? readEntryTerm(snapshotIndex) : 0;
-        return compactThrough(snapshotIndex, snapshotTerm);
+        long snapshotEpoch = snapshotIndex > 0 ? readEntryEpoch(snapshotIndex) : 0;
+        return compactThrough(snapshotIndex, snapshotEpoch);
     }
 
     /**
-     * Compact the log through {@code snapshotIndex} using an explicit term.
+     * Compact the log through {@code snapshotIndex} using an explicit epoch.
      *
      * @param snapshotIndex last included index in the snapshot
-     * @param snapshotTerm  term of the last included entry
+     * @param snapshotEpoch  epoch of the last included entry
      * @return physical snapshot boundary offset
      */
-    public synchronized long compactThrough(long snapshotIndex, long snapshotTerm) {
+    public synchronized long compactThrough(long snapshotIndex, long snapshotEpoch) {
         if (wal == null) {
             return 0;
         }
@@ -386,26 +386,26 @@ public class RaftLog {
                 snapshotIndex, wal.getSnapshotIndex());
             return wal.getSnapshotOffset();
         }
-        if (snapshotTerm < 0) {
-            throw new IllegalStateException("Cannot compact snapshot index " + snapshotIndex + " without a valid term");
+        if (snapshotEpoch < 0) {
+            throw new IllegalStateException("Cannot compact snapshot index " + snapshotIndex + " without a valid epoch");
         }
 
         long snapshotOffset = resolveSnapshotOffset(snapshotIndex);
 
         startPositions.keySet().removeIf(k -> k <= snapshotIndex);
         recordLengths.keySet().removeIf(k -> k <= snapshotIndex);
-        entryTerms.keySet().removeIf(k -> k <= snapshotIndex);
+        entryEpochs.keySet().removeIf(k -> k <= snapshotIndex);
 
-        wal.setSnapshotMetadata(snapshotIndex, snapshotTerm, snapshotOffset);
+        wal.setSnapshotMetadata(snapshotIndex, snapshotEpoch, snapshotOffset);
         wal.truncateBefore(snapshotOffset);
 
         if (snapshotIndex >= lastLogIndex) {
             lastLogIndex = snapshotIndex;
-            lastLogTerm = snapshotTerm;
+            lastLogEpoch = snapshotEpoch;
         }
 
-        log.info("Compacted Raft log through index={} (term={}, offset={})",
-            snapshotIndex, snapshotTerm, snapshotOffset);
+        log.info("Compacted Raft log through index={} (epoch={}, offset={})",
+            snapshotIndex, snapshotEpoch, snapshotOffset);
         return snapshotOffset;
     }
 

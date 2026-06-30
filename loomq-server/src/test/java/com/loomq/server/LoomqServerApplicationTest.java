@@ -11,7 +11,6 @@ import com.loomq.config.ServerConfig;
 import com.loomq.http.netty.HttpErrorResponse;
 import com.loomq.metrics.LoomQMetrics;
 import com.loomq.spi.RaftStatusProvider;
-import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import org.junit.jupiter.api.Test;
@@ -54,28 +53,6 @@ class LoomqServerApplicationTest {
     void parseRaftPeerTargetsShouldRejectMissingEndpointForRemotePeer() {
         assertThrows(IllegalStateException.class,
             () -> LoomqServerApplication.parseRaftPeerTargets("node-1,node-2", "node-1"));
-    }
-
-    @Test
-    void validateRaftStartupConfigShouldRejectMissingSelfPeer() {
-        ServerConfig serverConfig = serverConfig(7928, 7929);
-        List<String> peers = List.of("node-2");
-        List<LoomqServerApplication.RaftPeerTarget> targets = List.of(
-            new LoomqServerApplication.RaftPeerTarget("node-2", "127.0.0.1", 9929));
-
-        assertThrows(IllegalStateException.class,
-            () -> LoomqServerApplication.validateRaftStartupConfig(
-                "node-1", peers, targets, 9928, serverConfig));
-    }
-
-    @Test
-    void validateRaftStartupConfigShouldRejectPortCollision() {
-        ServerConfig serverConfig = serverConfig(9928, 9928);
-        List<String> peers = List.of("node-1");
-
-        assertThrows(IllegalStateException.class,
-            () -> LoomqServerApplication.validateRaftStartupConfig(
-                "node-1", peers, List.of(), 9928, serverConfig));
     }
 
     @Test

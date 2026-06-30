@@ -16,7 +16,7 @@ public interface RaftRuntimeListener {
      * Called whenever the node's visible Raft role changes, including initial
      * startup.
      */
-    default void onRoleChanged(RaftRole role, long term) {}
+    default void onRoleChanged(RaftRole role, long epoch) {}
 
     /**
      * Called after a committed intent snapshot has been applied to the local store.

@@ -10,6 +10,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -153,6 +154,15 @@ public final class PlatformThreadIntentStore implements IntentStore {
     @Override
     public void shutdown() {
         platformExecutor.shutdown();
+        try {
+            if (!platformExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                platformExecutor.shutdownNow();
+                logger.warn("PlatformThreadIntentStore: executor did not terminate in 5s, forced shutdown");
+            }
+        } catch (InterruptedException e) {
+            platformExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
         delegate.shutdown();
     }
 }

@@ -47,11 +47,11 @@ public interface WalAccessor {
     }
 
     /**
-     * 快照覆盖到的最后一条 log entry term。
+     * 快照覆盖到的最后一条 log entry epoch。
      *
-     * @return 快照最后覆盖的 term；没有快照时返回 0
+     * @return 快照最后覆盖的 epoch；没有快照时返回 0
      */
-    default long getSnapshotTerm() {
+    default long getSnapshotEpoch() {
         return 0;
     }
 
@@ -69,20 +69,20 @@ public interface WalAccessor {
      * 持久化快照元数据。
      *
      * @param snapshotIndex 快照最后覆盖的 log index
-     * @param snapshotTerm  快照最后覆盖的 log term
+     * @param snapshotEpoch  快照最后覆盖的 log epoch
      */
-    default void setSnapshotMetadata(long snapshotIndex, long snapshotTerm) {
-        setSnapshotMetadata(snapshotIndex, snapshotTerm, getWritePosition());
+    default void setSnapshotMetadata(long snapshotIndex, long snapshotEpoch) {
+        setSnapshotMetadata(snapshotIndex, snapshotEpoch, getWritePosition());
     }
 
     /**
      * 持久化快照元数据（包含物理边界偏移）。
      *
      * @param snapshotIndex  快照最后覆盖的 log index
-     * @param snapshotTerm   快照最后覆盖的 log term
+     * @param snapshotEpoch   快照最后覆盖的 log epoch
      * @param snapshotOffset 快照最后覆盖后的物理 WAL 偏移
      */
-    default void setSnapshotMetadata(long snapshotIndex, long snapshotTerm, long snapshotOffset) {
+    default void setSnapshotMetadata(long snapshotIndex, long snapshotEpoch, long snapshotOffset) {
         // No-op for read-only implementations.
     }
 
@@ -113,23 +113,23 @@ public interface WalAccessor {
         return snapshotIndex > 0 ? snapshotIndex + 1 : 1;
     }
 
-    /** Raft 协议：最后一条 log entry 的 term */
-    long getLastLogTerm();
+    /** Raft 协议：最后一条 log entry 的 epoch */
+    long getLastLogEpoch();
 
     /**
-     * Raft 协议：最后一条实际写入的 log entry 的 term。
+     * Raft 协议：最后一条实际写入的 log entry 的 epoch。
      *
-     * 与 {@link #getLastLogTerm()} 不同，此方法返回最后一条已持久化 entry 的 term，
-     * 而非 Raft currentTerm。用于 §5.4.1 isUpToDate 判断。
+     * 与 {@link #getLastLogEpoch()} 不同，此方法返回最后一条已持久化 entry 的 epoch，
+     * 而非 Raft currentEpoch。用于 §5.4.1 isUpToDate 判断。
      *
-     * @return 最后一条 log entry 的 term（无 entry 时为 0）
+     * @return 最后一条 log entry 的 epoch（无 entry 时为 0）
      */
-    default long getLastLogEntryTerm() {
+    default long getLastLogEntryEpoch() {
         return 0;
     }
 
-    /** Raft 协议：记录当前 term（leader 选举时更新） */
-    void setCurrentTerm(long term);
+    /** Raft 协议：记录当前 epoch（leader 选举时更新） */
+    void setCurrentEpoch(long epoch);
 
     /** Raft 协议：读取 votedFor */
     String getVotedFor();
@@ -137,9 +137,9 @@ public interface WalAccessor {
     /** Raft 协议：记录 votedFor（选举时更新） */
     void setVotedFor(String nodeId);
 
-    /** Raft 协议：原子性设置 term 和 votedFor（默认分别调用 setCurrentTerm/setVotedFor） */
-    default void setTermAndVotedFor(long term, String votedFor) {
-        setCurrentTerm(term);
+    /** Raft 协议：原子性设置 epoch 和 votedFor（默认分别调用 setCurrentEpoch/setVotedFor） */
+    default void setEpochAndVotedFor(long epoch, String votedFor) {
+        setCurrentEpoch(epoch);
         setVotedFor(votedFor);
     }
 
@@ -171,9 +171,9 @@ public interface WalAccessor {
     }
 
     /**
-     * 同步持久化 Raft 元数据（currentTerm、votedFor）到磁盘。
+     * 同步持久化 Raft 元数据（currentEpoch、votedFor）到磁盘。
      *
-     * Raft §5.2 要求：节点在回复任何 RPC 之前，必须确保持久化 currentTerm 和 votedFor。
+     * Raft §5.2 要求：节点在回复任何 RPC 之前，必须确保持久化 currentEpoch 和 votedFor。
      * 调用此方法可以保证所有待写入的 Raft 元数据已落盘。
      *
      * 默认实现为空操作（只读访问器无需实现）。

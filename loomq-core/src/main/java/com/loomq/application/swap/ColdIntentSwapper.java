@@ -184,6 +184,9 @@ public final class ColdIntentSwapper implements AutoCloseable {
      * @return true 如果该 Intent 在冷索引中
      */
     public boolean isCold(String intentId) {
+        if (cancelledColdIds.contains(intentId)) {
+            return false;
+        }
         for (List<ColdIntentEntry> entries : coldIndex.values()) {
             for (ColdIntentEntry entry : entries) {
                 if (entry.intentId().equals(intentId)) {

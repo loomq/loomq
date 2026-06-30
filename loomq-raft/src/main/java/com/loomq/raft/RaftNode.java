@@ -15,7 +15,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -28,7 +27,6 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
     private static final Logger log = LoggerFactory.getLogger(RaftNode.class);
     private static final LoomQMetrics metrics = LoomQMetrics.getInstance();
     private static final int MAX_ENTRIES_PER_APPEND = 1000;
-    private static final int SNAPSHOT_CHUNK_SIZE = 256 * 1024; // 256KB per chunk
     private final String nodeId;
     private final WalAccessor wal;
     private final IntentStore store;
@@ -41,11 +39,10 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
     private final ScheduledExecutorService heartbeatTimer;
     private final long heartbeatMs;
     private final long readLeaseMs;
+    private final long shutdownTimeoutMs;
     private final ConcurrentMap<String, PeerReplicationState> peerStates;
     private ScheduledFuture<?> heartbeatTask;
     private volatile long readLeaseUntilMs = 0L;
-    /** Chunk reassembly buffer for incoming InstallSnapshot chunks. */
-    private final ConcurrentMap<String, ChunkReassembly> pendingChunks = new ConcurrentHashMap<>();
     /**
      * Leader generation counter — incremented each time this node becomes leader.
      * Heartbeat callbacks check this against their captured generation to discard
@@ -54,11 +51,21 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
     private volatile long leaderGeneration = 0;
 
     public RaftNode(RaftConfig config, WalAccessor wal, IntentStore store, RaftTransport transport) {
-        this(config, wal, store, transport, null);
+        this(config, wal, store, transport, null, new StandaloneElection(wal, config.nodeId()));
     }
 
     public RaftNode(RaftConfig config, WalAccessor wal, IntentStore store, RaftTransport transport,
                     RaftRuntimeListener runtimeListener) {
+        this(config, wal, store, transport, runtimeListener, new StandaloneElection(wal, config.nodeId()));
+    }
+
+    /**
+     * 创建 RaftNode，使用外部提供的 LeaderElection 实现。
+     *
+     * <p>externalElection 不能为 null，必须显式传入（K8sLeaseElection 或 StandaloneElection）。
+     */
+    public RaftNode(RaftConfig config, WalAccessor wal, IntentStore store, RaftTransport transport,
+                    RaftRuntimeListener runtimeListener, LeaderElection externalElection) {
         this.nodeId = config.nodeId();
         this.wal = wal;
         this.store = store;
@@ -67,6 +74,7 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
         this.peers = config.peers();
         this.heartbeatMs = config.heartbeatMs();
         this.readLeaseMs = computeReadLeaseMs(config.electionMinMs(), config.heartbeatMs());
+        this.shutdownTimeoutMs = config.shutdownTimeoutMs();
         this.peerStates = new ConcurrentHashMap<>();
         for (String peerId : peers) {
             if (!peerId.equals(nodeId)) {
@@ -74,8 +82,10 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
             }
         }
         this.raftLog = new RaftLog(wal);
-        this.election = new LeaderElection(nodeId, wal, config.peers(),
-            config.electionMinMs(), config.electionMaxMs());
+        if (externalElection == null) {
+            throw new IllegalArgumentException("externalElection is required (K8sLeaseElection or StandaloneElection)");
+        }
+        this.election = externalElection;
         this.replication = new LogReplication(nodeId, wal, raftLog, store, election, runtimeListener);
         this.heartbeatTimer = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "raft-heartbeat-" + nodeId);
@@ -85,37 +95,30 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
 
         // Server-side RPC handlers (transport may be null for single-node/no-network tests)
         if (transport != null) {
-            transport.setOnRequestVote(msg -> {
-                boolean granted = election.handleRequestVote(msg.term(), msg.candidateId(),
-                    msg.lastLogIndex(), msg.lastLogTerm());
+            transport.setOnAppendEntries(request -> {
+                AppendEntriesResult result = replication.handleAppendEntries(
+                    request.epoch(), request.leaderId(),
+                    request.prevLogIndex(), request.prevLogEpoch(),
+                    request.entries().toArray(new byte[0][]),
+                    request.leaderCommit());
                 syncRaftMetrics();
-                return granted;
+                return new RaftTransport.AppendEntriesResponse(
+                    result.epoch, result.success, result.matchIndex, result.conflictIndex);
             });
 
-            transport.setOnAppendEntries(msg -> {
-                AppendEntriesResult result = replication.handleAppendEntries(msg.term(), msg.leaderId(),
-                    msg.prevLogIndex(), msg.prevLogTerm(), msg.entries(), msg.leaderCommit());
+            transport.setOnInstallSnapshot(request -> {
+                // Transport layer handles chunk reassembly — only complete snapshots arrive here
+                Long appliedIndex = handleInstallSnapshot(request);
                 syncRaftMetrics();
-                return result;
+                return new RaftTransport.InstallSnapshotResponse(
+                    request.epoch(), appliedIndex != null ? appliedIndex : -1);
             });
-
-            transport.setOnInstallSnapshot(msg -> {
-                Long appliedIndex = handleInstallSnapshot(msg);
-                syncRaftMetrics();
-                return appliedIndex;
-            });
-
-            transport.setOnInstallSnapshotChunk(msg -> {
-                Long appliedIndex = handleInstallSnapshotChunk(msg);
-                syncRaftMetrics();
-                return appliedIndex;
-            });
+            transport.setCurrentEpochSupplier(election::currentEpoch);
         }
 
         // Election lifecycle callbacks
-        election.setOnElectionStarted(this::onElectionStarted);
-        election.setOnBecomeLeader(this::onBecomeLeader);
-        election.setOnBecomeFollower(this::onBecomeFollower);
+        election.addBecomeLeaderListener(this::onBecomeLeader);
+        election.addBecomeFollowerListener(this::onBecomeFollower);
     }
 
     public void start() {
@@ -124,30 +127,82 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
         if (runtimeListener != null && role() == RaftRole.FOLLOWER) {
             notifyRuntimeRole();
         }
-        log.info("RaftNode started: node={}, term={}, logIndex={}",
-            nodeId, election.currentTerm(), raftLog.lastIndex());
+        log.info("RaftNode started: node={}, epoch={}, logIndex={}",
+            nodeId, election.currentEpoch(), raftLog.lastIndex());
     }
 
     @Override
     public void close() {
-        stopHeartbeat();
-        heartbeatTimer.shutdown();
-        election.stop();
-        replication.failPendingWaiters(new IllegalStateException("Raft node closed"));
-        notifyRuntimeRole(RaftRole.FOLLOWER);
-        metrics.updateRaftRole("OFFLINE");
-        metrics.updateRaftLeaderId(null);
-        metrics.updateRaftReplicationLag(0);
-        metrics.updateRaftConnectedPeers(0);
-        metrics.updateRaftTotalPeers(0);
-        if (transport != null) {
-            transport.close();
+        try {
+            stopHeartbeat();
+            if (isLeader() && !peerStates.isEmpty() && shutdownTimeoutMs > 0) {
+                gracefulShutdown();
+            }
+        } catch (Exception e) {
+            log.error("Error during graceful shutdown", e);
+        } finally {
+            heartbeatTimer.shutdown();
+            election.stop();
+            replication.failPendingWaiters(new IllegalStateException("Raft node closed"));
+            notifyRuntimeRole(RaftRole.FOLLOWER);
+            metrics.updateRaftRole("OFFLINE");
+            metrics.updateRaftLeaderId(null);
+            metrics.updateRaftReplicationLag(0);
+            metrics.updateRaftConnectedPeers(0);
+            metrics.updateRaftTotalPeers(0);
+            if (transport != null) {
+                try {
+                    transport.close();
+                } catch (Exception e) {
+                    log.error("Error closing transport", e);
+                }
+            }
+            log.info("RaftNode closed: node={}", nodeId);
         }
-        log.info("RaftNode closed: node={}", nodeId);
+    }
+
+    /**
+     * 优雅关机：等待异步复制完成。
+     *
+     * <p>收到 SIGTERM 后，Leader 执行以下步骤：
+     * <ol>
+     *   <li>停止接收新的写入请求（election.stop() 后 isLeader() 返回 false）</li>
+     *   <li>持续复制积压日志到 Followers</li>
+     *   <li>等待 commitIndex 追上 lastLogIndex（最长 shutdownTimeoutMs）</li>
+     *   <li>超时后强制关闭</li>
+     * </ol>
+     */
+    private void gracefulShutdown() {
+        log.info("Graceful shutdown: waiting for async replication (max {}ms)", shutdownTimeoutMs);
+        long deadline = System.currentTimeMillis() + shutdownTimeoutMs;
+        long lastLogIdx = raftLog.lastIndex();
+        long commitIdx = replication.commitIndex();
+
+        // 先做一次心跳，触发复制
+        sendHeartbeats();
+
+        while (System.currentTimeMillis() < deadline && commitIdx < lastLogIdx && isLeader()) {
+            try {
+                Thread.sleep(100);
+                sendHeartbeats();
+                commitIdx = replication.commitIndex();
+                lastLogIdx = raftLog.lastIndex();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        if (commitIdx >= lastLogIdx) {
+            log.info("Graceful shutdown: all entries replicated (commitIndex={})", commitIdx);
+        } else {
+            log.warn("Graceful shutdown: timeout, {} entries may not be replicated (commitIndex={}, lastLogIndex={})",
+                lastLogIdx - commitIdx, commitIdx, lastLogIdx);
+        }
     }
 
     public RaftRole role() { return election.role(); }
-    public boolean isLeader() { return role() == RaftRole.LEADER; }
+    public boolean isLeader() { return election.isLeader(); }
     public LeaderElection getElection() { return election; }
     public LogReplication getReplication() { return replication; }
     public WalAccessor getWal() { return wal; }
@@ -179,16 +234,40 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
         if (!isLeader()) {
             throw new IllegalStateException("Raft proposals must be issued by the leader");
         }
-        long index = raftLog.appendEntry(election.currentTerm(), entry);
+        long epoch = election.currentEpoch(); // capture once
+        long index = raftLog.appendEntry(epoch, entry);
         if (peerStates.isEmpty()) {
             // Single-node: commit and apply immediately
-            replication.advanceCommitIndex(new long[]{index}, election.currentTerm());
+            replication.advanceCommitIndex(new long[]{index}, epoch);
             replication.applyCommitted();
         } else {
             // Multi-node: trigger immediate replication instead of waiting for next heartbeat tick
             triggerImmediateReplication();
         }
         log.debug("Proposed entry at index {}", index);
+        return index;
+    }
+
+    /**
+     * 异步模式：Leader 提交 entry 到本地 WAL 并立即提交应用。
+     *
+     * <p>不等待多数节点确认，直接将 commitIndex 推进到此 index。
+     * 用于 ASYNC 复制模式，写入延迟最低，但 Leader 崩溃可能丢失未复制的数据。
+     */
+    public long proposeAsync(byte[] entry) {
+        if (!isLeader()) {
+            throw new IllegalStateException("Raft proposals must be issued by the leader");
+        }
+        long epoch = election.currentEpoch(); // capture once
+        long index = raftLog.appendEntry(epoch, entry);
+        // 立即推进 commitIndex 并应用（不等待 quorum）
+        replication.advanceCommitIndex(new long[]{index}, epoch);
+        replication.applyCommitted();
+        // 后台异步复制到 Followers
+        if (!peerStates.isEmpty()) {
+            triggerImmediateReplication();
+        }
+        log.debug("Async proposed entry at index {}", index);
         return index;
     }
 
@@ -216,8 +295,6 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
      * Leader: 发送快照给落后过多的 follower。
      * 当 follower 的 nextIndex 低于 WAL 最早可用 index 时（段文件已截断），
      * 必须用快照替代 AppendEntries 来同步。
-     *
-     * 对于大快照（>256KB），使用分块传输避免单次 RPC 内存爆炸。
      */
     public void sendInstallSnapshot(String peerId) {
         PeerReplicationState ps = peerStates.get(peerId);
@@ -225,65 +302,40 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
             return;
         }
 
-        long term = election.currentTerm();
+        long epoch = election.currentEpoch();
         long snapshotIndex = replication.lastApplied();
-        long snapshotTerm = snapshotIndex > 0 ? raftLog.readEntryTerm(snapshotIndex) : 0;
+        long snapshotEpoch = snapshotIndex > 0 ? raftLog.readEntryEpoch(snapshotIndex) : 0;
         long requestGeneration = ++ps.requestGeneration;
 
-        // Encode current store state as snapshot payload
         byte[] snapshotData = encodeStoreSnapshot();
-        raftLog.compactThrough(snapshotIndex, snapshotTerm);
+        if (snapshotData.length == 0) {
+            log.error("Failed to encode snapshot for peer {}, skipping", peerId);
+            return;
+        }
+        log.info("Sending snapshot to {}: {} bytes (index={})", peerId, snapshotData.length, snapshotIndex);
 
-        if (snapshotData.length <= SNAPSHOT_CHUNK_SIZE) {
-            // Small snapshot: single RPC (original behavior)
-            transport.sendInstallSnapshot(peerId, term, nodeId, snapshotIndex, snapshotTerm, snapshotData)
-                .thenAccept(newIndex -> {
-                    if (requestGeneration != ps.requestGeneration) return;
-                    if (newIndex >= 0) {
-                        ps.nextIndex = newIndex + 1;
-                        ps.matchIndex = newIndex;
-                        log.info("InstallSnapshot accepted by {} (index={})", peerId, newIndex);
-                    } else {
-                        log.warn("InstallSnapshot rejected by {}", peerId);
-                    }
-                });
-        } else {
-            // Large snapshot: chunked transfer
-            int totalChunks = (snapshotData.length + SNAPSHOT_CHUNK_SIZE - 1) / SNAPSHOT_CHUNK_SIZE;
-            log.info("Sending chunked snapshot to {}: {} bytes in {} chunks", peerId, snapshotData.length, totalChunks);
-
-            java.util.concurrent.CompletableFuture<Boolean> chain =
-                java.util.concurrent.CompletableFuture.completedFuture(true);
-
-            for (int i = 0; i < totalChunks; i++) {
-                final int chunkIndex = i;
-                int start = i * SNAPSHOT_CHUNK_SIZE;
-                int end = Math.min(start + SNAPSHOT_CHUNK_SIZE, snapshotData.length);
-                byte[] chunk = java.util.Arrays.copyOfRange(snapshotData, start, end);
-
-                chain = chain.thenCompose(ok -> {
-                    if (requestGeneration != ps.requestGeneration) {
-                        return java.util.concurrent.CompletableFuture.completedFuture(false);
-                    }
-                    return transport.sendInstallSnapshotChunk(peerId, term, nodeId,
-                        snapshotIndex, snapshotTerm, chunkIndex, totalChunks, chunk);
-                });
-            }
-
-            chain.thenAccept(success -> {
+        // Transport handles chunking — RaftNode passes full data
+        transport.sendInstallSnapshot(peerId,
+            new RaftTransport.InstallSnapshotRequest(
+                epoch, nodeId, snapshotIndex, snapshotEpoch,
+                0, 1, snapshotData))
+            .thenAccept(response -> {
                 if (requestGeneration != ps.requestGeneration) return;
-                if (success) {
+                if (response.bytesReceived() >= 0) {
+                    // Compact log now that snapshot is confirmed by follower
+                    raftLog.compactThrough(snapshotIndex, snapshotEpoch);
                     ps.nextIndex = snapshotIndex + 1;
                     ps.matchIndex = snapshotIndex;
-                    log.info("Chunked snapshot accepted by {} (index={}, chunks={})", peerId, snapshotIndex, totalChunks);
+                    log.info("InstallSnapshot accepted by {} (index={})", peerId, snapshotIndex);
                 } else {
-                    log.warn("Chunked snapshot rejected by {} (chunks={})", peerId, totalChunks);
+                    log.warn("InstallSnapshot rejected by {}", peerId);
                 }
-            }).exceptionally(ex -> {
-                log.error("Chunked snapshot failed for {}: {}", peerId, ex.getMessage(), ex);
+            })
+            .exceptionally(ex -> {
+                log.error("InstallSnapshot failed for {}: {} (compactThrough may have failed, disk space not reclaimed)",
+                    peerId, ex.getMessage(), ex);
                 return null;
             });
-        }
     }
 
     /**
@@ -292,76 +344,46 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
      *
      * @return 新的 lastApplied index（失败返回 -1）
      */
-    private Long handleInstallSnapshot(RaftTransport.InstallSnapshotMessage msg) {
-        if (msg.term() < election.currentTerm()) {
-            log.debug("Rejecting InstallSnapshot: stale term {} < {}", msg.term(), election.currentTerm());
+    private Long handleInstallSnapshot(RaftTransport.InstallSnapshotRequest request) {
+        if (request.epoch() < election.currentEpoch()) {
+            log.debug("Rejecting InstallSnapshot: stale epoch {} < {}", request.epoch(), election.currentEpoch());
             return -1L;
         }
-        election.onAppendEntries(msg.term(), msg.leaderId());
+        election.onAppendEntries(request.epoch(), request.leaderId());
 
         try {
             // Decode snapshot first — if this fails, store is untouched and
             // we reject the snapshot (leader will retry).
-            java.util.List<com.loomq.domain.intent.Intent> decoded = decodeStoreSnapshot(msg.snapshotData());
+            java.util.List<com.loomq.domain.intent.Intent> decoded = decodeStoreSnapshot(request.data());
 
-            // Clear existing store state before applying the snapshot
-            store.clear();
+            // Phase 1: upsert-then-prune (requires replication lock to block applyCommitted)
+            synchronized (replication) {
+                java.util.Set<String> snapshotIds = new java.util.HashSet<>();
+                for (com.loomq.domain.intent.Intent intent : decoded) {
+                    store.upsert(intent);
+                    snapshotIds.add(intent.getIntentId());
+                }
 
-            // Apply decoded intents
-            for (com.loomq.domain.intent.Intent intent : decoded) {
-                store.upsert(intent);
+                // Remove stale intents not in snapshot
+                java.util.Set<String> toRemove = new java.util.HashSet<>(store.getAllIntents().keySet());
+                toRemove.removeAll(snapshotIds);
+                for (String id : toRemove) {
+                    store.delete(id);
+                }
+
+                replication.resetToSnapshot(request.lastIncludedIndex());
+                // Compact WAL inside the replication lock so the snapshot is applied
+                // atomically with log truncation. This keeps log state consistent with
+                // the in-memory store: any concurrent applyCommitted is blocked until
+                // both the reset and the compaction have completed.
+                raftLog.compactThrough(request.lastIncludedIndex(), request.lastIncludedEpoch());
             }
 
-            raftLog.compactThrough(msg.lastIncludedIndex(), msg.lastIncludedTerm());
-            replication.resetToSnapshot(msg.lastIncludedIndex());
-            log.info("InstallSnapshot applied: {} intents, index={}, term={}",
-                decoded.size(), msg.lastIncludedIndex(), msg.lastIncludedTerm());
-            return msg.lastIncludedIndex();
+            log.info("InstallSnapshot applied: {} intents, index={}, epoch={}",
+                decoded.size(), request.lastIncludedIndex(), request.lastIncludedEpoch());
+            return request.lastIncludedIndex();
         } catch (Exception e) {
-            log.error("Failed to apply InstallSnapshot from {}", msg.leaderId(), e);
-            return -1L;
-        }
-    }
-
-    /**
-     * Follower: handle an incoming InstallSnapshot chunk.
-     * Buffers chunks until all received, then reassembles and applies.
-     */
-    private Long handleInstallSnapshotChunk(RaftTransport.InstallSnapshotChunkMessage msg) {
-        if (msg.term() < election.currentTerm()) {
-            log.debug("Rejecting InstallSnapshot chunk: stale term {} < {}", msg.term(), election.currentTerm());
-            return -1L;
-        }
-        election.onAppendEntries(msg.term(), msg.leaderId());
-
-        String reassemblyKey = msg.leaderId() + ":" + msg.lastIncludedIndex();
-        ChunkReassembly reassembly = pendingChunks.computeIfAbsent(reassemblyKey,
-            k -> new ChunkReassembly(msg.totalChunks(), msg.lastIncludedIndex(), msg.lastIncludedTerm()));
-
-        boolean complete = reassembly.addChunk(msg.chunkIndex(), msg.chunkData());
-        if (!complete) {
-            log.debug("Received chunk {}/{} for snapshot from {}", msg.chunkIndex() + 1, msg.totalChunks(), msg.leaderId());
-            return msg.lastIncludedIndex(); // ack chunk but not yet complete
-        }
-
-        // All chunks received — reassemble and apply
-        pendingChunks.remove(reassemblyKey);
-        try {
-            byte[] fullSnapshot = reassembly.reassemble();
-            java.util.List<com.loomq.domain.intent.Intent> decoded = decodeStoreSnapshot(fullSnapshot);
-
-            store.clear();
-            for (com.loomq.domain.intent.Intent intent : decoded) {
-                store.upsert(intent);
-            }
-
-            raftLog.compactThrough(msg.lastIncludedIndex(), msg.lastIncludedTerm());
-            replication.resetToSnapshot(msg.lastIncludedIndex());
-            log.info("Chunked snapshot applied: {} intents, index={}, term={}",
-                decoded.size(), msg.lastIncludedIndex(), msg.lastIncludedTerm());
-            return msg.lastIncludedIndex();
-        } catch (Exception e) {
-            log.error("Failed to apply chunked snapshot from {}", msg.leaderId(), e);
+            log.error("Failed to apply InstallSnapshot from {}", request.leaderId(), e);
             return -1L;
         }
     }
@@ -391,65 +413,71 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
         java.io.DataInputStream dis = new java.io.DataInputStream(
             new java.io.ByteArrayInputStream(data));
         int count = dis.readInt();
+        if (count < 0 || count > 1_000_000) {
+            throw new java.io.IOException("Invalid snapshot count: " + count);
+        }
         java.util.List<com.loomq.domain.intent.Intent> result = new java.util.ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             int len = dis.readInt();
+            if (len < 0 || len > 10_000_000) {
+                throw new java.io.IOException("Invalid entry length: " + len);
+            }
             byte[] encoded = new byte[len];
             dis.readFully(encoded);
             var intent = com.loomq.infrastructure.wal.IntentBinaryCodec.decode(encoded);
+            if (intent == null) {
+                throw new java.io.IOException("Decoded intent is null at index " + i);
+            }
             result.add(intent);
         }
         return result;
     }
 
-    // ========== Vote coordination ==========
-
-    private void onElectionStarted(long term) {
-        syncRaftMetrics();
-        if (peers.isEmpty() || transport == null) return;
-        log.info("Sending RequestVote to {} peers for term {}", peers.size(), term);
-        long lastIdx = raftLog.lastIndex();
-        long lastTerm = raftLog.lastTerm();
-        AtomicInteger votesGranted = new AtomicInteger(1); // self-vote
-        int majority = (peers.size() / 2) + 1;
-
-        for (String peerId : peers) {
-            if (peerId.equals(nodeId)) continue;
-            transport.sendRequestVote(peerId, term, nodeId, lastIdx, lastTerm)
-                .thenAccept(granted -> {
-                    if (granted) {
-                        int total = votesGranted.incrementAndGet();
-                        log.debug("Vote granted by {} (total={}/{})", peerId, total, majority);
-                        if (total >= majority && election.role() == RaftRole.CANDIDATE) {
-                            election.becomeLeader(term);
-                        }
-                    }
-                });
-        }
-    }
-
     // ========== Heartbeat ==========
 
-    private void onBecomeLeader(long term) {
+    private void onBecomeLeader(long epoch) {
         leaderGeneration++;
         renewReadLease();
         syncRaftMetrics();
         notifyRuntimeRole();
-        log.info("Node {} became LEADER at term {} (gen {})", nodeId, term, leaderGeneration);
-        startHeartbeat(term);
+        log.info("Node {} became LEADER at epoch {} (gen {})", nodeId, epoch, leaderGeneration);
+
+        // 追加 no-op entry（Raft 安全性保证）
+        // 新 Leader 无法直接提交之前 term 的 entry，
+        // 通过追加当前 term 的 no-op entry，间接提交所有之前的 entry。
+        if (!peerStates.isEmpty()) {
+            appendNoOpEntry();
+        }
+
+        startHeartbeat(epoch);
     }
 
-    private void onBecomeFollower(long term) {
+    /**
+     * 追加 no-op entry 到当前 term。
+     * 用于新 Leader 间接提交之前 term 的 entry（Raft §5.4.2）。
+     */
+    private void appendNoOpEntry() {
+        try {
+            long index = raftLog.appendEntry(election.currentEpoch(), new byte[0]);
+            log.debug("Appended no-op entry at index {} for epoch {}", index, election.currentEpoch());
+            // 触发复制以尽快推进 commitIndex
+            triggerImmediateReplication();
+        } catch (Exception e) {
+            log.error("Failed to append no-op entry", e);
+        }
+    }
+
+    private void onBecomeFollower(long epoch) {
         readLeaseUntilMs = 0L;
         syncRaftMetrics();
         replication.failPendingWaiters(new IllegalStateException("Leadership lost"));
         notifyRuntimeRole();
-        log.info("Node {} became FOLLOWER at term {}", nodeId, term);
+        log.info("Node {} became FOLLOWER at epoch {}", nodeId, epoch);
         leaderGeneration++;
         stopHeartbeat();
     }
 
-    private void startHeartbeat(long term) {
+    private void startHeartbeat(long epoch) {
         stopHeartbeat();
         heartbeatTask = heartbeatTimer.scheduleAtFixedRate(this::sendHeartbeats,
             heartbeatMs, heartbeatMs, TimeUnit.MILLISECONDS);
@@ -467,7 +495,7 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
             }
             syncRaftMetrics();
             final long myGeneration = leaderGeneration;
-            long currentTerm = election.currentTerm();
+            long currentEpoch = election.currentEpoch();
             long commitIdx = replication.commitIndex();
             long lastIdx = raftLog.lastIndex();
             int majority = ((peerStates.size() + 1) / 2) + 1;
@@ -495,57 +523,58 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
                     // Read entries the peer is missing (batch-limited)
                     long nextIdx = ps.nextIndex;
                     long prevLogIndex = nextIdx - 1;
-                    long prevLogTerm = prevLogIndex > 0 ? raftLog.readEntryTerm(prevLogIndex) : 0;
-                    if (prevLogTerm < 0) prevLogTerm = 0; // entry not yet readable
+                    long prevLogEpoch = prevLogIndex > 0 ? raftLog.readEntryEpoch(prevLogIndex) : 0;
+                    if (prevLogEpoch < 0) prevLogEpoch = 0; // entry not yet readable
 
                     int count = (int) Math.min(lastIdx - nextIdx + 1, MAX_ENTRIES_PER_APPEND);
                     if (count <= 0) continue;
 
-                    byte[][] entries = new byte[count][];
+                    // Read entries, stopping at first null (truncated or I/O error)
+                    java.util.List<byte[]> entryList = new java.util.ArrayList<>(count);
                     for (int i = 0; i < count; i++) {
                         byte[] entry = raftLog.readEntryRaw(nextIdx + i);
-                        if (entry == null) {
-                            entries[i] = new byte[0];
-                        } else {
-                            entries[i] = entry;
-                        }
+                        if (entry == null) break;
+                        entryList.add(entry);
                     }
-
-                    // Track the max index covered by this in-flight RPC
-                    ps.inflightMaxIndex = nextIdx + count - 1;
-
-                    transport.sendAppendEntries(ps.peerId, currentTerm, nodeId,
-                            prevLogIndex, prevLogTerm, entries, commitIdx)
-                        .whenComplete((result, throwable) -> {
+                    if (entryList.isEmpty()) continue;
+                    // Update inflightMaxIndex to actual last entry sent
+                    ps.inflightMaxIndex = nextIdx + entryList.size() - 1;
+                    transport.sendAppendEntries(ps.peerId,
+                            new RaftTransport.AppendEntriesRequest(
+                                currentEpoch, nodeId, prevLogIndex, prevLogEpoch, entryList, commitIdx))
+                        .whenComplete((response, throwable) -> {
                             if (throwable != null) {
                                 log.error("AppendEntries failed for peer {}: {}", ps.peerId,
                                     throwable.getMessage(), throwable);
+                                ps.inflightMaxIndex = 0; // Reset so next heartbeat can retry
                                 return;
                             }
                             if (requestGeneration != ps.requestGeneration) return;
-                            // Bail out if this response belongs to a past leadership term
+                            // Bail out if this response belongs to a past leadership epoch
                             if (myGeneration != leaderGeneration) return;
 
-                            if (result.success) {
-                                ps.matchIndex = result.matchIndex;
-                                ps.nextIndex = result.matchIndex + 1;
+                            if (response.success()) {
+                                ps.matchIndex = response.matchIndex();
+                                ps.nextIndex = response.matchIndex() + 1;
                                 if (quorumAcks.incrementAndGet() >= majority && leaseRenewed.compareAndSet(false, true)) {
                                     renewReadLease();
                                 }
                                 advanceCommitIndexFromAllPeers();
-                            } else if (result.term > currentTerm) {
-                                election.stepDown(result.term);
+                            } else if (response.epoch() > currentEpoch) {
+                                log.warn("AppendEntries rejected: follower {} has higher epoch {} > {}, stepping down",
+                                    ps.peerId, response.epoch(), currentEpoch);
+                                election.stepDown(response.epoch());
                             } else {
                                 // Log inconsistency: use conflictIndex for fast backtrack
-                                if (result.conflictIndex > 0) {
-                                    ps.nextIndex = Math.max(1, result.conflictIndex);
+                                if (response.conflictIndex() > 0) {
+                                    ps.nextIndex = Math.max(1, response.conflictIndex());
                                 } else {
                                     ps.nextIndex = Math.max(1, ps.nextIndex - 1);
                                 }
                                 // Reset inflightMaxIndex so next heartbeat can retry
                                 ps.inflightMaxIndex = 0;
                                 log.debug("AppendEntries rejected by {} (conflictIdx={}), nextIndex={}",
-                                    ps.peerId, result.conflictIndex, ps.nextIndex);
+                                    ps.peerId, response.conflictIndex(), ps.nextIndex);
                             }
                         });
                 } catch (Exception peerEx) {
@@ -569,7 +598,7 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
             matchIndices[i++] = ps.matchIndex;
         }
         long before = replication.commitIndex();
-        replication.advanceCommitIndex(matchIndices, election.currentTerm());
+        replication.advanceCommitIndex(matchIndices, election.currentEpoch());
         if (replication.commitIndex() > before) {
             replication.applyCommitted();
         }
@@ -587,7 +616,7 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
         RaftStatusSnapshot status = snapshotStatus();
         metrics.updateRaftRole(status.role().name());
         metrics.updateRaftLeaderId(status.leaderId());
-        metrics.updateRaftTerm(status.term());
+        metrics.updateRaftEpoch(status.epoch());
         metrics.updateRaftCommitIndex(status.commitIndex());
         metrics.updateRaftLastApplied(status.lastApplied());
         metrics.updateRaftReplicationLag(status.replicationLag());
@@ -601,13 +630,13 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
 
     private void notifyRuntimeRole(RaftRole role) {
         if (runtimeListener != null) {
-            runtimeListener.onRoleChanged(role, election.currentTerm());
+            runtimeListener.onRoleChanged(role, election.currentEpoch());
         }
     }
 
     @Override
     public RaftStatusSnapshot snapshotStatus() {
-        long term = election.currentTerm();
+        long epoch = election.currentEpoch();
         long commitIndex = replication.commitIndex();
         long lastApplied = replication.lastApplied();
         long commitLag = Math.max(0, commitIndex - lastApplied);
@@ -640,7 +669,7 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
             nodeId,
             election.role(),
             election.currentLeader(),
-            term,
+            epoch,
             commitIndex,
             lastApplied,
             commitLag,
@@ -668,61 +697,6 @@ public class RaftNode implements AutoCloseable, RaftStatusProvider {
 
         PeerReplicationState(String peerId) {
             this.peerId = peerId;
-        }
-    }
-
-    /**
-     * Reassembly buffer for chunked InstallSnapshot transfer.
-     * Collects chunks by index and reassembles into a full snapshot blob.
-     */
-    static class ChunkReassembly {
-        private final int totalChunks;
-        private final long lastIncludedIndex;
-        private final long lastIncludedTerm;
-        private final byte[][] chunks;
-        private final java.util.concurrent.atomic.AtomicInteger receivedCount = new java.util.concurrent.atomic.AtomicInteger(0);
-
-        ChunkReassembly(int totalChunks, long lastIncludedIndex, long lastIncludedTerm) {
-            this.totalChunks = totalChunks;
-            this.lastIncludedIndex = lastIncludedIndex;
-            this.lastIncludedTerm = lastIncludedTerm;
-            this.chunks = new byte[totalChunks][];
-        }
-
-        /**
-         * Add a chunk. Returns true when all chunks have been received.
-         */
-        synchronized boolean addChunk(int chunkIndex, byte[] data) {
-            if (chunkIndex < 0 || chunkIndex >= totalChunks) {
-                log.warn("Invalid chunk index: {} (total={})", chunkIndex, totalChunks);
-                return false;
-            }
-            if (chunks[chunkIndex] != null) {
-                // Duplicate chunk — ignore
-                return receivedCount.get() >= totalChunks;
-            }
-            chunks[chunkIndex] = data;
-            receivedCount.incrementAndGet();
-            return receivedCount.get() >= totalChunks;
-        }
-
-        /**
-         * Reassemble all chunks into a single byte array.
-         */
-        byte[] reassemble() {
-            int totalSize = 0;
-            for (byte[] chunk : chunks) {
-                totalSize += chunk != null ? chunk.length : 0;
-            }
-            byte[] result = new byte[totalSize];
-            int offset = 0;
-            for (byte[] chunk : chunks) {
-                if (chunk != null) {
-                    System.arraycopy(chunk, 0, result, offset, chunk.length);
-                    offset += chunk.length;
-                }
-            }
-            return result;
         }
     }
 

@@ -90,19 +90,19 @@ class RaftNodeTest {
         RaftNode node1 = new RaftNode(config, wal, store, null);
         node1.start();
         waitForLeader(node1, 3000);
-        long term1 = node1.getElection().currentTerm();
+        long epoch1 = node1.getElection().currentEpoch();
         node1.close();
         RaftNode node2 = new RaftNode(config, wal, store, null);
-        assertEquals(term1, node2.getElection().currentTerm(), "term should persist");
+        assertEquals(epoch1, node2.getElection().currentEpoch(), "epoch should persist");
         node2.close();
     }
 
     @Test
-    void multiNodeShouldStartAsFollower() {
+    void multiNodeShouldStartAsLeaderWithStandaloneElection() {
         RaftConfig config = new RaftConfig("node-1", List.of("node-1","node-2","node-3"), dataDir.toString(), 150, 300, 50);
         RaftNode node = new RaftNode(config, wal, store, null);
         node.start();
-        assertEquals(RaftRole.FOLLOWER, node.role(), "should start as follower in multi-node cluster");
+        assertEquals(RaftRole.LEADER, node.role(), "StandaloneElection always starts as leader");
         node.close();
     }
 
@@ -122,7 +122,7 @@ class RaftNodeTest {
         assertTrue(index > 0);
 
         // Simulate commit and apply
-        node.getReplication().advanceCommitIndex(new long[]{index}, node.getElection().currentTerm());
+        node.getReplication().advanceCommitIndex(new long[]{index}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         Intent restored = store.findById("raft-intent-2");
@@ -140,13 +140,13 @@ class RaftNodeTest {
         waitForLeader(node, 3000);
         assertTrue(node.isLeader(), "should become leader");
 
-        long leaderTerm = node.getElection().currentTerm();
+        long leaderEpoch = node.getElection().currentEpoch();
 
         // Wait 5 heartbeat periods - leader should not self-trigger re-election
         Thread.sleep(config.heartbeatMs() * 5);
         assertTrue(node.isLeader(), "leader should remain leader (no self-re-election)");
-        assertEquals(leaderTerm, node.getElection().currentTerm(),
-            "term should not change (no spurious election)");
+        assertEquals(leaderEpoch, node.getElection().currentEpoch(),
+            "epoch should not change (no spurious election)");
         node.close();
     }
 
@@ -163,7 +163,7 @@ class RaftNodeTest {
 
         // Single-node: self-matchIndex = lastIndex, majority of 1 is trivially met
         node.getReplication().advanceCommitIndex(
-            new long[]{node.getRaftLog().lastIndex()}, node.getElection().currentTerm());
+            new long[]{node.getRaftLog().lastIndex()}, node.getElection().currentEpoch());
         assertTrue(node.getReplication().commitIndex() > 0,
             "commitIndex should advance for single-node majority");
         node.close();
@@ -197,20 +197,20 @@ class RaftNodeTest {
 
             LoomQMetrics.MetricsSnapshot afterStart = metrics.snapshot();
             assertEquals("LEADER", afterStart.raftRole());
-            assertEquals("node-1", afterStart.raftLeaderId());
-            assertTrue(afterStart.raftTerm() > 0);
+            assertEquals("standalone", afterStart.raftLeaderId());
+            assertTrue(afterStart.raftEpoch() > 0);
             assertEquals(0, afterStart.raftConnectedPeers());
             assertEquals(0, afterStart.raftTotalPeers());
 
             byte[] encoded = IntentBinaryCodec.encode(makeIntent("metrics-intent"));
             long index = node.propose(encoded);
             node.getReplication().advanceCommitIndex(
-                new long[]{node.getRaftLog().lastIndex()}, node.getElection().currentTerm());
+                new long[]{node.getRaftLog().lastIndex()}, node.getElection().currentEpoch());
             node.applyCommitted();
 
             LoomQMetrics.MetricsSnapshot afterCommit = metrics.snapshot();
             assertEquals("LEADER", afterCommit.raftRole());
-            assertEquals("node-1", afterCommit.raftLeaderId());
+            assertEquals("standalone", afterCommit.raftLeaderId());
             assertTrue(afterCommit.raftCommitIndex() >= index);
             assertTrue(afterCommit.raftLastApplied() >= index);
             assertEquals(0, afterCommit.raftCommitLag());
@@ -243,7 +243,7 @@ class RaftNodeTest {
         assertTrue(idx1 > 0 && idx2 > idx1);
 
         node.getReplication().advanceCommitIndex(
-            new long[]{idx2}, node.getElection().currentTerm());
+            new long[]{idx2}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         // Verify intents are in store after commit
@@ -268,7 +268,7 @@ class RaftNodeTest {
         byte[] encoded = IntentBinaryCodec.encode(existingIntent);
         long index = node.propose(encoded);
         node.getReplication().advanceCommitIndex(
-            new long[]{index}, node.getElection().currentTerm());
+            new long[]{index}, node.getElection().currentEpoch());
         node.applyCommitted();
 
         // Store should still have the intent (verify atomicity guarantee:
@@ -281,7 +281,7 @@ class RaftNodeTest {
 
     @Test
     void staleAppendEntriesResponsesShouldNotRegressPeerState() throws Exception {
-        ControlledRaftTransport transport = new ControlledRaftTransport("node-1");
+        ControlledRaftTransport transport = new ControlledRaftTransport();
         RaftConfig config = new RaftConfig(
             "node-1",
             List.of("node-1", "node-2"),
@@ -290,10 +290,9 @@ class RaftNodeTest {
             20_000,
             500
         );
-        RaftNode node = new RaftNode(config, wal, store, transport);
+        RaftNode node = new RaftNode(config, wal, store, transport, null, new StandaloneElection(wal));
         try {
             node.start();
-            node.getElection().becomeLeader(1);
 
             node.getRaftLog().appendEntry(1, IntentBinaryCodec.encode(makeIntent("stale-1")));
             node.getRaftLog().appendEntry(1, IntentBinaryCodec.encode(makeIntent("stale-2")));
@@ -313,44 +312,72 @@ class RaftNodeTest {
         }
     }
 
-    private static final class ControlledRaftTransport extends RaftTransport {
+    private static final class ControlledRaftTransport implements RaftTransport {
         private final CountDownLatch appendRequested = new CountDownLatch(1);
-        private final CompletableFuture<AppendEntriesResult> appendResult = new CompletableFuture<>();
+        private final CompletableFuture<RaftTransport.AppendEntriesResponse> appendResult = new CompletableFuture<>();
 
-        ControlledRaftTransport(String nodeId) {
-            super(nodeId);
+        @Override
+        public void start() { /* no-op */ }
+
+        @Override
+        public CompletableFuture<Void> connect(String peerId, String host, int port) {
+            return CompletableFuture.completedFuture(null);
         }
 
         @Override
-        public void listen(String host, int port) {
-            // No-op for tests.
-        }
+        public void disconnect(String peerId) { /* no-op */ }
 
         @Override
-        public CompletableFuture<Boolean> sendRequestVote(String peerId, long term, String candidateId,
-                long lastLogIndex, long lastLogTerm) {
-            return CompletableFuture.completedFuture(false);
-        }
-
-        @Override
-        public CompletableFuture<AppendEntriesResult> sendAppendEntries(String peerId, long term,
-                String leaderId, long prevLogIndex, long prevLogTerm, byte[][] entries, long leaderCommit) {
+        public CompletableFuture<RaftTransport.AppendEntriesResponse> sendAppendEntries(
+                String peerId, RaftTransport.AppendEntriesRequest request) {
             appendRequested.countDown();
             return appendResult;
         }
 
         @Override
-        public CompletableFuture<Long> sendInstallSnapshot(String peerId, long term, String leaderId,
-                long lastIncludedIndex, long lastIncludedTerm, byte[] snapshotData) {
-            return CompletableFuture.completedFuture(-1L);
+        public CompletableFuture<RaftTransport.InstallSnapshotResponse> sendInstallSnapshot(
+                String peerId, RaftTransport.InstallSnapshotRequest request) {
+            return CompletableFuture.completedFuture(
+                new RaftTransport.InstallSnapshotResponse(request.epoch(), -1));
         }
+
+        @Override
+        public void setOnAppendEntries(
+                java.util.function.Function<RaftTransport.AppendEntriesRequest, RaftTransport.AppendEntriesResponse> handler) {
+            // no-op for tests
+        }
+
+        @Override
+        public void setOnInstallSnapshot(
+                java.util.function.Function<RaftTransport.InstallSnapshotRequest, RaftTransport.InstallSnapshotResponse> handler) {
+            // no-op for tests
+        }
+
+        @Override
+        public void setCurrentEpochSupplier(java.util.function.Supplier<Long> supplier) {
+            // no-op for tests
+        }
+
+        @Override
+        public boolean isPeerConnected(String peerId) {
+            return true;
+        }
+
+        @Override
+        public int connectedPeerCount() {
+            return 0;
+        }
+
+        @Override
+        public void close() { /* no-op */ }
 
         boolean awaitAppendRequest(long timeout, TimeUnit unit) throws InterruptedException {
             return appendRequested.await(timeout, unit);
         }
 
         void completeAppend(AppendEntriesResult result) {
-            appendResult.complete(result);
+            appendResult.complete(new RaftTransport.AppendEntriesResponse(
+                result.epoch, result.success, result.matchIndex, result.conflictIndex));
         }
     }
 }

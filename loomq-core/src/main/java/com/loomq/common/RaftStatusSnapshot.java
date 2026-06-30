@@ -11,7 +11,7 @@ public record RaftStatusSnapshot(
     String nodeId,
     RaftRole role,
     String leaderId,
-    long term,
+    long epoch,
     long commitIndex,
     long lastApplied,
     long commitLag,

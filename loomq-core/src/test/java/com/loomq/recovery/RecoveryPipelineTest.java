@@ -143,10 +143,10 @@ class RecoveryPipelineTest {
         public void truncateBefore(long globalOffset) {}
 
         @Override
-        public long getLastLogTerm() { return 0; }
+        public long getLastLogEpoch() { return 0; }
 
         @Override
-        public void setCurrentTerm(long term) {}
+        public void setCurrentEpoch(long epoch) {}
 
         @Override
         public String getVotedFor() { return null; }

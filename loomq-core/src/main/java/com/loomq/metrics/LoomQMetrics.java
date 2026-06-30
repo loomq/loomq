@@ -66,8 +66,8 @@ public class LoomQMetrics {
         raftMetrics.updateRaftRole(role);
     }
 
-    public void updateRaftTerm(long term) {
-        raftMetrics.updateRaftTerm(term);
+    public void updateRaftEpoch(long epoch) {
+        raftMetrics.updateRaftEpoch(epoch);
     }
 
     public void updateRaftCommitIndex(long commitIndex) {
@@ -221,7 +221,7 @@ public class LoomQMetrics {
             walHealthMetrics.getWalRingBufferSize(),
             raftMetrics.getRaftRole(),
             raftMetrics.getRaftLeaderId(),
-            raftMetrics.getRaftTerm(),
+            raftMetrics.getRaftEpoch(),
             raftMetrics.getRaftCommitIndex(),
             raftMetrics.getRaftLastApplied(),
             raftMetrics.getRaftCommitLag(),
@@ -271,7 +271,7 @@ public class LoomQMetrics {
         long walRingBufferSize,
         String raftRole,
         String raftLeaderId,
-        long raftTerm,
+        long raftEpoch,
         long raftCommitIndex,
         long raftLastApplied,
         long raftCommitLag,

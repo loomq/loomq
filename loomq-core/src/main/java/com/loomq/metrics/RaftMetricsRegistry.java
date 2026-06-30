@@ -8,13 +8,13 @@ import java.util.concurrent.atomic.LongAdder;
 /**
  * Raft 运行指标注册表。
  *
- * 负责记录当前角色、term、commit index、lastApplied 和提交滞后。
+ * 负责记录当前角色、epoch、commit index、lastApplied 和提交滞后。
  */
 final class RaftMetricsRegistry {
 
     private final AtomicReference<String> raftRole = new AtomicReference<>("OFFLINE");
     private final AtomicReference<String> raftLeaderId = new AtomicReference<>(null);
-    private final AtomicLong raftTerm = new AtomicLong(0);
+    private final AtomicLong raftEpoch = new AtomicLong(0);
     private final AtomicLong raftCommitIndex = new AtomicLong(0);
     private final AtomicLong raftLastApplied = new AtomicLong(0);
     private final AtomicLong raftReplicationLag = new AtomicLong(0);
@@ -37,8 +37,8 @@ final class RaftMetricsRegistry {
         raftLeaderId.set(leaderId == null || leaderId.isBlank() ? null : leaderId);
     }
 
-    void updateRaftTerm(long term) {
-        raftTerm.set(Math.max(0, term));
+    void updateRaftEpoch(long epoch) {
+        raftEpoch.set(Math.max(0, epoch));
     }
 
     void updateRaftCommitIndex(long commitIndex) {
@@ -96,8 +96,8 @@ final class RaftMetricsRegistry {
         return raftLeaderId.get();
     }
 
-    long getRaftTerm() {
-        return raftTerm.get();
+    long getRaftEpoch() {
+        return raftEpoch.get();
     }
 
     long getRaftCommitIndex() {
@@ -159,7 +159,7 @@ final class RaftMetricsRegistry {
     void reset() {
         raftRole.set("OFFLINE");
         raftLeaderId.set(null);
-        raftTerm.set(0);
+        raftEpoch.set(0);
         raftCommitIndex.set(0);
         raftLastApplied.set(0);
         raftReplicationLag.set(0);

@@ -55,7 +55,7 @@ public final class MetricsResponseSerializer {
     private static final byte[] FIELD_WAL_RING_BUFFER_SIZE = "\"walRingBufferSize\"".getBytes(StandardCharsets.UTF_8);
     private static final byte[] FIELD_RAFT_ROLE = "\"raftRole\"".getBytes(StandardCharsets.UTF_8);
     private static final byte[] FIELD_RAFT_LEADER_ID = "\"raftLeaderId\"".getBytes(StandardCharsets.UTF_8);
-    private static final byte[] FIELD_RAFT_TERM = "\"raftTerm\"".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] FIELD_RAFT_EPOCH = "\"raftEpoch\"".getBytes(StandardCharsets.UTF_8);
     private static final byte[] FIELD_RAFT_COMMIT_INDEX = "\"raftCommitIndex\"".getBytes(StandardCharsets.UTF_8);
     private static final byte[] FIELD_RAFT_LAST_APPLIED = "\"raftLastApplied\"".getBytes(StandardCharsets.UTF_8);
     private static final byte[] FIELD_RAFT_COMMIT_LAG = "\"raftCommitLag\"".getBytes(StandardCharsets.UTF_8);
@@ -105,7 +105,7 @@ public final class MetricsResponseSerializer {
         first = writeLongField(buf, first, FIELD_WAL_RING_BUFFER_SIZE, snapshot.walRingBufferSize());
         first = writeStringField(buf, first, FIELD_RAFT_ROLE, snapshot.raftRole());
         first = writeStringField(buf, first, FIELD_RAFT_LEADER_ID, snapshot.raftLeaderId());
-        first = writeLongField(buf, first, FIELD_RAFT_TERM, snapshot.raftTerm());
+        first = writeLongField(buf, first, FIELD_RAFT_EPOCH, snapshot.raftEpoch());
         first = writeLongField(buf, first, FIELD_RAFT_COMMIT_INDEX, snapshot.raftCommitIndex());
         first = writeLongField(buf, first, FIELD_RAFT_LAST_APPLIED, snapshot.raftLastApplied());
         first = writeLongField(buf, first, FIELD_RAFT_COMMIT_LAG, snapshot.raftCommitLag());
