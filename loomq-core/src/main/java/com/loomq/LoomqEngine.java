@@ -352,7 +352,7 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取原始 Intent 存储（内部/Raft 使用，可读写）。
+     * 获取原始 Intent 存储（内部使用，可读写）。
      *
      * 外部调用方应使用 {@link #getIntentStore()} 只读视图。
      */
@@ -370,14 +370,14 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取命令服务（供 WriteCoordinator 使用）
+     * 获取命令服务。
      */
     public IntentCommandService getCommandService() {
         return commandService;
     }
 
     /**
-     * 获取运行状态标志（供 WriteCoordinator 使用）
+     * 获取运行状态标志。
      */
     public AtomicBoolean getRunning() {
         return running;

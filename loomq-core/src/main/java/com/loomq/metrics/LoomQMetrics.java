@@ -21,9 +21,6 @@ public class LoomQMetrics {
     // ==================== WAL 健康指标 ====================
     private final WalHealthMetricsRegistry walHealthMetrics = new WalHealthMetricsRegistry();
 
-    // ==================== Raft 指标 ====================
-    private final RaftMetricsRegistry raftMetrics = new RaftMetricsRegistry();
-
     public void updateWalLastFlushTime(long timestamp) {
         walHealthMetrics.updateWalLastFlushTime(timestamp);
     }
@@ -60,64 +57,6 @@ public class LoomQMetrics {
         return walHealthMetrics.getWalIdleTimeMs();
     }
 
-    // ==================== Raft 指标更新 ====================
-
-    public void updateRaftRole(String role) {
-        raftMetrics.updateRaftRole(role);
-    }
-
-    public void updateRaftEpoch(long epoch) {
-        raftMetrics.updateRaftEpoch(epoch);
-    }
-
-    public void updateRaftCommitIndex(long commitIndex) {
-        raftMetrics.updateRaftCommitIndex(commitIndex);
-    }
-
-    public void updateRaftLastApplied(long lastApplied) {
-        raftMetrics.updateRaftLastApplied(lastApplied);
-    }
-
-    public void updateRaftLeaderId(String leaderId) {
-        raftMetrics.updateRaftLeaderId(leaderId);
-    }
-
-    public void updateRaftReplicationLag(long replicationLag) {
-        raftMetrics.updateRaftReplicationLag(replicationLag);
-    }
-
-    public void updateRaftConnectedPeers(int connectedPeers) {
-        raftMetrics.updateRaftConnectedPeers(connectedPeers);
-    }
-
-    public void updateRaftTotalPeers(int totalPeers) {
-        raftMetrics.updateRaftTotalPeers(totalPeers);
-    }
-
-    public void updateRaftPendingWrites(long pendingWrites) {
-        raftMetrics.updateRaftPendingWrites(pendingWrites);
-    }
-
-    public void recordRaftWriteProposalLatency(long latencyMs) {
-        raftMetrics.recordRaftWriteProposalLatency(latencyMs);
-    }
-
-    public void incrementRaftWriteTimeouts() {
-        raftMetrics.incrementRaftWriteTimeouts();
-    }
-
-    public void incrementRaftWriteStepDownAborts() {
-        raftMetrics.incrementRaftWriteStepDownAborts();
-    }
-
-    public void incrementRaftWriteBackpressureRejects() {
-        raftMetrics.incrementRaftWriteBackpressureRejects();
-    }
-
-    public void incrementRaftWriteRevisionConflicts() {
-        raftMetrics.incrementRaftWriteRevisionConflicts();
-    }
-
     // ==================== 单例模式 ====================
     private static final LoomQMetrics INSTANCE = new LoomQMetrics();
 
@@ -147,20 +86,6 @@ public class LoomQMetrics {
 
     public void recordDeliveryRetry() {
         pipelineMetrics.recordDeliveryRetry();
-    }
-
-    // ==================== 复制计数方法 ====================
-
-    public void recordReplicationRecordSent(int bytes) {
-        pipelineMetrics.recordReplicationRecordSent(bytes);
-    }
-
-    public void recordReplicationRecordAcked() {
-        pipelineMetrics.recordReplicationRecordAcked();
-    }
-
-    public void updateReplicationLag(long lagMs) {
-        pipelineMetrics.updateReplicationLag(lagMs);
     }
 
     // ==================== 存储计数方法 ====================
@@ -203,9 +128,6 @@ public class LoomQMetrics {
             pipelineMetrics.getDeliveriesRetried(),
             pipelineMetrics.calculateAverageDeliveryLatency(),
             pipelineMetrics.getDeliveryLatencyMaxMs(),
-            pipelineMetrics.getReplicationRecordsSent(),
-            pipelineMetrics.getReplicationRecordsAcked(),
-            pipelineMetrics.getReplicationLagMs(),
             pipelineMetrics.getWalRecordsWritten(),
             pipelineMetrics.getSnapshotsCreated(),
             pendingIntents,
@@ -218,23 +140,7 @@ public class LoomQMetrics {
             walHealthMetrics.calculateAverageFlushLatency(pipelineMetrics.getWalRecordsWritten()),
             walHealthMetrics.getWalFlushLatencyMaxMs(),
             walHealthMetrics.getWalPendingWrites(),
-            walHealthMetrics.getWalRingBufferSize(),
-            raftMetrics.getRaftRole(),
-            raftMetrics.getRaftLeaderId(),
-            raftMetrics.getRaftEpoch(),
-            raftMetrics.getRaftCommitIndex(),
-            raftMetrics.getRaftLastApplied(),
-            raftMetrics.getRaftCommitLag(),
-            raftMetrics.getRaftReplicationLag(),
-            raftMetrics.getRaftConnectedPeers(),
-            raftMetrics.getRaftTotalPeers(),
-            raftMetrics.getRaftPendingWrites(),
-            raftMetrics.getRaftAverageWriteProposalLatencyMs(),
-            raftMetrics.getRaftWriteProposalLatencyMaxMs(),
-            raftMetrics.getRaftWriteTimeouts(),
-            raftMetrics.getRaftWriteStepDownAborts(),
-            raftMetrics.getRaftWriteBackpressureRejects(),
-            raftMetrics.getRaftWriteRevisionConflicts()
+            walHealthMetrics.getWalRingBufferSize()
         );
     }
 
@@ -253,9 +159,6 @@ public class LoomQMetrics {
         long deliveriesRetried,
         double avgDeliveryLatencyMs,
         long maxDeliveryLatencyMs,
-        long replicationRecordsSent,
-        long replicationRecordsAcked,
-        long replicationLagMs,
         long walRecordsWritten,
         long snapshotsCreated,
         long pendingIntents,
@@ -268,23 +171,7 @@ public class LoomQMetrics {
         double avgWalFlushLatencyMs,
         long maxWalFlushLatencyMs,
         long walPendingWrites,
-        long walRingBufferSize,
-        String raftRole,
-        String raftLeaderId,
-        long raftEpoch,
-        long raftCommitIndex,
-        long raftLastApplied,
-        long raftCommitLag,
-        long raftReplicationLag,
-        int raftConnectedPeers,
-        int raftTotalPeers,
-        long raftPendingWrites,
-        double raftWriteProposalLatencyMs,
-        long raftWriteProposalLatencyMaxMs,
-        long raftWriteTimeouts,
-        long raftWriteStepDownAborts,
-        long raftWriteBackpressureRejects,
-        long raftWriteRevisionConflicts
+        long walRingBufferSize
     ) {}
 
     // ==================== 重置 ====================
@@ -293,7 +180,6 @@ public class LoomQMetrics {
         pipelineMetrics.reset();
         // WAL 健康指标重置
         walHealthMetrics.reset();
-        raftMetrics.reset();
         MetricsCollector.getInstance().resetRuntimeIntentMetrics();
     }
 }

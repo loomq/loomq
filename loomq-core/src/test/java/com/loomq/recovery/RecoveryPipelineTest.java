@@ -141,17 +141,5 @@ class RecoveryPipelineTest {
 
         @Override
         public void truncateBefore(long globalOffset) {}
-
-        @Override
-        public long getLastLogEpoch() { return 0; }
-
-        @Override
-        public void setCurrentEpoch(long epoch) {}
-
-        @Override
-        public String getVotedFor() { return null; }
-
-        @Override
-        public void setVotedFor(String nodeId) {}
     }
 }

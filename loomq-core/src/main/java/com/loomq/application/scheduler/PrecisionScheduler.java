@@ -515,8 +515,7 @@ public class PrecisionScheduler {
      * 用 committed state 重建调度器状态。
      *
      * 该方法会清空当前桶、cohort 和过期索引，再按 store 里的当前态
-     * 重新挂载所有非终态 intent。适用于 Raft leader 角色恢复和快照后
-     * 的调度重建。
+     * 重新挂载所有非终态 intent。适用于快照后的调度重建。
      */
     public void rebuildFromCommittedState(Collection<Intent> intents) {
         bucketGroupManager.clear();

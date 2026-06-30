@@ -51,8 +51,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
     private static final int HEADER_SIZE = 4;
     private static final int CHECKSUM_SIZE = 4;
     private static final int RECORD_OVERHEAD = HEADER_SIZE + CHECKSUM_SIZE;
-    private static final int EPOCH_PREFIX_SIZE = Long.BYTES;
-
     public static final int RECORD_FIXED_OVERHEAD = HEADER_SIZE + CHECKSUM_SIZE;
 
     public static int recordLength(int payloadLength) {
@@ -78,15 +76,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
     private final AtomicLong writePosition = new AtomicLong(0);
     private volatile long flushedPosition = 0;
     private volatile long lastFsyncTimestampMs = 0;
-
-    // ========== Raft 元数据 ==========
-    private final Path raftMetaPath;
-    private volatile long currentEpoch = 0;
-    private volatile String votedFor = null;
-    private volatile long lastLogEntryEpoch = 0;
-    private volatile long snapshotIndex = 0;
-    private volatile long snapshotEpoch = 0;
-    private volatile long snapshotOffset = 0;
 
     // ========== 刷盘协调 ==========
     private final StripedCondition flushConditions;
@@ -180,10 +169,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
 
         Files.createDirectories(dataDir);
 
-        // Raft 元数据持久化文件
-        this.raftMetaPath = dataDir.resolve("raft_meta");
-        loadRaftMeta();
-
         // Recover existing segments if the process is restarting on an existing WAL dir.
         // If nothing exists yet, create the initial segment at offset 0.
         loadExistingSegments();
@@ -192,8 +177,8 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
         } else {
             currentSegment = segments.get(segments.size() - 1);
             nextSegmentIndex = currentSegment.index + 1;
-            logger.info("Recovered WAL: segments={}, writePosition={}, lastLogEntryEpoch={}",
-                segments.size(), writePosition.get(), lastLogEntryEpoch);
+            logger.info("Recovered WAL: segments={}, writePosition={}",
+                segments.size(), writePosition.get());
         }
 
         this.flushThread = Thread.ofPlatform()
@@ -247,7 +232,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
         }
 
         long recoveredWritePosition = 0;
-        long recoveredLastLogEntryEpoch = 0;
         int maxSegmentIndex = 0;
 
         for (Path path : existing) {
@@ -262,9 +246,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
             segments.add(seg);
 
             recoveredWritePosition = segmentStart + recovery.usedBytes;
-            if (recovery.usedBytes > 0) {
-                recoveredLastLogEntryEpoch = recovery.lastEntryEpoch;
-            }
 
             maxSegmentIndex = Math.max(maxSegmentIndex, segmentIndex);
         }
@@ -274,13 +255,11 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
             nextSegmentIndex = maxSegmentIndex + 1;
             writePosition.set(recoveredWritePosition);
             flushedPosition = recoveredWritePosition;
-            lastLogEntryEpoch = recoveredLastLogEntryEpoch;
         }
     }
 
     private SegmentRecovery scanSegment(Segment seg) throws IOException {
         long localPos = 0;
-        long lastEpoch = 0;
         while (localPos + RECORD_OVERHEAD <= seg.size) {
             ByteBuffer headerBuf = ByteBuffer.allocate(HEADER_SIZE)
                 .order(java.nio.ByteOrder.BIG_ENDIAN);
@@ -321,13 +300,10 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
                 break;
             }
 
-            if (payload.length >= EPOCH_PREFIX_SIZE) {
-                lastEpoch = ByteBuffer.wrap(payload, 0, EPOCH_PREFIX_SIZE).getLong();
-            }
             localPos += recordSize;
         }
 
-        return new SegmentRecovery(localPos, lastEpoch);
+        return new SegmentRecovery(localPos);
     }
 
     private int extractSegmentIndex(String filename) {
@@ -626,8 +602,8 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
     /**
      * 将写入位置回退到 globalOffset，丢弃之后的所有数据。
      *
-     * Raft 日志截断使用：删除 globalOffset 之后的所有段文件，
-     * 在 globalOffset 处创建新段，重置 writePosition 和 flushedPosition。
+     * 日志截断使用：删除 globalOffset 之后的所有段文件，
+     * 在 globalOffset 处重置 writePosition 和 flushedPosition。
      *
      * @param globalOffset 新的写入起始位置（必须 <= 当前 writePosition）
      */
@@ -697,33 +673,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
         writePosition.set(globalOffset);
         flushedPosition = globalOffset;
         logger.info("WAL reset to offset {}, current segment {}", globalOffset, currentSegment.index);
-    }
-
-    private void loadRaftMeta() {
-        try {
-            if (Files.exists(raftMetaPath)) {
-                List<String> lines = Files.readAllLines(raftMetaPath);
-                if (lines.size() >= 2) {
-                    currentEpoch = Long.parseLong(lines.get(0));
-                    votedFor = lines.get(1).isEmpty() ? null : lines.get(1);
-                }
-                if (lines.size() >= 3) {
-                    lastLogEntryEpoch = Long.parseLong(lines.get(2));
-                }
-                if (lines.size() >= 4) {
-                    snapshotIndex = Long.parseLong(lines.get(3));
-                }
-                if (lines.size() >= 5) {
-                    snapshotEpoch = Long.parseLong(lines.get(4));
-                }
-                if (lines.size() >= 6) {
-                    snapshotOffset = Long.parseLong(lines.get(5));
-                }
-                // Backward-compatible: pre-existing 2-line files leave lastLogEntryEpoch at 0
-            }
-        } catch (Exception e) {
-            logger.warn("Failed to load Raft metadata, starting fresh", e);
-        }
     }
 
     // ========== WalAccessor 实现 ==========
@@ -843,100 +792,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
         return "OK";
     }
 
-    // ========== Raft 元数据 ==========
-
-    private void saveRaftMeta() {
-        Path tmpPath = raftMetaPath.resolveSibling(raftMetaPath.getFileName() + ".tmp");
-        try {
-            Files.writeString(tmpPath,
-                currentEpoch + "\n" + (votedFor != null ? votedFor : "") + "\n" +
-                lastLogEntryEpoch + "\n" + snapshotIndex + "\n" + snapshotEpoch + "\n" + snapshotOffset + "\n");
-            Files.move(tmpPath, raftMetaPath,
-                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-        } catch (IOException e) {
-            logger.error("Failed to save Raft metadata", e);
-            try { Files.deleteIfExists(tmpPath); } catch (IOException ignored) {}
-        }
-    }
-
-    @Override
-    public long getLastLogEpoch() { return currentEpoch; }
-
-    @Override
-    public void setCurrentEpoch(long epoch) {
-        this.currentEpoch = epoch;
-    }
-
-    @Override
-    public void setEpochAndVotedFor(long epoch, String votedFor) {
-        this.currentEpoch = epoch;
-        this.votedFor = votedFor;
-    }
-
-    @Override
-    public String getVotedFor() { return votedFor; }
-
-    @Override
-    public void setVotedFor(String nodeId) {
-        this.votedFor = nodeId;
-    }
-
-    @Override
-    public long writeEntry(byte[] data) {
-        long startPos = write(data);
-        int recordLen = RECORD_FIXED_OVERHEAD + data.length;
-        // Extract epoch from the Raft-framed data (first 8 bytes = epoch as big-endian long)
-        if (data.length >= 8) {
-            lastLogEntryEpoch = java.nio.ByteBuffer.wrap(data, 0, 8).getLong();
-        }
-        return startPos + recordLen; // Return end position = log index (caller doesn't need to know record format)
-    }
-
-    @Override
-    public long getLastLogEntryEpoch() {
-        return lastLogEntryEpoch;
-    }
-
-    @Override
-    public long getSnapshotIndex() {
-        return snapshotIndex;
-    }
-
-    @Override
-    public long getSnapshotEpoch() {
-        return snapshotEpoch;
-    }
-
-    @Override
-    public long getSnapshotOffset() {
-        return snapshotOffset;
-    }
-
-    @Override
-    public synchronized void setSnapshotMetadata(long snapshotIndex, long snapshotEpoch) {
-        setSnapshotMetadata(snapshotIndex, snapshotEpoch, getWritePosition());
-    }
-
-    @Override
-    public synchronized void setSnapshotMetadata(long snapshotIndex, long snapshotEpoch, long snapshotOffset) {
-        this.snapshotIndex = Math.max(0, snapshotIndex);
-        this.snapshotEpoch = Math.max(0, snapshotEpoch);
-        this.snapshotOffset = Math.max(0, snapshotOffset);
-        saveRaftMeta();
-    }
-
-    /**
-     * 同步持久化 Raft 元数据（currentEpoch、votedFor）到磁盘。
-     *
-     * Raft §5.2 要求：节点在回复任何 RPC 之前，必须确保持久化 currentEpoch 和 votedFor。
-     * saveRaftMeta 写入原子临时文件后 rename，保证调用返回后元数据已落盘。
-     */
-    @Override
-    public void persistRaftMeta() {
-        saveRaftMeta();
-    }
-
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {
@@ -960,9 +815,6 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
             closeSegment(seg);
         }
 
-        // 最后同步保存 Raft 元数据保证最新状态落盘
-        saveRaftMeta();
-
         logger.info("SimpleWalWriter closed, writes={}, flushes={}",
             stats.getWriteCount(), stats.getFlushCount());
     }
@@ -971,11 +823,9 @@ public class SimpleWalWriter implements AutoCloseable, WalAccessor {
 
     private static class SegmentRecovery {
         final long usedBytes;
-        final long lastEntryEpoch;
 
-        SegmentRecovery(long usedBytes, long lastEntryEpoch) {
+        SegmentRecovery(long usedBytes) {
             this.usedBytes = usedBytes;
-            this.lastEntryEpoch = lastEntryEpoch;
         }
     }
 }

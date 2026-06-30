@@ -127,7 +127,7 @@ public class Intent {
     private String lastDeliveryId;
 
     /**
-     * 单调递增的写版本号，用于 Raft 写幂等和乐观并发控制。
+     * 单调递增的写版本号，用于乐观并发控制。
      */
     private volatile long revision;
 
@@ -251,7 +251,7 @@ public class Intent {
     /**
      * 创建当前 Intent 的独立副本。
      *
-     * Raft 写路径会先在内存中生成最终快照，再提交到日志，避免直接
+     * 写路径会先在内存中生成最终快照，再提交到日志，避免直接
      * 修改 store 中的当前态对象。
      */
     public Intent copy() {
@@ -402,8 +402,7 @@ public class Intent {
     /**
      * 增加写版本号。
      *
-     * Raft 写路径和本地写路径都会在状态变更后调用它，避免重复提交
-     * 或陈旧写请求覆盖更新后的状态。
+     * 状态变更后调用它，避免重复提交或陈旧写请求覆盖更新后的状态。
      */
     public void incrementRevision() {
         this.revision++;

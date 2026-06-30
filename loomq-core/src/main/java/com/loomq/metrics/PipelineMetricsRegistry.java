@@ -18,11 +18,6 @@ final class PipelineMetricsRegistry {
     private final LongAdder deliveryLatencyTotalMs = new LongAdder();
     private final AtomicLong deliveryLatencyMaxMs = new AtomicLong(0);
 
-    private final LongAdder replicationRecordsSent = new LongAdder();
-    private final LongAdder replicationRecordsAcked = new LongAdder();
-    private final LongAdder replicationBytesSent = new LongAdder();
-    private final AtomicLong replicationLagMs = new AtomicLong(0);
-
     private final LongAdder walRecordsWritten = new LongAdder();
     private final LongAdder walBytesWritten = new LongAdder();
     private final LongAdder snapshotsCreated = new LongAdder();
@@ -46,19 +41,6 @@ final class PipelineMetricsRegistry {
 
     void recordDeliveryRetry() {
         deliveriesRetried.increment();
-    }
-
-    void recordReplicationRecordSent(int bytes) {
-        replicationRecordsSent.increment();
-        replicationBytesSent.add(bytes);
-    }
-
-    void recordReplicationRecordAcked() {
-        replicationRecordsAcked.increment();
-    }
-
-    void updateReplicationLag(long lagMs) {
-        replicationLagMs.set(lagMs);
     }
 
     void recordWalRecordWritten(int bytes) {
@@ -106,18 +88,6 @@ final class PipelineMetricsRegistry {
         return deliveryLatencyMaxMs.get();
     }
 
-    long getReplicationRecordsSent() {
-        return replicationRecordsSent.sum();
-    }
-
-    long getReplicationRecordsAcked() {
-        return replicationRecordsAcked.sum();
-    }
-
-    long getReplicationLagMs() {
-        return replicationLagMs.get();
-    }
-
     long getWalRecordsWritten() {
         return walRecordsWritten.sum();
     }
@@ -137,10 +107,6 @@ final class PipelineMetricsRegistry {
         deliveriesRetried.reset();
         deliveryLatencyTotalMs.reset();
         deliveryLatencyMaxMs.set(0);
-        replicationRecordsSent.reset();
-        replicationRecordsAcked.reset();
-        replicationBytesSent.reset();
-        replicationLagMs.set(0);
         walRecordsWritten.reset();
         walBytesWritten.reset();
         snapshotsCreated.reset();
