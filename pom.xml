@@ -108,24 +108,15 @@
                         <format>
                             <includes>
                                 <include>.editorconfig</include>
-                                <include>.env.example</include>
                                 <include>.gitattributes</include>
                                 <include>.github/**/*.yml</include>
-                                <include>CHANGELOG.md</include>
                                 <include>CLAUDE.md</include>
-                                <include>CONTRIBUTING.md</include>
                                 <include>Makefile</include>
-                                <include>README.md</include>
-                                <include>README.zh.md</include>
-                                <include>SECURITY.md</include>
                                 <include>docs/development/ARCHITECTURE.md</include>
-                                <include>docs/development/API.md</include>
-                                <include>docs/development/TECH_DEBT_CLEANUP.md</include>
+                                <include>docs/architecture/**/*.md</include>
                                 <include>benchmark/scripts/**/*.ps1</include>
                                 <include>benchmark/scripts/**/*.sh</include>
                                 <include>benchmark/README.md</include>
-                                <include>docs/architecture/**/*.md</include>
-                                <include>docs/operations/**/*.md</include>
                             </includes>
                             <trimTrailingWhitespace/>
                             <endWithNewline/>
