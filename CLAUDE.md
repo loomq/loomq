@@ -43,7 +43,7 @@ Tests are categorized with `@Tag` annotations. Maven Surefire uses `groups`/`exc
 | Tag | Maven Profile | What |
 |-----|--------------|------|
 | *(none)* | default / `fast-tests` | Fast unit tests, always run |
-| `slow` | `slow-tests` | PrecisionSchedulerTest, SegmentedWalTest, ColdSwapSoakTest, SimpleWalWriterTruncateTest |
+| `slow` | `slow-tests` | PrecisionSchedulerTest, LoomqEnginePhtwRecoveryTest |
 | `benchmark` | (included in `full-tests`) | Performance benchmarks |
 
 ## Architecture
@@ -55,10 +55,14 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
     │   ├── CohortManager     — CSA-style batched wakeup (replaces per-intent VT sleep)
     │   ├── BucketGroupManager — per-tier time-bucket storage
     │   └── ResizableSemaphore — extends Semaphore, runtime-resizable permits
-    ├── IntentStore           — pluggable storage (ConcurrentIntentStore)
-    ├── SimpleWalWriter       — memory-mapped WAL with FFM API (~100ns/record)
-    ├── RecoveryPipeline      — snapshot + WAL replay on restart
-    └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, WalAccessor, RedeliveryDecider
+    ├── IntentStore           — in-memory hot-state store (ConcurrentIntentStore)
+    ├── WheelStore            — persistent hierarchical timing wheel (4-tier mmap: sec/min/hour/day)
+    ├── TailIndex             — durable run-file for intents beyond the day-wheel horizon (>30 days)
+    ├── GroupCommitBarrier    — rendezvous msync daemon; DURABLE writers awaitCommit()
+    ├── PromotionDaemon       — cold→hot cohort promotion (mirrors CohortManager, HOT_WINDOW=60min)
+    ├── IntentLocationIndex   — intentId→SlotLocation index for cold cancel/reschedule
+    ├── WheelRecovery         — scan-based recovery on restart (replaces snapshot+WAL replay)
+    └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, RedeliveryDecider
 ```
 
 **Intent lifecycle:** CREATED → SCHEDULED → DUE → DISPATCHING → DELIVERED → ACKED (branches: CANCELLED, EXPIRED, DEAD_LETTERED)
@@ -74,7 +78,10 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
 - **Cohort-based wakeup (CSA-inspired)** — intents with delay > precision window are grouped by cohort key; one daemon thread wakes thousands, replacing per-intent VT sleep.
 - **Arrow cross-tier borrowing** — when a tier's semaphore is full, consumers borrow slots from lower-priority tiers via `tryAcquire(100ms)`. AdapTBF bounds lending to 50% of a tier's slots to prevent starvation.
 - **ResizableSemaphore extends Semaphore** — zero-overhead acquire/tryAcquire (inherited); only release() is overridden for gradual shrink via permit discarding. Tracks `borrowedCount` per tier.
-- **IntentStore is pluggable** — `ConcurrentIntentStore` handles in-memory mode; use `upsert()` for current-state writes.
+- **Persistent Hierarchical Timing Wheel (PHTW)** — durability lives in a 4-tier mmap wheel (sec/min/hour/day) plus `TailIndex` (run-file for intents beyond the day-wheel horizon, >30 days). `WheelStore` is append-only; recovery dedups by max revision per intentId.
+- **Group-commit durability** — `GroupCommitBarrier` runs a rendezvous msync daemon; `DURABLE` writers `awaitCommit()` until a force covering their write completes. `ASYNC` returns after mmap (crash window); state-change ops (update/cancel/fireNow) hardcode `DURABLE`.
+- **Cold→hot promotion** — `PromotionDaemon` registers intents due beyond `HOT_WINDOW_MS` (60min) as cohorts, mirroring `CohortManager`; on wake it loads the slot into memory and hands off to the scheduler. `IntentLocationIndex` (intentId→`SlotLocation`) enables cold cancel/reschedule.
+- **IntentStore is hot-state only** — `ConcurrentIntentStore` holds the in-memory hot window (≤60min); the wheel is the durable authority. Use `upsert()` for current-state writes.
 
 ## CI
 

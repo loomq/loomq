@@ -3,20 +3,22 @@ package com.loomq;
 import com.loomq.application.command.IntentCommandService;
 import com.loomq.application.scheduler.BucketGroupManager;
 import com.loomq.application.scheduler.PrecisionScheduler;
-import com.loomq.application.swap.ColdIntentSwapper;
 import com.loomq.common.MetricsCollector;
-import com.loomq.config.WalConfig;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
-import com.loomq.infrastructure.wal.SimpleWalWriter;
-import com.loomq.recovery.RecoveryPipeline;
-import com.loomq.snapshot.SnapshotManager.SnapshotInfo;
+import com.loomq.infrastructure.wheel.GroupCommitBarrier;
+import com.loomq.infrastructure.wheel.IntentLocationIndex;
+import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.TailIndex;
+import com.loomq.infrastructure.wheel.WheelConfig;
+import com.loomq.infrastructure.wheel.WheelRecovery;
+import com.loomq.infrastructure.wheel.WheelRecoveryReport;
+import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.IntentObserver;
 import com.loomq.spi.RedeliveryDecider;
-import com.loomq.spi.WalAccessor;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
@@ -44,27 +46,41 @@ import org.slf4j.LoggerFactory;
  * 纯 Java 实现，零外部依赖（仅 SLF4J API）。
  * 提供 Intent 队列的核心能力，通过 DeliveryHandler 投递 Intent。
  *
+ * <p>持久化由持久化分层时间轮(PHTW)栈承担:{@link WheelStore}(四轮 mmap 槽位)+
+ * {@link TailIndex}(超 day 视界 run 文件)+ {@link GroupCommitBarrier}(group-commit msync)+
+ * {@link IntentLocationIndex}(intentId→槽位)+ {@link PromotionDaemon}(冷→热提升 cohort)+
+ * {@link WheelRecovery}(重启扫描重建)。</p>
+ *
  * @author loomq
  */
 public class LoomqEngine implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(LoomqEngine.class);
 
+    /**
+     * 默认投递处理器:未配置 deliveryHandler 时使用,直接判为 DEAD_LETTER。
+     * 使引擎开箱即用(嵌入式场景下调用方可能仅用于调度/持久化,不关心投递)。
+     */
+    private static final DeliveryHandler DEFAULT_DELIVERY_HANDLER = intent ->
+        CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.DEAD_LETTER);
+
     // ========== 核心组件 ==========
     private final IntentStore intentStore;
-    private final SimpleWalWriter walWriter;
+    private final WheelStore wheelStore;
+    private final TailIndex tailIndex;
+    private final GroupCommitBarrier commitBarrier;
+    private final IntentLocationIndex locationIndex;
+    private final PromotionDaemon promotionDaemon;
+    private final WheelRecovery wheelRecovery;
     private final MetricsCollector metricsCollector;
     private final PrecisionScheduler scheduler;
-    private final RecoveryPipeline recoveryPipeline;
     private final IntentCommandService commandService;
-    private final ColdIntentSwapper coldSwapper;
 
     // ========== 观察器 ==========
     private final List<IntentObserver> observers = new CopyOnWriteArrayList<>();
 
     // ========== 回调机制 ==========
     private final Executor callbackExecutor;
-    private final Executor walWriteExecutor;
     private final java.util.concurrent.ExecutorService operationExecutor;
 
     // ========== 状态 ==========
@@ -75,18 +91,15 @@ public class LoomqEngine implements AutoCloseable {
     // ========== 配置 ==========
     private final Path walDir;
     private final String nodeId;
-    private final WalConfig walConfig;
     private final PrecisionTier defaultTier;
 
     private LoomqEngine(Builder builder) {
         this.nodeId = builder.nodeId != null ? builder.nodeId : "default-node";
         this.walDir = builder.walDir != null ? builder.walDir : Path.of("./data");
-        this.walConfig = builder.walConfig != null ? builder.walConfig : defaultWalConfig();
         this.defaultTier = builder.defaultTier;
         this.callbackExecutor = builder.callbackExecutor != null
             ? builder.callbackExecutor
             : Executors.newVirtualThreadPerTaskExecutor();
-        this.walWriteExecutor = Executors.newVirtualThreadPerTaskExecutor();
         this.operationExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
         try {
@@ -97,44 +110,47 @@ public class LoomqEngine implements AutoCloseable {
             this.intentStore = builder.intentStore != null
                 ? builder.intentStore
                 : new ConcurrentIntentStore();
-            this.walWriter = new SimpleWalWriter(walConfig, "shard-0");
+            WheelConfig wheelConfig = WheelConfig.defaultConfig().withDataDir(walDir.toString());
+            this.wheelStore = new WheelStore(wheelConfig, System::currentTimeMillis);
+            this.tailIndex = new TailIndex(walDir, System::currentTimeMillis);
+            this.commitBarrier = new GroupCommitBarrier(wheelStore, tailIndex, wheelConfig.groupCommitIntervalMs());
+            this.locationIndex = new IntentLocationIndex();
             this.metricsCollector = MetricsCollector.getInstance();
-            this.recoveryPipeline = new RecoveryPipeline(walDir);
 
-            // 初始化调度器
+            // 初始化调度器(未配置 deliveryHandler 时使用默认 DEAD_LETTER 处理器)
+            DeliveryHandler deliveryHandler = builder.deliveryHandler != null
+                ? builder.deliveryHandler
+                : DEFAULT_DELIVERY_HANDLER;
             this.scheduler = new PrecisionScheduler(
                 intentStore,
-                builder.deliveryHandler,
+                deliveryHandler,
                 builder.redeliveryDecider
             );
 
-            // 初始化冷热交换器（依赖 scheduler）
-            this.coldSwapper = new ColdIntentSwapper(intentStore, scheduler, walWriter);
+            // 初始化冷→热提升 daemon:到点把冷 Intent 从磁盘载入内存并调度
+            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, intent -> {
+                if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
+                    intentStore.upsert(intent);          // 幂等:已在内存则跳过
+                    scheduler.schedule(intent);
+                }
+            });
+
+            this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex);
 
             this.commandService = new IntentCommandService(
-                intentStore,
-                scheduler,
-                walWriter,
-                metricsCollector,
-                callbackExecutor,
-                walWriteExecutor,
-                running,
-                sequenceNumber,
-                builder.callbackHandler,
-                defaultTier,
-                coldSwapper
+                intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
+                locationIndex, promotionDaemon,
+                metricsCollector, callbackExecutor, running, sequenceNumber,
+                builder.callbackHandler, defaultTier
             );
 
             logger.info(
-                "LoomqEngine created: nodeId={}, walDir={}, walEngine={}, flushStrategy={}, syncOnWrite={}, segmentSizeMb={}, flushThresholdKb={}, stripeCount={}",
+                "LoomqEngine created: nodeId={}, walDir={}, horizonDays={}, slotsPerBucket={}, groupCommitIntervalMs={}",
                 nodeId,
                 walDir,
-                walConfig.engine(),
-                walConfig.flushStrategy(),
-                walConfig.syncOnWrite(),
-                walConfig.segmentSizeMb(),
-                walConfig.memorySegmentFlushThresholdKb(),
-                walConfig.memorySegmentStripeCount()
+                wheelConfig.horizonDays(),
+                wheelConfig.slotsPerBucket(),
+                wheelConfig.groupCommitIntervalMs()
             );
 
         } catch (IOException e) {
@@ -153,30 +169,26 @@ public class LoomqEngine implements AutoCloseable {
         logger.info("╔════════════════════════════════════════════════════════╗");
         logger.info("║       LoomQ Core Engine Starting...                    ║");
         logger.info("║       Mode: Embedded (Zero HTTP dependencies)          ║");
+        logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
         logger.info("╚════════════════════════════════════════════════════════╝");
 
-        // 先恢复快照和 WAL 增量，再启动运行时
-        RecoveryPipeline.RecoveryReport recoveryReport = recoveryPipeline.recover(intentStore, scheduler, walWriter);
-        if (recoveryReport.restoredTotal() > 0) {
-            logger.info("Recovered {} intents from snapshot/WAL (snapshot={}, wal={})",
-                recoveryReport.restoredTotal(),
-                recoveryReport.restoredFromSnapshot(),
-                recoveryReport.restoredFromWal());
+        // 1. 恢复:扫所有槽 → 重建索引 + 热载入内存 + 冷注册 promotion cohort
+        WheelRecoveryReport recoveryReport =
+            wheelRecovery.recover(intentStore, scheduler, locationIndex, promotionDaemon);
+        if (recoveryReport.hotRestored() > 0 || recoveryReport.coldRegistered() > 0) {
+            logger.info("WheelRecovery: hotRestored={}, coldRegistered={}",
+                recoveryReport.hotRestored(), recoveryReport.coldRegistered());
         }
 
-        // 启动 WAL
-        walWriter.start();
+        // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
+        commitBarrier.start();
 
-        // 启动调度器
+        // 3. 启动 promotion daemon(冷→热提升 cohort)
+        promotionDaemon.start();
+
+        // 4. 启动调度器
         scheduler.setObservers(observers);
         scheduler.start();
-
-        // 启动冷热交换器（长延迟 Intent 内存换出/换入）
-        coldSwapper.start();
-
-        // 启动定期快照（快照完成后自动截断旧 WAL 段，冷 Intent 的 WAL 段受保护不被截断）
-        recoveryPipeline.startSnapshots(intentStore, walWriter::getWritePosition, () -> walWriter,
-            coldSwapper::getMinRequiredWalPosition);
 
         logger.info("Engine started successfully");
     }
@@ -193,25 +205,23 @@ public class LoomqEngine implements AutoCloseable {
         running.set(false);
         logger.info("Shutting down LoomqEngine...");
 
-        // 停止恢复/快照管线
-        recoveryPipeline.close();
+        // 停止提升 daemon
+        promotionDaemon.close();
 
         // 停止调度器
         scheduler.stop();
 
-        // 停止冷热交换器
-        coldSwapper.close();
-
         // 停止存储后台清理线程
         intentStore.shutdown();
 
-        // 关闭 WAL
-        walWriter.close();
+        // 关闭 group-commit daemon
+        commitBarrier.close();
 
-        // 关闭 WAL 写入执行器
-        if (walWriteExecutor instanceof AutoCloseable ac) {
-            ac.close();
-        }
+        // 关闭时间轮(强制脏桶落盘)
+        wheelStore.close();
+
+        // 关闭 tail run 文件
+        tailIndex.close();
 
         // 关闭回调执行器
         if (callbackExecutor instanceof AutoCloseable) {
@@ -229,7 +239,7 @@ public class LoomqEngine implements AutoCloseable {
      *
      * @param intent  Intent 对象
      * @param ackMode 确认模式
-     * @return CompletableFuture<Long> WAL 序列号
+     * @return CompletableFuture<Long> 序列号
      */
     public CompletableFuture<Long> createIntent(Intent intent, AckMode ackMode) {
         return CompletableFuture.supplyAsync(() -> commandService.createIntent(intent, ackMode), operationExecutor);
@@ -240,7 +250,7 @@ public class LoomqEngine implements AutoCloseable {
      *
      * @param intents Intent 列表
      * @param ackMode 确认模式
-     * @return CompletableFuture<List<Long>> WAL 序列号列表
+     * @return CompletableFuture<List<Long>> 序列号列表
      */
     public CompletableFuture<List<Long>> createIntents(List<Intent> intents, AckMode ackMode) {
         return CompletableFuture.supplyAsync(() -> commandService.createIntents(intents, ackMode), operationExecutor);
@@ -361,19 +371,18 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取 WAL 访问器（供服务层读取/截断 WAL）
-     *
-     * @return WalAccessor
-     */
-    public WalAccessor getWalAccessor() {
-        return walWriter;
-    }
-
-    /**
      * 获取命令服务。
      */
     public IntentCommandService getCommandService() {
         return commandService;
+    }
+
+    /**
+     * 获取 intent 位置索引(包级可见,供同包测试断言冷取消后的索引状态)。
+     * 不作为公共 API:生产调用方应通过 commandService 间接操作。
+     */
+    IntentLocationIndex getLocationIndex() {
+        return locationIndex;
     }
 
     /**
@@ -410,72 +419,12 @@ public class LoomqEngine implements AutoCloseable {
         );
     }
 
-    /**
-     * 获取 WAL 健康状态
-     */
-    public WalHealthStatus getWalHealth() {
-        return new WalHealthStatus(
-            walWriter.getWalHealth(),
-            walWriter.getUnflushedBytes(),
-            walWriter.getLastFsyncMsAgo(),
-            walWriter.getWritePosition(),
-            walWriter.getFlushedPosition()
-        );
-    }
-
-    /**
-     * WAL 健康状态
-     */
-    public record WalHealthStatus(
-        String status,
-        long unflushedBytes,
-        long lastFsyncMsAgo,
-        long writePosition,
-        long flushedPosition
-    ) {}
-
-    /**
-     * 立即生成一次快照。
-     */
-    public SnapshotInfo createSnapshot() {
-        ensureRunning();
-        return recoveryPipeline.checkpoint(intentStore, walWriter::getWritePosition);
-    }
-
-    /**
-     * 获取冷热交换统计。
-     */
-    public ColdSwapStats getColdSwapStats() {
-        return new ColdSwapStats(
-            coldSwapper.coldIntentCount(),
-            coldSwapper.getTotalSwappedOut(),
-            coldSwapper.getTotalSwappedIn(),
-            coldSwapper.getSwapInErrors(),
-            coldSwapper.getColdThreshold()
-        );
-    }
-
-    /**
-     * 冷热交换统计。
-     */
-    public record ColdSwapStats(
-        int coldIntentCount,
-        long totalSwappedOut,
-        long totalSwappedIn,
-        long swapInErrors,
-        java.time.Duration coldThreshold
-    ) {}
-
     // ========== 内部方法 ==========
 
     private void ensureRunning() {
         if (!running.get()) {
             throw new IllegalStateException("Engine is not running");
         }
-    }
-
-    private WalConfig defaultWalConfig() {
-        return WalConfig.defaultConfig().withDataDir(walDir.toString());
     }
 
     // ========== Builder ==========
@@ -487,7 +436,6 @@ public class LoomqEngine implements AutoCloseable {
     public static class Builder {
         private Path walDir;
         private String nodeId;
-        private WalConfig walConfig;
         private Executor callbackExecutor;
         private CallbackHandler callbackHandler;
         private DeliveryHandler deliveryHandler;
@@ -502,11 +450,6 @@ public class LoomqEngine implements AutoCloseable {
 
         public Builder nodeId(String nodeId) {
             this.nodeId = nodeId;
-            return this;
-        }
-
-        public Builder walConfig(WalConfig walConfig) {
-            this.walConfig = walConfig;
             return this;
         }
 

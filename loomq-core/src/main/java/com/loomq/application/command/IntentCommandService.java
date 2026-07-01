@@ -1,7 +1,6 @@
 package com.loomq.application.command;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
-import com.loomq.application.swap.ColdIntentSwapper;
 import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
@@ -9,16 +8,18 @@ import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.domain.intent.WalMode;
-import com.loomq.infrastructure.wal.IntentBinaryCodec;
-import com.loomq.infrastructure.wal.SimpleWalWriter;
+import com.loomq.infrastructure.wheel.GroupCommitBarrier;
+import com.loomq.infrastructure.wheel.IntentLocationIndex;
+import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.SlotLocation;
+import com.loomq.infrastructure.wheel.TailIndex;
+import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -31,6 +32,11 @@ import org.slf4j.LoggerFactory;
  *
  * 统一承接 intent 的创建、更新、取消和立即触发，避免业务命令逻辑分散在
  * LoomqEngine、HTTP 适配层和调度器之间。
+ *
+ * <p>持久化由持久化分层时间轮(PHTW)栈承担:写入 {@link WheelStore}(磁盘权威)或
+ * {@link TailIndex}(超 day 视界),{@link GroupCommitBarrier} 提供 DURABLE group-commit,
+ * {@link IntentLocationIndex} 记录 intentId→槽位以支持冷取消,{@link PromotionDaemon}
+ * 负责冷→热提升 cohort。
  */
 public final class IntentCommandService {
 
@@ -38,41 +44,47 @@ public final class IntentCommandService {
 
     private final IntentStore intentStore;
     private final PrecisionScheduler scheduler;
-    private final SimpleWalWriter walWriter;
+    private final WheelStore wheelStore;
+    private final TailIndex tailIndex;
+    private final GroupCommitBarrier commitBarrier;
+    private final IntentLocationIndex locationIndex;
+    private final PromotionDaemon promotionDaemon;
     private final MetricsCollector metricsCollector;
     private final Executor callbackExecutor;
-    private final Executor walWriteExecutor;
     private final AtomicBoolean running;
     private final AtomicLong sequenceNumber;
 
     private volatile CallbackHandler callbackHandler;
     private final PrecisionTier defaultTier;
-    private final ColdIntentSwapper coldSwapper;
 
     public IntentCommandService(
         IntentStore intentStore,
         PrecisionScheduler scheduler,
-        SimpleWalWriter walWriter,
+        WheelStore wheelStore,
+        TailIndex tailIndex,
+        GroupCommitBarrier commitBarrier,
+        IntentLocationIndex locationIndex,
+        PromotionDaemon promotionDaemon,
         MetricsCollector metricsCollector,
         Executor callbackExecutor,
-        Executor walWriteExecutor,
         AtomicBoolean running,
         AtomicLong sequenceNumber,
         CallbackHandler callbackHandler,
-        PrecisionTier defaultTier,
-        ColdIntentSwapper coldSwapper
+        PrecisionTier defaultTier
     ) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
-        this.walWriter = walWriter;
+        this.wheelStore = wheelStore;
+        this.tailIndex = tailIndex;
+        this.commitBarrier = commitBarrier;
+        this.locationIndex = locationIndex;
+        this.promotionDaemon = promotionDaemon;
         this.metricsCollector = metricsCollector;
         this.callbackExecutor = callbackExecutor;
-        this.walWriteExecutor = walWriteExecutor;
         this.running = running;
         this.sequenceNumber = sequenceNumber;
         this.callbackHandler = callbackHandler;
         this.defaultTier = defaultTier;
-        this.coldSwapper = coldSwapper;
     }
 
     public void registerCallbackHandler(CallbackHandler handler) {
@@ -91,11 +103,10 @@ public final class IntentCommandService {
     /**
      * 创建 Intent 并调度。
      *
-     * <p>持久化语义取决于 ackMode：
+     * <p>持久化语义取决于 ackMode:
      * <ul>
-     *   <li><b>DURABLE</b>（默认）：WAL 同步刷盘后才返回，崩溃不丢数据</li>
-     *   <li><b>ASYNC</b>：WAL 异步写入，高吞吐但崩溃时可能丢失最近创建的 Intent</li>
-     *   <li><b>BATCH_DEFERRED</b>：WAL 批量写入，吞吐优先但崩溃窗口更大</li>
+     *   <li><b>DURABLE</b>(默认):写入 PHTW 后阻塞到 group-commit msync,崩溃不丢数据</li>
+     *   <li><b>ASYNC</b>:写入 mmap 后立即返回(由 group-commit daemon 异步刷盘),崩溃时可能丢失最近创建的 Intent</li>
      * </ul>
      *
      * @return 序列号
@@ -114,43 +125,37 @@ public final class IntentCommandService {
             intent.transitionTo(IntentStatus.SCHEDULED);
             intent.incrementRevision();
 
-            // Pipeline overlap (DeepSeek V4 compute-comm overlap):
-            // 1. Pre-encode WAL payload (CPU)
-            byte[] walPayload = IntentBinaryCodec.encode(intent);
-
-            // 2. Resolve effective WAL mode
             WalMode effectiveMode = resolveWalMode(intent, ackMode);
 
-            // 非 DURABLE 模式下 WAL 写入为 fire-and-forget，崩溃时可能丢失数据
+            // 非 DURABLE 模式下写入为 fire-and-forget(落 mmap 但未 force),崩溃时可能丢失数据
             if (effectiveMode != WalMode.DURABLE) {
                 logger.warn("Intent {} using non-DURABLE walMode={}, crash may cause data loss",
                     intent.getIntentId(), effectiveMode);
             }
 
-            // 3. Start WAL write (I/O) — runs on background thread for DURABLE
-            CompletableFuture<Long> walFuture = startWalWrite(walPayload, effectiveMode);
+            // 3. 写入持久化分层时间轮(磁盘权威)+ 更新索引
+            //    wheelStore.put 返回实际分配槽位的 SlotLocation(slotIndex>=0);
+            //    locate() 仅返回 slotIndex=-1 的占位,不能直接入索引(否则冷取消/提升读槽失败)。
+            SlotLocation loc = wheelStore.locate(intent.getExecuteAt());
+            if (loc.inTail()) {
+                tailIndex.put(intent);                  // 远期(>horizon):落 tail
+            } else {
+                loc = wheelStore.put(intent);           // 捕获分配的真实槽位
+            }
+            locationIndex.put(intent.getIntentId(), loc);
 
-            // 4. While WAL I/O is in flight, save to store (memory-only)
-            intentStore.save(intent);
-
-            // 5. For DURABLE mode, wait for fsync before scheduling or cold-swap
-            long walPosition = -1;
+            // 4. DURABLE: 阻塞到 group-commit msync(覆盖本次写入的 force 完成)
             if (effectiveMode == WalMode.DURABLE) {
-                walPosition = walFuture.join();
+                commitBarrier.awaitCommit();
             }
 
-            // 6. Cold swap: long-delay intents evicted from memory after DURABLE persist
-            if (coldSwapper != null && walPosition >= 0
-                && coldSwapper.shouldSwapOut(Duration.between(Instant.now(), intent.getExecuteAt()).toMillis())) {
-                int recordLen = SimpleWalWriter.recordLength(walPayload.length);
-                coldSwapper.swapOut(intent, walPosition, recordLen);
-                logger.debug("Intent {} cold-swapped: delay={}s, walPos={}",
-                    intent.getIntentId(),
-                    Duration.between(Instant.now(), intent.getExecuteAt()).toSeconds(),
-                    walPosition);
-            } else {
-                // 7. Schedule (memory-only, independent of WAL)
+            // 5. 热(≤60min)→ 进内存热尖 + 调度;冷 → 注册 promotion cohort(到点由 PromotionDaemon 载入)
+            long deltaMs = intent.getExecuteAt().toEpochMilli() - System.currentTimeMillis();
+            if (deltaMs <= PromotionDaemon.HOT_WINDOW_MS) {
+                intentStore.save(intent);
                 scheduler.schedule(intent);
+            } else {
+                promotionDaemon.register(intent.getIntentId(), loc, intent.getExecuteAt().toEpochMilli());
             }
 
             metricsCollector.incrementIntentsCreated();
@@ -160,7 +165,9 @@ public final class IntentCommandService {
             return seq;
         } catch (Exception e) {
             logger.error("Failed to create intent: id={}", intent.getIntentId(), e);
-            // 回滚：从调度器和 store 中移除（异常可能发生在 schedule 之后）
+            // 回滚内存态:从调度器/store/索引/cohort 移除。
+            // 注意:已落盘的 wheel/tail 写入不回滚——若写入已成功,崩溃恢复会重建该 intent,
+            // 这与 DURABLE 语义一致(写入成功即持久)。
             try {
                 scheduler.removeFromSchedule(intent);
             } catch (Exception ignored) {}
@@ -170,6 +177,12 @@ public final class IntentCommandService {
                 logger.error("Rollback failed for intent {}: store.delete",
                     intent.getIntentId(), rollbackEx);
             }
+            try {
+                promotionDaemon.remove(intent.getIntentId());
+            } catch (Exception ignored) {}
+            try {
+                locationIndex.remove(intent.getIntentId());
+            } catch (Exception ignored) {}
             throw new RuntimeException("Failed to create intent", e);
         }
     }
@@ -244,13 +257,8 @@ public final class IntentCommandService {
 
         Intent intent = intentStore.findByIdInternal(intentId);
         if (intent == null) {
-            // 冷意图：intent 已从 store 移除，尝试标记取消
-            if (coldSwapper != null && coldSwapper.cancelCold(intentId)) {
-                metricsCollector.incrementIntentsCancelled();
-                logger.info("Cold intent cancelled: id={}", intentId);
-                return true;
-            }
-            return false;
+            // 冷意图:不在内存 store,经 locationIndex 定位磁盘槽取消
+            return cancelCold(intentId);
         }
 
         IntentStatus oldStatus = null;
@@ -295,15 +303,71 @@ public final class IntentCommandService {
         }
     }
 
+    /**
+     * 冷取消:Intent 不在内存 store(>60min 未提升或 >horizon 落 tail),经 locationIndex
+     * 定位磁盘槽位取消。cancel 为状态变更操作:成功路径恒为 DURABLE(写新槽/tombstone +
+     * awaitCommit);槽位缺失/损坏时返回 false,不谎报未持久化的取消。
+     *
+     * <ul>
+     *   <li>tail:追加 TOMBSTONE 到 run 文件 + awaitCommit 强制落盘</li>
+     *   <li>wheel:读槽解码 → transitionTo(CANCELED) + incrementRevision → 写新槽(append-only,
+     *       recovery 按 max revision 去重,terminal 跳过)→ 索引指向新 CANCELED 槽(在 awaitCommit
+     *       之前,杜绝在途 promote 复活)+ awaitCommit</li>
+     * </ul>
+     * 槽位可读时最后移除 promotion cohort 与索引项;槽位缺失时直接返回 false(不动索引/cohort)。
+     */
+    private boolean cancelCold(String intentId) {
+        SlotLocation loc = locationIndex.get(intentId);
+        if (loc == null) {
+            return false;                                   // 不存在(无索引项)
+        }
+
+        if (loc.inTail()) {
+            tailIndex.remove(intentId);                     // 追加 TOMBSTONE(durable 待 force)
+            commitBarrier.awaitCommit();                    // cancel 恒 DURABLE:确保 tombstone 落盘
+        } else {
+            Intent cold = wheelStore.readSlot(loc);
+            if (cold == null) {
+                // 槽位缺失/损坏(空槽、撕裂写或桶已回收):无法持久化取消。
+                // 不可谎报成功——返回 false,调用方得知取消未生效(索引与 cohort 保持原状)。
+                return false;
+            }
+            synchronized (cold) {
+                try {
+                    cold.transitionTo(IntentStatus.CANCELED);
+                } catch (IllegalStateException e) {
+                    logger.warn("Cannot cancel cold intent {}: {}", intentId, e.getMessage());
+                    return false;
+                }
+                cold.incrementRevision();
+                // WheelStore 为 append-only:此处写入新槽(revision 更高),recovery 按 intentId
+                // 取 max revision 胜者,terminal 状态跳过——不会重复投递。
+                // 关键:在 awaitCommit 之前把索引指向新 CANCELED 槽。否则 awaitCommit 窗口内,
+                // locationIndex 仍指向旧 SCHEDULED 槽,PromotionDaemon.promote 的 latest.equals(h.loc())
+                // 复核会通过(索引=旧槽=handle 槽)→ 读旧 SCHEDULED 槽 → onHotPromotion 复活已取消
+                // 的冷 Intent(ghost 投递)。指向新槽后:promote 见 latest≠h.loc() 直接跳过;即便
+                // 读到新槽也是 CANCELED(terminal)→ 跳过。两路均杜绝复活。
+                SlotLocation canceledLoc = wheelStore.put(cold);
+                locationIndex.put(intentId, canceledLoc);
+                commitBarrier.awaitCommit();            // cancel 恒 DURABLE
+            }
+        }
+
+        promotionDaemon.remove(intentId);                   // 取消提升 cohort
+        locationIndex.remove(intentId);
+        metricsCollector.incrementIntentsCancelled();
+        logger.info("Cold intent cancelled: id={}", intentId);
+        return true;
+    }
+
     public boolean fireNow(String intentId) {
         ensureRunning();
 
         Intent intent = intentStore.findByIdInternal(intentId);
         if (intent == null) {
-            // 冷意图尚在冷索引中，无法立即触发
-            if (coldSwapper != null && coldSwapper.isCold(intentId)) {
-                logger.warn("Cannot fire-now a cold intent (not yet swapped in): id={}", intentId);
-                return false;
+            // 冷意图尚在磁盘(未提升入内存),无法立即触发
+            if (locationIndex.get(intentId) != null) {
+                logger.warn("Cannot fire-now a cold intent (not yet promoted into memory): id={}", intentId);
             }
             return false;
         }
@@ -373,26 +437,24 @@ public final class IntentCommandService {
         return PrecisionTierCatalog.defaultCatalog().walMode(intent.getPrecisionTier());
     }
 
-    private CompletableFuture<Long> startWalWrite(byte[] walPayload,
-                                                   WalMode mode) {
-        return switch (mode) {
-            case ASYNC -> CompletableFuture.completedFuture(walWriter.write(walPayload));
-            case BATCH_DEFERRED -> CompletableFuture.completedFuture(walWriter.writeBatched(walPayload));
-            case DURABLE -> CompletableFuture.supplyAsync(
-                () -> walWriter.writeSync(walPayload), walWriteExecutor);
-        };
-    }
-
-    private long persistIntentState(Intent intent, AckMode ackMode) {
-        byte[] data = IntentBinaryCodec.encode(intent);
-
+    /**
+     * 持久化 intent 当前态到 PHTW 并同步索引。状态变更操作(update/cancel/fireNow)恒为 DURABLE。
+     *
+     * <p>WheelStore 为 append-only:每次写入分配新槽,旧槽残留。recovery 按 intentId 取
+     * max revision 胜者,故旧槽不会引发 ghost 投递。</p>
+     */
+    private void persistIntentState(Intent intent, AckMode ackMode) {
+        SlotLocation loc = wheelStore.locate(intent.getExecuteAt());
+        if (loc.inTail()) {
+            tailIndex.put(intent);
+        } else {
+            loc = wheelStore.put(intent);                   // 捕获分配的真实槽位
+        }
+        locationIndex.put(intent.getIntentId(), loc);       // 同步索引
         WalMode effectiveMode = resolveWalMode(intent, ackMode);
-
-        return switch (effectiveMode) {
-            case ASYNC -> walWriter.write(data);
-            case BATCH_DEFERRED -> walWriter.writeBatched(data);
-            case DURABLE -> walWriter.writeSync(data);
-        };
+        if (effectiveMode == WalMode.DURABLE) {
+            commitBarrier.awaitCommit();
+        }
     }
 
     private void ensureRunning() {

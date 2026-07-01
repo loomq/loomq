@@ -10,6 +10,9 @@ import java.util.Map;
  *
  * 提供完整的监控指标收集和查询能力
  *
+ * <p>注:持久化已由 PHTW(持久化分层时间轮)承担,原 WAL 健康指标退化为默认值
+ * (恒健康、零延迟),仅为兼容 {@link MetricsSnapshot} 字段与 {@code HealthNarrator} 读取。</p>
+ *
  * @author loomq
  * @since v0.5.0
  */
@@ -17,45 +20,6 @@ public class LoomQMetrics {
 
     // ==================== 流水线指标 ====================
     private final PipelineMetricsRegistry pipelineMetrics = new PipelineMetricsRegistry();
-
-    // ==================== WAL 健康指标 ====================
-    private final WalHealthMetricsRegistry walHealthMetrics = new WalHealthMetricsRegistry();
-
-    public void updateWalLastFlushTime(long timestamp) {
-        walHealthMetrics.updateWalLastFlushTime(timestamp);
-    }
-
-    public void incrementWalFlushErrorCount() {
-        walHealthMetrics.incrementWalFlushErrorCount();
-    }
-
-    public void recordWalFlushLatency(long latencyMs) {
-        walHealthMetrics.recordWalFlushLatency(latencyMs);
-    }
-
-    public void updateWalPendingWrites(long count) {
-        walHealthMetrics.updateWalPendingWrites(count);
-    }
-
-    public void updateWalRingBufferSize(long size) {
-        walHealthMetrics.updateWalRingBufferSize(size);
-    }
-
-    public void updateWalHealth(boolean healthy) {
-        walHealthMetrics.updateWalHealth(healthy);
-    }
-
-    public boolean isWalHealthy() {
-        return walHealthMetrics.isWalHealthy();
-    }
-
-    public long getWalLastFlushTime() {
-        return walHealthMetrics.getWalLastFlushTime();
-    }
-
-    public long getWalIdleTimeMs() {
-        return walHealthMetrics.getWalIdleTimeMs();
-    }
 
     // ==================== 单例模式 ====================
     private static final LoomQMetrics INSTANCE = new LoomQMetrics();
@@ -132,15 +96,15 @@ public class LoomQMetrics {
             pipelineMetrics.getSnapshotsCreated(),
             pendingIntents,
             pipelineMetrics.getActiveDispatches(),
-            // WAL 健康指标
-            walHealthMetrics.isWalHealthy(),
-            walHealthMetrics.getWalLastFlushTime(),
-            getWalIdleTimeMs(),
-            walHealthMetrics.getWalFlushErrorCount(),
-            walHealthMetrics.calculateAverageFlushLatency(pipelineMetrics.getWalRecordsWritten()),
-            walHealthMetrics.getWalFlushLatencyMaxMs(),
-            walHealthMetrics.getWalPendingWrites(),
-            walHealthMetrics.getWalRingBufferSize()
+            // WAL 健康指标(PHTW 无 WAL flush 概念,恒报默认健康值)
+            true,
+            0L,
+            0L,
+            0L,
+            0.0,
+            0L,
+            0L,
+            0L
         );
     }
 
@@ -163,7 +127,7 @@ public class LoomQMetrics {
         long snapshotsCreated,
         long pendingIntents,
         long activeDispatches,
-        // WAL 健康指标
+        // WAL 健康指标(PHTW 下为默认值,保留字段以兼容 HealthNarrator)
         boolean walHealthy,
         long walLastFlushTime,
         long walIdleTimeMs,
@@ -178,8 +142,6 @@ public class LoomQMetrics {
 
     public void reset() {
         pipelineMetrics.reset();
-        // WAL 健康指标重置
-        walHealthMetrics.reset();
         MetricsCollector.getInstance().resetRuntimeIntentMetrics();
     }
 }
