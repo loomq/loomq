@@ -158,21 +158,9 @@ public final class IntentCommandService {
                 }
             }
 
-            // 3. 写入持久化分层时间轮(磁盘权威)+ 更新索引
-            //    wheelStore.put 返回实际分配槽位的 SlotLocation(slotIndex>=0);
-            //    locate() 仅返回 slotIndex=-1 的占位,不能直接入索引(否则冷取消/提升读槽失败)。
-            SlotLocation loc = wheelStore.locate(intent.getExecuteAt());
-            if (loc.inTail()) {
-                tailIndex.put(intent);                  // 远期(>horizon):落 tail
-            } else {
-                loc = wheelStore.put(intent);           // 捕获分配的真实槽位
-            }
-            locationIndex.put(intent.getIntentId(), loc);
-
-            // 4. DURABLE: 阻塞到 group-commit msync(覆盖本次写入的 force 完成)
-            if (effectiveMode == WalMode.DURABLE) {
-                commitBarrier.awaitCommit();
-            }
+            // 3. 写入持久化分层时间轮(磁盘权威)+ 更新索引 + DURABLE 阻塞到 group-commit msync。
+            //    wheelStore.put 返回实际分配槽位(slotIndex>=0);locate() 仅返回 slotIndex=-1 的占位。
+            SlotLocation loc = persistToWheel(intent, effectiveMode == WalMode.DURABLE);
 
             // 5. 热(≤hotBoundaryMs)→ 进内存热尖 + 调度;冷 → 注册 promotion cohort(到点由 PromotionDaemon 载入)
             long deltaMs = intent.getExecuteAt().toEpochMilli() - System.currentTimeMillis();
@@ -497,23 +485,32 @@ public final class IntentCommandService {
     }
 
     /**
-     * 持久化 intent 当前态到 PHTW 并同步索引。状态变更操作(update/cancel/fireNow)恒为 DURABLE。
-     *
-     * <p>WheelStore 为 append-only:每次写入分配新槽,旧槽残留。recovery 按 intentId 取
-     * max revision 胜者,故旧槽不会引发 ghost 投递。</p>
+     * PHTW 写协议:locate→(inTail? tail.put : wheel.put)→locationIndex.put→(durable? awaitCommit)。
+     * 返回实际分配槽位(wheel 路径为 put 捕获的真实槽;tail 路径为 locate 的占位)。
+     * createIntent 与 persistIntentState 共用,避免副本漂移。
      */
-    private void persistIntentState(Intent intent, AckMode ackMode) {
+    private SlotLocation persistToWheel(Intent intent, boolean durable) {
         SlotLocation loc = wheelStore.locate(intent.getExecuteAt());
         if (loc.inTail()) {
             tailIndex.put(intent);
         } else {
             loc = wheelStore.put(intent);                   // 捕获分配的真实槽位
         }
-        locationIndex.put(intent.getIntentId(), loc);       // 同步索引
-        WalMode effectiveMode = resolveWalMode(intent, ackMode);
-        if (effectiveMode == WalMode.DURABLE) {
+        locationIndex.put(intent.getIntentId(), loc);
+        if (durable) {
             commitBarrier.awaitCommit();
         }
+        return loc;
+    }
+
+    /**
+     * 持久化 intent 当前态到 PHTW 并同步索引。状态变更操作(update/cancel/fireNow)恒为 DURABLE。
+     *
+     * <p>WheelStore 为 append-only:每次写入分配新槽,旧槽残留。recovery 按 intentId 取
+     * max revision 胜者,故旧槽不会引发 ghost 投递。</p>
+     */
+    private void persistIntentState(Intent intent, AckMode ackMode) {
+        persistToWheel(intent, resolveWalMode(intent, ackMode) == WalMode.DURABLE);
     }
 
     private void ensureRunning() {

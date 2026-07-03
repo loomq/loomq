@@ -1,10 +1,16 @@
-package com.loomq.infrastructure.wheel;
+package com.loomq.application.recovery;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.infrastructure.wheel.IntentLocationIndex;
+import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.SlotLocation;
+import com.loomq.infrastructure.wheel.TailIndex;
+import com.loomq.infrastructure.wheel.WheelConfig;
+import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;

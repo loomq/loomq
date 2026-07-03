@@ -1,6 +1,8 @@
 package com.loomq;
 
 import com.loomq.application.command.IntentCommandService;
+import com.loomq.application.recovery.WheelRecovery;
+import com.loomq.application.recovery.WheelRecoveryReport;
 import com.loomq.application.scheduler.BucketGroupManager;
 import com.loomq.application.scheduler.PrecisionScheduler;
 import com.loomq.common.MetricsCollector;
@@ -12,8 +14,6 @@ import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
 import com.loomq.infrastructure.wheel.TailIndex;
 import com.loomq.infrastructure.wheel.WheelConfig;
-import com.loomq.infrastructure.wheel.WheelRecovery;
-import com.loomq.infrastructure.wheel.WheelRecoveryReport;
 import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
 import com.loomq.spi.DeliveryHandler;
@@ -92,10 +92,12 @@ public class LoomqEngine implements AutoCloseable {
     private final Path dataDir;
     private final String nodeId;
     private final PrecisionTier defaultTier;
+    private final boolean deliveryHandlerConfigured;
 
     private LoomqEngine(Builder builder) {
         this.nodeId = builder.nodeId != null ? builder.nodeId : "default-node";
         this.defaultTier = builder.defaultTier;
+        this.deliveryHandlerConfigured = builder.deliveryHandler != null;
         this.callbackExecutor = builder.callbackExecutor != null
             ? builder.callbackExecutor
             : Executors.newVirtualThreadPerTaskExecutor();
@@ -179,6 +181,11 @@ public class LoomqEngine implements AutoCloseable {
         logger.info("║       Mode: Embedded (Zero HTTP dependencies)          ║");
         logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
         logger.info("╚════════════════════════════════════════════════════════╝");
+
+        if (!deliveryHandlerConfigured) {
+            logger.warn("No DeliveryHandler configured; intents will be silently dead-lettered. "
+                + "Supply one via Builder.deliveryHandler(...) to enable delivery.");
+        }
 
         // 1. 恢复:扫所有槽 → 重建索引 + 热载入内存 + 冷注册 promotion cohort
         WheelRecoveryReport recoveryReport =
