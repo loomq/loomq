@@ -20,6 +20,7 @@ import com.loomq.store.IntentStore;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,6 +57,17 @@ public final class IntentCommandService {
 
     private volatile CallbackHandler callbackHandler;
     private final PrecisionTier defaultTier;
+    private final long groupCommitIntervalMs;
+
+    /**
+     * 冷取消按 intentId 串行化的细粒度锁注册表。
+     *
+     * <p>wheel 路径专用:wheelStore.readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient
+     * 副本,无法阻塞并发取消。改为按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径已由
+     * TailIndex.appendLock 串行,不进此表。锁对象在 synchronized 块的 finally 中以 identity 校验
+     * 移除(computeIfPresent),只删自己放入的对象,避免误删后到者的锁。</p>
+     */
+    private final ConcurrentHashMap<String, Object> coldCancelLocks = new ConcurrentHashMap<>();
 
     public IntentCommandService(
         IntentStore intentStore,
@@ -70,7 +82,8 @@ public final class IntentCommandService {
         AtomicBoolean running,
         AtomicLong sequenceNumber,
         CallbackHandler callbackHandler,
-        PrecisionTier defaultTier
+        PrecisionTier defaultTier,
+        long groupCommitIntervalMs
     ) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
@@ -85,6 +98,7 @@ public final class IntentCommandService {
         this.sequenceNumber = sequenceNumber;
         this.callbackHandler = callbackHandler;
         this.defaultTier = defaultTier;
+        this.groupCommitIntervalMs = groupCommitIntervalMs;
     }
 
     public void registerCallbackHandler(CallbackHandler handler) {
@@ -127,10 +141,17 @@ public final class IntentCommandService {
 
             WalMode effectiveMode = resolveWalMode(intent, ackMode);
 
-            // 非 DURABLE 模式下写入为 fire-and-forget(落 mmap 但未 force),崩溃时可能丢失数据
+            // H1:准确陈述崩溃窗口。group-commit daemon 每 groupCommitIntervalMs 对所有脏桶批量
+            // fsync,非 DURABLE 写入后字节已在 mmap,崩溃窗口 ≤ groupCommitIntervalMs。
+            // 仅在间隔较大(>100ms)时提示风险,小间隔降级 debug。
             if (effectiveMode != WalMode.DURABLE) {
-                logger.warn("Intent {} using non-DURABLE walMode={}, crash may cause data loss",
-                    intent.getIntentId(), effectiveMode);
+                if (groupCommitIntervalMs > 100) {
+                    logger.warn("Intent {} using non-DURABLE walMode={}, crash window <= {}ms",
+                        intent.getIntentId(), effectiveMode, groupCommitIntervalMs);
+                } else {
+                    logger.debug("Intent {} using non-DURABLE walMode={}, crash window <= {}ms",
+                        intent.getIntentId(), effectiveMode, groupCommitIntervalMs);
+                }
             }
 
             // 3. 写入持久化分层时间轮(磁盘权威)+ 更新索引
@@ -309,10 +330,14 @@ public final class IntentCommandService {
      * awaitCommit);槽位缺失/损坏时返回 false,不谎报未持久化的取消。
      *
      * <ul>
-     *   <li>tail:追加 TOMBSTONE 到 run 文件 + awaitCommit 强制落盘</li>
-     *   <li>wheel:读槽解码 → transitionTo(CANCELED) + incrementRevision → 写新槽(append-only,
-     *       recovery 按 max revision 去重,terminal 跳过)→ 索引指向新 CANCELED 槽(在 awaitCommit
-     *       之前,杜绝在途 promote 复活)+ awaitCommit</li>
+     *   <li>tail:追加 TOMBSTONE 到 run 文件 + awaitCommit 强制落盘;以 TailIndex.remove 返回值门控 ——
+ *       remove 返回 false 表示已被并发取消者移除(已追加 tombstone),直接返回 false 不重复计数。
+ *       appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需布尔门控</li>
+     *   <li>wheel:按 intentId 串行化(computeIfAbsent 锁)→ 锁内重读索引取最新槽 → 读槽解码 →
+     *       transitionTo(CANCELED) + incrementRevision → 写新槽(append-only,recovery 按 max revision
+     *       去重,terminal 跳过)→ 索引指向新 CANCELED 槽(在 awaitCommit 之前,杜绝在途 promote 复活)
+     *       + awaitCommit。串行化保证后到者重读得到先到者写入的 CANCELED 槽(terminal)→ transitionTo
+     *       抛 ISE → 返回 false,杜绝 double-write + double 计数</li>
      * </ul>
      * 槽位可读时最后移除 promotion cohort 与索引项;槽位缺失时直接返回 false(不动索引/cohort)。
      */
@@ -323,33 +348,56 @@ public final class IntentCommandService {
         }
 
         if (loc.inTail()) {
-            tailIndex.remove(intentId);                     // 追加 TOMBSTONE(durable 待 force)
-            commitBarrier.awaitCommit();                    // cancel 恒 DURABLE:确保 tombstone 落盘
-        } else {
-            Intent cold = wheelStore.readSlot(loc);
-            if (cold == null) {
-                // 槽位缺失/损坏(空槽、撕裂写或桶已回收):无法持久化取消。
-                // 不可谎报成功——返回 false,调用方得知取消未生效(索引与 cohort 保持原状)。
+            // tail 路径:TailIndex.remove 返回 false 表示该 intent 已被并发取消者移除(已追加 tombstone)。
+            // 此时不可谎报成功或重复计数 —— 直接返回 false(镜像 wheel 路径第二取消者行为)。
+            // appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需此布尔门控。
+            if (!tailIndex.remove(intentId)) {
                 return false;
             }
-            synchronized (cold) {
+            commitBarrier.awaitCommit();                    // cancel 恒 DURABLE:确保 tombstone 落盘
+        } else {
+            // wheel 路径:readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient 副本,
+            // 并发取消互不阻塞 → double-write + double 计数。按 intentId 串行化:第二个取消者
+            // 串行进入后重读索引拿到先到者写入的 CANCELED 新槽(terminal)→ transitionTo 抛 ISE → 返回 false。
+            Object lock = coldCancelLocks.computeIfAbsent(intentId, k -> new Object());
+            synchronized (lock) {
                 try {
-                    cold.transitionTo(IntentStatus.CANCELED);
-                } catch (IllegalStateException e) {
-                    logger.warn("Cannot cancel cold intent {}: {}", intentId, e.getMessage());
-                    return false;
+                    // 必须在锁内重读索引:锁外拿到的 loc 是先到者写新槽前的旧槽位,指向 SCHEDULED 旧槽
+                    // (WheelStore append-only,旧槽不被覆写)。重读得到先到者更新后的 CANCELED 槽才能让
+                    // 后到者见到 terminal 状态。若先到者已走出锁并移除索引项,这里拿到 null → 返回 false。
+                    SlotLocation latest = locationIndex.get(intentId);
+                    if (latest == null) {
+                        return false;
+                    }
+                    Intent cold = wheelStore.readSlot(latest);
+                    if (cold == null) {
+                        // 槽位缺失/损坏(空槽、撕裂写或桶已回收):无法持久化取消。
+                        // 不可谎报成功——返回 false,调用方得知取消未生效(索引与 cohort 保持原状)。
+                        return false;
+                    }
+                    try {
+                        cold.transitionTo(IntentStatus.CANCELED);
+                    } catch (IllegalStateException e) {
+                        logger.warn("Cannot cancel cold intent {}: {}", intentId, e.getMessage());
+                        return false;
+                    }
+                    cold.incrementRevision();
+                    // WheelStore 为 append-only:此处写入新槽(revision 更高),recovery 按 intentId
+                    // 取 max revision 胜者,terminal 状态跳过——不会重复投递。
+                    // 关键:在 awaitCommit 之前把索引指向新 CANCELED 槽。否则 awaitCommit 窗口内,
+                    // locationIndex 仍指向旧 SCHEDULED 槽,PromotionDaemon.promote 的 latest.equals(h.loc())
+                    // 复核会通过(索引=旧槽=handle 槽)→ 读旧 SCHEDULED 槽 → onHotPromotion 复活已取消
+                    // 的冷 Intent(ghost 投递)。指向新槽后:promote 见 latest≠h.loc() 直接跳过;即便
+                    // 读到新槽也是 CANCELED(terminal)→ 跳过。两路均杜绝复活。
+                    SlotLocation canceledLoc = wheelStore.put(cold);
+                    locationIndex.put(intentId, canceledLoc);
+                    commitBarrier.awaitCommit();            // cancel 恒 DURABLE
+                } finally {
+                    // 只移除自己放入的锁对象,避免误删后到者的锁(computeIfPresent + identity)。
+                    // 后到者若通过 computeIfAbsent 拿到本锁对象(先到者尚未移除),会串行等待;其 cleanup
+                    // 时若 map 仍持有同一对象则移除,若已被先到者移除或被更新者的新锁替换则 no-op。
+                    coldCancelLocks.computeIfPresent(intentId, (k, v) -> v == lock ? null : v);
                 }
-                cold.incrementRevision();
-                // WheelStore 为 append-only:此处写入新槽(revision 更高),recovery 按 intentId
-                // 取 max revision 胜者,terminal 状态跳过——不会重复投递。
-                // 关键:在 awaitCommit 之前把索引指向新 CANCELED 槽。否则 awaitCommit 窗口内,
-                // locationIndex 仍指向旧 SCHEDULED 槽,PromotionDaemon.promote 的 latest.equals(h.loc())
-                // 复核会通过(索引=旧槽=handle 槽)→ 读旧 SCHEDULED 槽 → onHotPromotion 复活已取消
-                // 的冷 Intent(ghost 投递)。指向新槽后:promote 见 latest≠h.loc() 直接跳过;即便
-                // 读到新槽也是 CANCELED(terminal)→ 跳过。两路均杜绝复活。
-                SlotLocation canceledLoc = wheelStore.put(cold);
-                locationIndex.put(intentId, canceledLoc);
-                commitBarrier.awaitCommit();            // cancel 恒 DURABLE
             }
         }
 
@@ -421,7 +469,7 @@ public final class IntentCommandService {
         });
     }
 
-    private WalMode resolveWalMode(Intent intent, AckMode ackMode) {
+    private static WalMode resolveWalMode(Intent intent, AckMode ackMode) {
         // 1. Explicit AckMode wins (backward compatibility)
         if (ackMode != null) {
             return switch (ackMode) {
@@ -431,10 +479,17 @@ public final class IntentCommandService {
         }
         // 2. Intent-level walMode override
         if (intent.getWalMode() != null) {
-            return intent.getWalMode();
+            // H1: BATCH_DEFERRED 在 group-commit 架构下等价 ASYNC(周期 fsync 已覆盖)
+            return intent.getWalMode() == WalMode.BATCH_DEFERRED ? WalMode.ASYNC : intent.getWalMode();
         }
-        // 3. Fall back to tier default
-        return PrecisionTierCatalog.defaultCatalog().walMode(intent.getPrecisionTier());
+        // 3. Fall back to tier default; tier 默认若为 BATCH_DEFERRED 亦归一为 ASYNC
+        WalMode tierDefault = PrecisionTierCatalog.defaultCatalog().walMode(intent.getPrecisionTier());
+        return tierDefault == WalMode.BATCH_DEFERRED ? WalMode.ASYNC : tierDefault;
+    }
+
+    /** 包级测试入口(同包测试断言 resolveWalMode 行为)。不作为公共 API。 */
+    static WalMode resolveWalModeForTest(Intent intent, AckMode ackMode) {
+        return resolveWalMode(intent, ackMode);
     }
 
     /**

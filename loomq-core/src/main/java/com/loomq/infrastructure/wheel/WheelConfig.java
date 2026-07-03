@@ -18,6 +18,7 @@ public record WheelConfig(
     int horizonDays,
     int slotsPerBucket,
     long groupCommitIntervalMs,
+    long awaitCommitTimeoutMs,
     PrecisionTier defaultTier
 ) {
     public WheelConfig {
@@ -26,11 +27,12 @@ public record WheelConfig(
         requirePositive(horizonDays, "horizonDays");
         requirePositive(slotsPerBucket, "slotsPerBucket");
         requirePositive(groupCommitIntervalMs, "groupCommitIntervalMs");
+        requirePositive(awaitCommitTimeoutMs, "awaitCommitTimeoutMs");
         defaultTier = defaultTier != null ? defaultTier : PrecisionTierCatalog.defaultCatalog().defaultTier();
     }
 
     public static WheelConfig defaultConfig() {
-        return new WheelConfig("./data/wheel", "shard-0", 30, 1024, 1,
+        return new WheelConfig("./data/wheel", "shard-0", 30, 1024, 1, 10_000L,
             PrecisionTierCatalog.defaultCatalog().defaultTier());
     }
 
@@ -42,11 +44,12 @@ public record WheelConfig(
             ConfigSupport.intValue(p, 30, "wheel.horizon_days", "wheel.horizonDays"),
             ConfigSupport.intValue(p, 1024, "wheel.slots_per_bucket", "wheel.slotsPerBucket"),
             ConfigSupport.longValue(p, 1, "wheel.group_commit_interval_ms", "wheel.groupCommitIntervalMs"),
+            ConfigSupport.longValue(p, 10_000L, "wheel.await_commit_timeout_ms", "wheel.awaitCommitTimeoutMs"),
             PrecisionTier.fromString(ConfigSupport.string(p, "STANDARD", "wheel.default_tier", "wheel.defaultTier")));
     }
 
     public WheelConfig withDataDir(String dir) {
-        return new WheelConfig(dir, shardId, horizonDays, slotsPerBucket, groupCommitIntervalMs, defaultTier);
+        return new WheelConfig(dir, shardId, horizonDays, slotsPerBucket, groupCommitIntervalMs, awaitCommitTimeoutMs, defaultTier);
     }
 
     private static String requireText(String value, String fieldName) {

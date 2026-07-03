@@ -70,7 +70,7 @@ class WheelRecoveryTest {
     @Test
     void shouldLoadHotAndRegisterColdForPromotion() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // hot: +5s(在 60min 热窗口内)
@@ -98,7 +98,7 @@ class WheelRecoveryTest {
     @Test
     void shouldSkipTerminalIntentButStillIndexIt() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // CANCELED (terminal) intent sitting in the day wheel
@@ -120,7 +120,7 @@ class WheelRecoveryTest {
     @Test
     void shouldSkipExpiredIntentButStillIndexIt() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // executeAt in the past (< now) → expired at recover time
@@ -142,7 +142,7 @@ class WheelRecoveryTest {
     @Test
     void shouldDedupByMaxRevisionWithinDayWheel() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // rev 1: SCHEDULED at +5min (within hot window) → day-wheel slot
@@ -172,7 +172,7 @@ class WheelRecoveryTest {
     @Test
     void shouldNotGhostLoadWhenRescheduledAcrossHorizon() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // rev 1: within horizon (+2min, hot) → day-wheel slot (stale after reschedule)

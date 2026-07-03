@@ -16,7 +16,7 @@ class IntentLocationIndexTest {
     @Test
     void shouldTrackAndRemoveLocation() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              IntentLocationIndex idx = new IntentLocationIndex()) {
@@ -35,7 +35,7 @@ class IntentLocationIndexTest {
     @Test
     void shouldRebuildFromWheelScan() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              IntentLocationIndex idx = new IntentLocationIndex()) {
             for (int i = 0; i < 3; i++) {
@@ -58,7 +58,7 @@ class IntentLocationIndexTest {
     @Test
     void shouldCancelColdTailIntent() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              IntentLocationIndex idx = new IntentLocationIndex()) {

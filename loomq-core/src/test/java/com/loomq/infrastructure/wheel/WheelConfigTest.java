@@ -18,18 +18,30 @@ class WheelConfigTest {
     @Test
     void rejectsNonPositiveHorizon() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 0, 1024, 1, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", "shard-0", 0, 1024, 1, 10_000L, PrecisionTier.STANDARD));
     }
 
     @Test
     void rejectsBlankDataDir() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("  ", "shard-0", 30, 1024, 1, PrecisionTier.STANDARD));
+            () -> new WheelConfig("  ", "shard-0", 30, 1024, 1, 10_000L, PrecisionTier.STANDARD));
     }
 
     @Test
     void rejectsBlankShardId() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "  ", 30, 1024, 1, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", "  ", 30, 1024, 1, 10_000L, PrecisionTier.STANDARD));
+    }
+
+    @Test
+    void defaultsIncludeAwaitCommitTimeout() {
+        WheelConfig c = WheelConfig.defaultConfig();
+        assertEquals(10_000L, c.awaitCommitTimeoutMs());
+    }
+
+    @Test
+    void rejectsNonPositiveAwaitCommitTimeout() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 0, PrecisionTier.STANDARD));
     }
 }

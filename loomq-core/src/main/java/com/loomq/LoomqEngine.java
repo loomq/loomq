@@ -113,7 +113,10 @@ public class LoomqEngine implements AutoCloseable {
             WheelConfig wheelConfig = WheelConfig.defaultConfig().withDataDir(walDir.toString());
             this.wheelStore = new WheelStore(wheelConfig, System::currentTimeMillis);
             this.tailIndex = new TailIndex(walDir, System::currentTimeMillis);
-            this.commitBarrier = new GroupCommitBarrier(wheelStore, tailIndex, wheelConfig.groupCommitIntervalMs());
+            this.commitBarrier = new GroupCommitBarrier(
+                wheelStore, tailIndex,
+                wheelConfig.groupCommitIntervalMs(),
+                wheelConfig.awaitCommitTimeoutMs());
             this.locationIndex = new IntentLocationIndex();
             this.metricsCollector = MetricsCollector.getInstance();
 
@@ -141,7 +144,7 @@ public class LoomqEngine implements AutoCloseable {
                 intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
                 locationIndex, promotionDaemon,
                 metricsCollector, callbackExecutor, running, sequenceNumber,
-                builder.callbackHandler, defaultTier
+                builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs()
             );
 
             logger.info(

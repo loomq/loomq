@@ -16,7 +16,7 @@ class WheelStoreTest {
     @TempDir Path tmp;
 
     private WheelStore newStore(AtomicLong clock) {
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         return new WheelStore(cfg, clock::get);
     }
 
@@ -74,7 +74,7 @@ class WheelStoreTest {
     @Test
     void shouldNotOverwriteExistingSlotsOnRestart() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
         // Phase 1: write 3 intents into the same future bucket, close.
         String id1, id2, id3;
         try (WheelStore s1 = newStore(clock)) {

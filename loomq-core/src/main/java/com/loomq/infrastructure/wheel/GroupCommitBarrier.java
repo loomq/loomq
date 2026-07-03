@@ -24,6 +24,7 @@ public final class GroupCommitBarrier implements AutoCloseable {
     private final WheelStore store;
     private final TailIndex tail;
     private final long intervalNs;
+    private final long awaitCommitTimeoutNs;
     private final Thread thread;
     private final AtomicBoolean running = new AtomicBoolean();
 
@@ -32,10 +33,11 @@ public final class GroupCommitBarrier implements AutoCloseable {
     private final AtomicLong writeTicket = new AtomicLong();
     private volatile long flushedTicket = 0;  // durability frontier: all writes with ticket <= flushedTicket are forced
 
-    public GroupCommitBarrier(WheelStore store, TailIndex tail, long intervalMs) {
+    public GroupCommitBarrier(WheelStore store, TailIndex tail, long intervalMs, long awaitCommitTimeoutMs) {
         this.store = store;
         this.tail = tail;
         this.intervalNs = intervalMs * 1_000_000L;
+        this.awaitCommitTimeoutNs = awaitCommitTimeoutMs * 1_000_000L;
         this.thread = Thread.ofPlatform().name("wheel-group-commit").daemon(true).unstarted(this::loop);
     }
 
@@ -50,18 +52,23 @@ public final class GroupCommitBarrier implements AutoCloseable {
      * 阻塞到覆盖本次写入的 force 完成。
      * 写者必须在 store.put()(字节已进 mmap)之后调用本方法:领取一个 ticket,
      * 等待某次 snapshot 了 ticket >= myTicket 的 force 完成。
+     *
+     * <p>超时不再抛错:慢盘下 daemon 未能及时推进 frontier 时,改走内联 force 兜底
+     * (store.forceDirty()+tail.flush()),随后推进 flushedTicket 并返回成功。
+     * 这保证 DURABLE 契约成立 —— 否则 createIntent 内存回滚 + FAILED,而
+     * wheelStore.close() 仍刷盘 → 重启 recovery 复活 = ghost 投递。</p>
      */
     public long awaitCommit() {
         // Writer calls this AFTER store.put() (bytes already in mmap). Claim a ticket;
         // wait until a force that snapshot-ed a ticket >= mine has completed.
         long myTicket = writeTicket.incrementAndGet();
-        long deadline = System.nanoTime() + 5_000_000_000L;
+        long deadline = System.nanoTime() + awaitCommitTimeoutNs;
+
+        // 段 1:等待 daemon 在超时内推进 frontier
         lock.lock();
         try {
             while (flushedTicket < myTicket) {
-                if (System.nanoTime() > deadline) {
-                    throw new RuntimeException("group-commit timeout, ticket=" + myTicket + ", flushed=" + flushedTicket);
-                }
+                if (System.nanoTime() >= deadline) break; // 超时 → 走内联 force 兜底
                 try {
                     long remainingNs = deadline - System.nanoTime();
                     if (remainingNs <= 0) break;
@@ -71,7 +78,31 @@ public final class GroupCommitBarrier implements AutoCloseable {
                     throw new RuntimeException(e);
                 }
             }
-            return flushedTicket;
+            if (flushedTicket >= myTicket) {
+                return flushedTicket; // daemon 已覆盖,正常返回
+            }
+        } finally { lock.unlock(); }
+
+        // 段 2:超时兜底 —— daemon 未在超时内推进 frontier。不持锁 force(避免阻塞 daemon loop)。
+        // 先快照 pending(writeTicket 当前值,含 myTicket)再 force —— 镜像 daemon loop 的安全模式:
+        // 若 force 之后才读 writeTicket,并发写者 B 在 force 与读之间 put+领 ticket 会被错误地
+        // 标记为已持久(flushedTicket >= myTicket_B),但其字节在 force 之后才入 mmap → 崩溃丢失,
+        // 违反 DURABLE 契约。快照在 force 前,确保只发布 force 已覆盖的 ticket。
+        long pending = writeTicket.get();
+        try {
+            store.forceDirty();
+            tail.flush();
+        } catch (Exception forceEx) {
+            // 真 I/O 故障:字节已在 mmap,崩溃可能丢失,属磁盘故障极端边缘,不静默吞。
+            throw new RuntimeException("inline force fallback failed, ticket=" + myTicket, forceEx);
+        }
+        lock.lock();
+        try {
+            if (pending > flushedTicket) {   // 不回退:daemon 可能在 force 期间已推进更高 frontier
+                flushedTicket = pending;
+            }
+            committed.signalAll();
+            return flushedTicket;            // >= myTicket(pending 含 myTicket,且不回退)
         } finally { lock.unlock(); }
     }
 
@@ -100,11 +131,10 @@ public final class GroupCommitBarrier implements AutoCloseable {
         if (!running.compareAndSet(true, false)) return;
         // Drain in-flight DURABLE writers: a final force covers all writes whose bytes are
         // already in mmap, then publish the durability frontier so blocked awaitCommit callers
-        // return success. Without this, close() stops the loop without advancing flushedTicket,
-        // so in-flight writers can only exit via the 5s timeout → createIntent catches, rolls
-        // back memory-only and throws FAILED, while wheelStore.close() later flushes the slot →
-        // on restart WheelRecovery restores+schedules it → ghost delivery of an intent the
-        // caller believes was not created.
+        // return success. Without this, close() stops the loop without advancing flushedTicket;
+        // in-flight writers would each hit the configurable awaitCommit timeout and fall back to
+        // their own inline force — racing wheelStore.close()'s force during shutdown. The drain
+        // makes shutdown deterministic and fast.
         try {
             store.forceDirty();
             tail.flush();
