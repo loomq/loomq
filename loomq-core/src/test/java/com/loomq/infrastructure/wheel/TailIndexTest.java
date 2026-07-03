@@ -34,7 +34,7 @@ class TailIndexTest {
     @Test
     void shouldPromoteEntriesEnteringHorizon() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             long execAt = clock.get() + 40L * 86_400_000L; // +40d, 在 tail

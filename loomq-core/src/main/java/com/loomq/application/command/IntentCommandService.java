@@ -58,13 +58,15 @@ public final class IntentCommandService {
     private volatile CallbackHandler callbackHandler;
     private final PrecisionTier defaultTier;
     private final long groupCommitIntervalMs;
+    private final long hotBoundaryMs;
 
     /**
      * 冷取消按 intentId 串行化的细粒度锁注册表。
      *
      * <p>wheel 路径专用:wheelStore.readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient
-     * 副本,无法阻塞并发取消。改为按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径已由
-     * TailIndex.appendLock 串行,不进此表。锁对象在 synchronized 块的 finally 中以 identity 校验
+     * 副本,无法阻塞并发取消。改为按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径不进此表
+     * ——其并发由 tailIndex.remove 的布尔返回值门控(appendLock 仅串行单次 append,不串行
+     * remove→awaitCommit→metric++ 序列)。锁对象在 synchronized 块的 finally 中以 identity 校验
      * 移除(computeIfPresent),只删自己放入的对象,避免误删后到者的锁。</p>
      */
     private final ConcurrentHashMap<String, Object> coldCancelLocks = new ConcurrentHashMap<>();
@@ -83,7 +85,8 @@ public final class IntentCommandService {
         AtomicLong sequenceNumber,
         CallbackHandler callbackHandler,
         PrecisionTier defaultTier,
-        long groupCommitIntervalMs
+        long groupCommitIntervalMs,
+        long hotBoundaryMs
     ) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
@@ -99,6 +102,7 @@ public final class IntentCommandService {
         this.callbackHandler = callbackHandler;
         this.defaultTier = defaultTier;
         this.groupCommitIntervalMs = groupCommitIntervalMs;
+        this.hotBoundaryMs = hotBoundaryMs;
     }
 
     public void registerCallbackHandler(CallbackHandler handler) {
@@ -170,9 +174,9 @@ public final class IntentCommandService {
                 commitBarrier.awaitCommit();
             }
 
-            // 5. 热(≤60min)→ 进内存热尖 + 调度;冷 → 注册 promotion cohort(到点由 PromotionDaemon 载入)
+            // 5. 热(≤hotBoundaryMs)→ 进内存热尖 + 调度;冷 → 注册 promotion cohort(到点由 PromotionDaemon 载入)
             long deltaMs = intent.getExecuteAt().toEpochMilli() - System.currentTimeMillis();
-            if (deltaMs <= PromotionDaemon.HOT_WINDOW_MS) {
+            if (deltaMs <= hotBoundaryMs) {
                 intentStore.save(intent);
                 scheduler.schedule(intent);
             } else {
@@ -325,7 +329,7 @@ public final class IntentCommandService {
     }
 
     /**
-     * 冷取消:Intent 不在内存 store(>60min 未提升或 >horizon 落 tail),经 locationIndex
+     * 冷取消:Intent 不在内存 store(>hotBoundaryMs 未提升或 >horizon 落 tail),经 locationIndex
      * 定位磁盘槽位取消。cancel 为状态变更操作:成功路径恒为 DURABLE(写新槽/tombstone +
      * awaitCommit);槽位缺失/损坏时返回 false,不谎报未持久化的取消。
      *

@@ -19,6 +19,8 @@ public record WheelConfig(
     int slotsPerBucket,
     long groupCommitIntervalMs,
     long awaitCommitTimeoutMs,
+    long hotBoundaryMs,
+    long promotionLeadMs,
     PrecisionTier defaultTier
 ) {
     public WheelConfig {
@@ -28,11 +30,14 @@ public record WheelConfig(
         requirePositive(slotsPerBucket, "slotsPerBucket");
         requirePositive(groupCommitIntervalMs, "groupCommitIntervalMs");
         requirePositive(awaitCommitTimeoutMs, "awaitCommitTimeoutMs");
+        requirePositive(hotBoundaryMs, "hotBoundaryMs");
+        requirePositive(promotionLeadMs, "promotionLeadMs");
         defaultTier = defaultTier != null ? defaultTier : PrecisionTierCatalog.defaultCatalog().defaultTier();
     }
 
     public static WheelConfig defaultConfig() {
         return new WheelConfig("./data/wheel", "shard-0", 30, 1024, 1, 10_000L,
+            60L * 60_000L, 60_000L,
             PrecisionTierCatalog.defaultCatalog().defaultTier());
     }
 
@@ -45,11 +50,14 @@ public record WheelConfig(
             ConfigSupport.intValue(p, 1024, "wheel.slots_per_bucket", "wheel.slotsPerBucket"),
             ConfigSupport.longValue(p, 1, "wheel.group_commit_interval_ms", "wheel.groupCommitIntervalMs"),
             ConfigSupport.longValue(p, 10_000L, "wheel.await_commit_timeout_ms", "wheel.awaitCommitTimeoutMs"),
+            ConfigSupport.longValue(p, 60L * 60_000L, "wheel.hot_boundary_ms", "wheel.hotBoundaryMs"),
+            ConfigSupport.longValue(p, 60_000L, "wheel.promotion_lead_ms", "wheel.promotionLeadMs"),
             PrecisionTier.fromString(ConfigSupport.string(p, "STANDARD", "wheel.default_tier", "wheel.defaultTier")));
     }
 
     public WheelConfig withDataDir(String dir) {
-        return new WheelConfig(dir, shardId, horizonDays, slotsPerBucket, groupCommitIntervalMs, awaitCommitTimeoutMs, defaultTier);
+        return new WheelConfig(dir, shardId, horizonDays, slotsPerBucket, groupCommitIntervalMs,
+            awaitCommitTimeoutMs, hotBoundaryMs, promotionLeadMs, defaultTier);
     }
 
     private static String requireText(String value, String fieldName) {

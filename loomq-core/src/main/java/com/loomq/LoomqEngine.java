@@ -89,13 +89,12 @@ public class LoomqEngine implements AutoCloseable {
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
     // ========== 配置 ==========
-    private final Path walDir;
+    private final Path dataDir;
     private final String nodeId;
     private final PrecisionTier defaultTier;
 
     private LoomqEngine(Builder builder) {
         this.nodeId = builder.nodeId != null ? builder.nodeId : "default-node";
-        this.walDir = builder.walDir != null ? builder.walDir : Path.of("./data");
         this.defaultTier = builder.defaultTier;
         this.callbackExecutor = builder.callbackExecutor != null
             ? builder.callbackExecutor
@@ -103,16 +102,26 @@ public class LoomqEngine implements AutoCloseable {
         this.operationExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
         try {
-            // 确保数据目录存在
-            Files.createDirectories(walDir);
+            WheelConfig wheelConfig;
+            if (builder.wheelConfig != null) {
+                wheelConfig = builder.wheelConfig;
+                if (builder.dataDir != null) {
+                    logger.warn("Both wheelConfig and dataDir/walDir set on Builder; wheelConfig wins (its dataDir={})",
+                        wheelConfig.dataDir());
+                }
+            } else {
+                Path dir = builder.dataDir != null ? builder.dataDir : Path.of("./data");
+                wheelConfig = WheelConfig.defaultConfig().withDataDir(dir.toString());
+            }
+            this.dataDir = Path.of(wheelConfig.dataDir());
+            Files.createDirectories(dataDir);
 
             // 初始化组件
             this.intentStore = builder.intentStore != null
                 ? builder.intentStore
                 : new ConcurrentIntentStore();
-            WheelConfig wheelConfig = WheelConfig.defaultConfig().withDataDir(walDir.toString());
             this.wheelStore = new WheelStore(wheelConfig, System::currentTimeMillis);
-            this.tailIndex = new TailIndex(walDir, System::currentTimeMillis);
+            this.tailIndex = new TailIndex(dataDir, System::currentTimeMillis);
             this.commitBarrier = new GroupCommitBarrier(
                 wheelStore, tailIndex,
                 wheelConfig.groupCommitIntervalMs(),
@@ -136,25 +145,21 @@ public class LoomqEngine implements AutoCloseable {
                     intentStore.upsert(intent);          // 幂等:已在内存则跳过
                     scheduler.schedule(intent);
                 }
-            });
+            }, wheelConfig.promotionLeadMs());
 
-            this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex);
+            this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex, wheelConfig.hotBoundaryMs());
 
             this.commandService = new IntentCommandService(
                 intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
                 locationIndex, promotionDaemon,
                 metricsCollector, callbackExecutor, running, sequenceNumber,
-                builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs()
-            );
+                builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs(),
+                wheelConfig.hotBoundaryMs());
 
             logger.info(
-                "LoomqEngine created: nodeId={}, walDir={}, horizonDays={}, slotsPerBucket={}, groupCommitIntervalMs={}",
-                nodeId,
-                walDir,
-                wheelConfig.horizonDays(),
-                wheelConfig.slotsPerBucket(),
-                wheelConfig.groupCommitIntervalMs()
-            );
+                "LoomqEngine created: nodeId={}, dataDir={}, horizonDays={}, slotsPerBucket={}, groupCommitIntervalMs={}, hotBoundaryMs={}, promotionLeadMs={}",
+                nodeId, dataDir, wheelConfig.horizonDays(), wheelConfig.slotsPerBucket(),
+                wheelConfig.groupCommitIntervalMs(), wheelConfig.hotBoundaryMs(), wheelConfig.promotionLeadMs());
 
         } catch (IOException e) {
             throw new RuntimeException("Failed to initialize LoomqEngine", e);
@@ -437,8 +442,9 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     public static class Builder {
-        private Path walDir;
+        private Path dataDir;
         private String nodeId;
+        private WheelConfig wheelConfig;
         private Executor callbackExecutor;
         private CallbackHandler callbackHandler;
         private DeliveryHandler deliveryHandler;
@@ -446,8 +452,24 @@ public class LoomqEngine implements AutoCloseable {
         private PrecisionTier defaultTier;
         private IntentStore intentStore;
 
+        /**
+         * @deprecated 改用 {@link #dataDir(Path)};PHTW 已无 WAL,字段名陈旧。委托 dataDir。
+         */
+        @Deprecated
         public Builder walDir(Path walDir) {
-            this.walDir = walDir;
+            this.dataDir = walDir;
+            return this;
+        }
+
+        /** 数据目录(PHTW wheel + tail 根目录)。与 {@link #wheelConfig(WheelConfig)} 互斥,后者优先。 */
+        public Builder dataDir(Path dataDir) {
+            this.dataDir = dataDir;
+            return this;
+        }
+
+        /** 完整 PHTW 配置;设了则覆盖 dataDir(用 wheelConfig.dataDir())。 */
+        public Builder wheelConfig(WheelConfig wheelConfig) {
+            this.wheelConfig = wheelConfig;
             return this;
         }
 

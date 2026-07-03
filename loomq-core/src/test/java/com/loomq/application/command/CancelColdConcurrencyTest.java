@@ -37,7 +37,7 @@ class CancelColdConcurrencyTest {
     @Test
     void concurrentColdCancelDoesNotDoubleWrite() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, PrecisionTier.STANDARD);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000)) {
@@ -49,12 +49,12 @@ class CancelColdConcurrencyTest {
             PrecisionScheduler scheduler = new PrecisionScheduler(memStore, intent ->
                 java.util.concurrent.CompletableFuture.completedFuture(
                     com.loomq.spi.DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, i -> {});
+            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, i -> {}, 60_000L);
             ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
 
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                MetricsCollector.getInstance(), cb, running, seq, null, PrecisionTier.STANDARD, 1L);
+                MetricsCollector.getInstance(), cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
             barrier.start(); daemon.start(); scheduler.start();
 
             // 冷 Intent:executeAt 远超 60min → 落 wheel(非 tail),不在内存 store
@@ -110,7 +110,7 @@ class CancelColdConcurrencyTest {
     @Test
     void concurrentTailColdCancelDoesNotDoubleCount() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, PrecisionTier.STANDARD);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000)) {
@@ -122,12 +122,12 @@ class CancelColdConcurrencyTest {
             PrecisionScheduler scheduler = new PrecisionScheduler(memStore, intent ->
                 java.util.concurrent.CompletableFuture.completedFuture(
                     com.loomq.spi.DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, i -> {});
+            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, i -> {}, 60_000L);
             ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
 
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                MetricsCollector.getInstance(), cb, running, seq, null, PrecisionTier.STANDARD, 1L);
+                MetricsCollector.getInstance(), cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
             barrier.start(); daemon.start(); scheduler.start();
 
             // 远期冷 Intent:executeAt > 30d 视界 → 落 tail(非 wheel),不在内存 store。

@@ -59,7 +59,7 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
     ├── WheelStore            — persistent hierarchical timing wheel (4-tier mmap: sec/min/hour/day)
     ├── TailIndex             — durable run-file for intents beyond the day-wheel horizon (>30 days)
     ├── GroupCommitBarrier    — rendezvous msync daemon; DURABLE writers awaitCommit()
-    ├── PromotionDaemon       — cold→hot cohort promotion (mirrors CohortManager, HOT_WINDOW=60min)
+    ├── PromotionDaemon       — cold→hot cohort promotion (mirrors CohortManager; wakes at executeAt - PROMOTION_LEAD_MS, default 60s)
     ├── IntentLocationIndex   — intentId→SlotLocation index for cold cancel/reschedule
     ├── WheelRecovery         — scan-based recovery on restart (replaces snapshot+WAL replay)
     └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, RedeliveryDecider
@@ -80,8 +80,8 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
 - **ResizableSemaphore extends Semaphore** — zero-overhead acquire/tryAcquire (inherited); only release() is overridden for gradual shrink via permit discarding. Tracks `borrowedCount` per tier.
 - **Persistent Hierarchical Timing Wheel (PHTW)** — durability lives in a 4-tier mmap wheel (sec/min/hour/day) plus `TailIndex` (run-file for intents beyond the day-wheel horizon, >30 days). `WheelStore` is append-only; recovery dedups by max revision per intentId.
 - **Group-commit durability** — `GroupCommitBarrier` runs a rendezvous msync daemon; `DURABLE` writers `awaitCommit()` until a force covering their write completes. `ASYNC` returns after mmap (crash window); state-change ops (update/cancel/fireNow) hardcode `DURABLE`.
-- **Cold→hot promotion** — `PromotionDaemon` registers intents due beyond `HOT_WINDOW_MS` (60min) as cohorts, mirroring `CohortManager`; on wake it loads the slot into memory and hands off to the scheduler. `IntentLocationIndex` (intentId→`SlotLocation`) enables cold cancel/reschedule.
-- **IntentStore is hot-state only** — `ConcurrentIntentStore` holds the in-memory hot window (≤60min); the wheel is the durable authority. Use `upsert()` for current-state writes.
+- **Cold→hot promotion** — `PromotionDaemon` registers intents due beyond `WheelConfig.hotBoundaryMs()` (default 60min, create/recovery hot threshold) as cohorts, mirroring `CohortManager`; on wake (at `executeAt - WheelConfig.promotionLeadMs()`, default 60s) it loads the slot into memory and hands off to the scheduler. `IntentLocationIndex` (intentId→`SlotLocation`) enables cold cancel/reschedule.
+- **IntentStore is hot-state only** — `ConcurrentIntentStore` holds the in-memory hot window (≤`WheelConfig.hotBoundaryMs()`, default 60min); the wheel is the durable authority. Use `upsert()` for current-state writes.
 
 ## CI
 

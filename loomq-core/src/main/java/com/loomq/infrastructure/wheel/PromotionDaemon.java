@@ -13,12 +13,19 @@ import org.slf4j.LoggerFactory;
 
 /**
  * 冷→热提升 cohort daemon(镜像 CohortManager 的 cohort-wake)。
- * 冷 Intent 注册唤醒 cohort(executeAt - HOT_WINDOW_MS);单线程 sleep 到最早 cohort,
+ * 冷 Intent 注册唤醒 cohort(executeAt - promotionLeadMs);单线程 sleep 到最早 cohort,
  * 唤醒时按 loc 从磁盘读 slot → 解码 → onHotPromotion 载入内存。
  * 运行时 O(提升次数),按时间驱动。tail→day 落盘由调用方在恢复时调 TailIndex.promoteInto。
  */
 public final class PromotionDaemon implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(PromotionDaemon.class);
+
+    /**
+     * @deprecated 解耦为 {@link WheelConfig#hotBoundaryMs()}(创建/恢复热阈值)与
+     *     {@link WheelConfig#promotionLeadMs()}(cohort 唤醒提前量)。保留此常量(= 60min)
+     *     仅为旧外部引用兼容;内部代码已迁到 config 字段。
+     */
+    @Deprecated
     public static final long HOT_WINDOW_MS = 60L * 60_000L; // 60min
 
     private final WheelStore store;
@@ -26,6 +33,7 @@ public final class PromotionDaemon implements AutoCloseable {
     private final IntentLocationIndex locationIndex;
     private final LongSupplier clock;
     private final Consumer<Intent> onHotPromotion;
+    private final long promotionLeadMs;
 
     private final ConcurrentSkipListMap<Long, ConcurrentLinkedDeque<ColdHandle>> cohorts = new ConcurrentSkipListMap<>();
     private final ConcurrentHashMap<String, Long> intentIdToCohortKey = new ConcurrentHashMap<>();
@@ -33,14 +41,15 @@ public final class PromotionDaemon implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public PromotionDaemon(WheelStore store, TailIndex tail, IntentLocationIndex locationIndex,
-                           LongSupplier clock, Consumer<Intent> onHotPromotion) {
+                           LongSupplier clock, Consumer<Intent> onHotPromotion, long promotionLeadMs) {
         this.store = store; this.tail = tail; this.locationIndex = locationIndex;
         this.clock = clock; this.onHotPromotion = onHotPromotion;
+        this.promotionLeadMs = promotionLeadMs;
         this.thread = Thread.ofPlatform().name("wheel-promotion").daemon(true).unstarted(this::loop);
     }
 
     public void register(String intentId, SlotLocation loc, long executeAtMs) {
-        long wakeAt = executeAtMs - HOT_WINDOW_MS;
+        long wakeAt = executeAtMs - promotionLeadMs;
         ColdHandle handle = new ColdHandle(intentId, loc);
         cohorts.computeIfAbsent(wakeAt, k -> new ConcurrentLinkedDeque<>()).addLast(handle);
         intentIdToCohortKey.put(intentId, wakeAt);
@@ -55,7 +64,7 @@ public final class PromotionDaemon implements AutoCloseable {
         return true;
     }
 
-    public void start() { if (running.compareAndSet(false, true)) { thread.start(); log.info("PromotionDaemon started, hotWindow={}min", HOT_WINDOW_MS/60_000); } }
+    public void start() { if (running.compareAndSet(false, true)) { thread.start(); log.info("PromotionDaemon started, promotionLeadMs={}ms", promotionLeadMs); } }
 
     /** 单步:唤醒所有已到期 cohort(测试用)。 */
     public void tickOnce() {

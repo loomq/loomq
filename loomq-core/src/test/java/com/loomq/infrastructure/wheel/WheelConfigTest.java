@@ -18,19 +18,19 @@ class WheelConfigTest {
     @Test
     void rejectsNonPositiveHorizon() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 0, 1024, 1, 10_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", "shard-0", 0, 1024, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
     }
 
     @Test
     void rejectsBlankDataDir() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("  ", "shard-0", 30, 1024, 1, 10_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("  ", "shard-0", 30, 1024, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
     }
 
     @Test
     void rejectsBlankShardId() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "  ", 30, 1024, 1, 10_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", "  ", 30, 1024, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
     }
 
     @Test
@@ -42,6 +42,25 @@ class WheelConfigTest {
     @Test
     void rejectsNonPositiveAwaitCommitTimeout() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 0, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 0, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
+    }
+
+    @Test
+    void defaultsIncludeHotBoundaryAndPromotionLead() {
+        WheelConfig c = WheelConfig.defaultConfig();
+        assertEquals(60L * 60_000L, c.hotBoundaryMs(), "default hotBoundaryMs = 60min");
+        assertEquals(60_000L, c.promotionLeadMs(), "default promotionLeadMs = 60s");
+    }
+
+    @Test
+    void rejectsNonPositiveHotBoundary() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 10_000L, 0, 60_000L, PrecisionTier.STANDARD));
+    }
+
+    @Test
+    void rejectsNonPositivePromotionLead() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 10_000L, 60L * 60_000L, 0, PrecisionTier.STANDARD));
     }
 }

@@ -24,15 +24,16 @@ public final class WheelRecovery {
 
     private final WheelStore store;
     private final TailIndex tail;
+    private final long hotBoundaryMs;
 
-    public WheelRecovery(WheelStore store, TailIndex tail) {
-        this.store = store; this.tail = tail;
+    public WheelRecovery(WheelStore store, TailIndex tail, long hotBoundaryMs) {
+        this.store = store; this.tail = tail; this.hotBoundaryMs = hotBoundaryMs;
     }
 
     public WheelRecoveryReport recover(IntentStore memStore, PrecisionScheduler scheduler,
                                        IntentLocationIndex idx, PromotionDaemon daemon) {
         long nowMs = System.currentTimeMillis();
-        long hotBoundary = nowMs + PromotionDaemon.HOT_WINDOW_MS;
+        long hotBoundary = nowMs + hotBoundaryMs;
 
         // 1. tail → day (cold→cold disk reorg, once)
         tail.promoteInto(store);
