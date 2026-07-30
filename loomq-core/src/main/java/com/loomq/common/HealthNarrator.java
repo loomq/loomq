@@ -31,7 +31,7 @@ public final class HealthNarrator {
     }
 
     private static Map<String, Object> doNarrate(LoomqEngine engine) {
-        LoomQMetrics.MetricsSnapshot metrics = LoomQMetrics.getInstance().snapshot();
+        LoomQMetrics.MetricsSnapshot metrics = new LoomQMetrics().snapshot(engine.getMetricsCollector());
         PrecisionScheduler scheduler = engine.getScheduler();
         var backpressure = scheduler.getBackpressureStatus();
 

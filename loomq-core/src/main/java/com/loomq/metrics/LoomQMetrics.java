@@ -22,13 +22,8 @@ public class LoomQMetrics {
     private final PipelineMetricsRegistry pipelineMetrics = new PipelineMetricsRegistry();
 
     // ==================== 单例模式 ====================
-    private static final LoomQMetrics INSTANCE = new LoomQMetrics();
 
-    public static LoomQMetrics getInstance() {
-        return INSTANCE;
-    }
-
-    private LoomQMetrics() {}
+    public LoomQMetrics() {}
 
     // ==================== Intent 计数方法 ====================
     // 注意: Intent 生命周期计数器已统一到 MetricsCollector (com.loomq.common.MetricsCollector)
@@ -74,8 +69,8 @@ public class LoomQMetrics {
 
     // ==================== 指标查询 ====================
 
-    public MetricsSnapshot snapshot() {
-        MetricsCollector mc = MetricsCollector.getInstance();
+    public MetricsSnapshot snapshot(MetricsCollector mc) {
+        
         Map<String, Long> statusSnapshot = new LinkedHashMap<>(mc.getIntentStatusCounts());
         long pendingIntents = mc.getPendingIntents();
 
@@ -140,8 +135,8 @@ public class LoomQMetrics {
 
     // ==================== 重置 ====================
 
-    public void reset() {
+    public void reset(MetricsCollector mc) {
         pipelineMetrics.reset();
-        MetricsCollector.getInstance().resetRuntimeIntentMetrics();
+        mc.resetRuntimeIntentMetrics();
     }
 }

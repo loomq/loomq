@@ -23,7 +23,7 @@ class PromotionDaemonTest {
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              IntentLocationIndex idx = new IntentLocationIndex();
-             PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, promoted::set, leadMs)) {
+             PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> promoted.set(i), leadMs)) {
             Intent it = new Intent("intent_promo000000001");
             it.setExecuteAt(Instant.ofEpochMilli(clock.get() + 90 * 60_000L));
             it.transitionTo(IntentStatus.SCHEDULED);
@@ -52,7 +52,7 @@ class PromotionDaemonTest {
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              IntentLocationIndex idx = new IntentLocationIndex();
-             PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, promoted::set, leadMs)) {
+             PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> promoted.set(i), leadMs)) {
             Intent it = new Intent("intent_cancel0000001");
             it.setExecuteAt(Instant.ofEpochMilli(clock.get() + 90 * 60_000L));
             it.transitionTo(IntentStatus.SCHEDULED);

@@ -96,9 +96,8 @@ class LoomqEnginePhtwIntegrationTest {
             // terminal ones. A non-null loc here that is NOT the stale SCHEDULED loc proves
             // recovery dedup'd to the CANCELED slot — not the stale SCHEDULED.
             recoveredLoc = reopened.getLocationIndex().get(cold.getIntentId());
-            assertNotNull(recoveredLoc, "recovery should index the CANCELED (max-revision) loc");
-            assertNotEquals(scheduledLoc, recoveredLoc,
-                "recovery's loc must be the NEW CANCELED slot, not the stale SCHEDULED slot");
+            assertNull(recoveredLoc,
+                "recovery must not index terminal (CANCELED) intent (Spec B)");
         } finally {
             reopened.close();
         }
@@ -112,12 +111,6 @@ class LoomqEnginePhtwIntegrationTest {
             assertNotNull(scheduledSlot, "stale SCHEDULED slot must still be on disk (append-only)");
             assertEquals(IntentStatus.SCHEDULED, scheduledSlot.getStatus());
 
-            Intent canceledSlot = scan.readSlot(recoveredLoc);
-            assertNotNull(canceledSlot, "recovery's indexed loc must point to an occupied slot");
-            assertEquals(IntentStatus.CANCELED, canceledSlot.getStatus(),
-                "recovery's indexed slot must be CANCELED (max revision), not stale SCHEDULED");
-            assertTrue(canceledSlot.getRevision() > scheduledSlot.getRevision(),
-                "CANCELED slot must have strictly higher revision (dedup winner)");
         }
     }
 

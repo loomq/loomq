@@ -126,25 +126,6 @@ public class BucketGroupManager {
     }
 
     /**
-     * 扫描所有精度档位的到期任务
-     *
-     * @param now 当前时间
-     * @return 按精度档位分组的到期任务
-     */
-    public Map<PrecisionTier, List<Intent>> scanAllDue(Instant now) {
-        Map<PrecisionTier, List<Intent>> result = new EnumMap<>(PrecisionTier.class);
-
-        for (Map.Entry<PrecisionTier, BucketGroup> entry : bucketGroups.entrySet()) {
-            List<Intent> due = entry.getValue().scanDue(now);
-            if (!due.isEmpty()) {
-                result.put(entry.getKey(), due);
-            }
-        }
-
-        return result;
-    }
-
-    /**
      * 获取指定精度档位的 BucketGroup
      *
      * @param tier 精度档位

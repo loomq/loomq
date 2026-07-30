@@ -6,7 +6,7 @@ import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.LockSupport;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,7 +32,7 @@ public final class PromotionDaemon implements AutoCloseable {
     private final TailIndex tail;
     private final IntentLocationIndex locationIndex;
     private final LongSupplier clock;
-    private final Consumer<Intent> onHotPromotion;
+    private final BiConsumer<Intent, SlotLocation> onHotPromotion;
     private final long promotionLeadMs;
 
     private final ConcurrentSkipListMap<Long, ConcurrentLinkedDeque<ColdHandle>> cohorts = new ConcurrentSkipListMap<>();
@@ -41,7 +41,7 @@ public final class PromotionDaemon implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     public PromotionDaemon(WheelStore store, TailIndex tail, IntentLocationIndex locationIndex,
-                           LongSupplier clock, Consumer<Intent> onHotPromotion, long promotionLeadMs) {
+                           LongSupplier clock, BiConsumer<Intent, SlotLocation> onHotPromotion, long promotionLeadMs) {
         this.store = store; this.tail = tail; this.locationIndex = locationIndex;
         this.clock = clock; this.onHotPromotion = onHotPromotion;
         this.promotionLeadMs = promotionLeadMs;
@@ -107,7 +107,8 @@ public final class PromotionDaemon implements AutoCloseable {
                 intent = store.readSlot(h.loc());
             }
             if (intent == null || intent.getStatus().isTerminal()) return;
-            onHotPromotion.accept(intent);
+            // 把读槽用的 loc 传给回调,供其做提升后复核(P1-2:与 cancelCold 的 TOCTOU 收口)。
+            onHotPromotion.accept(intent, h.loc());
         } catch (Exception ex) {
             log.error("promote failed for {}", h.intentId(), ex);
         }

@@ -1,5 +1,6 @@
 package com.loomq.infrastructure.wheel;
 
+import java.util.Collection;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -18,6 +19,9 @@ public final class IntentLocationIndex implements AutoCloseable {
     public boolean remove(String intentId) { return map.remove(intentId) != null; }
     public void clear() { map.clear(); }
     public int size() { return map.size(); }
+
+    /** 返回所有索引中的 SlotLocation(供 BucketReclaimer 遍历判断活跃桶)。 */
+    public Collection<SlotLocation> allLocations() { return map.values(); }
 
     @Override
     public void close() {

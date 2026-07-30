@@ -8,6 +8,7 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -49,7 +50,7 @@ public final class TailIndex implements AutoCloseable {
 
     private final LongSupplier clock;
     private final Path runFile;
-    private final FileChannel runChannel;
+    private FileChannel runChannel;  // non-final: compaction reopens
 
     /** 真相源的内存镜像:intentId → (executeAtMs, encodedSlot)。 */
     private final ConcurrentHashMap<String, TailRecord> byId = new ConcurrentHashMap<>();
@@ -64,6 +65,8 @@ public final class TailIndex implements AutoCloseable {
         this.runFile = dataDir.resolve("tail").resolve("tail.log");
         try {
             Files.createDirectories(dataDir.resolve("tail"));
+            // 清理可能残留的 compaction 临时文件(上次崩溃在 compaction 中途)
+            Files.deleteIfExists(runFile.resolveSibling("tail.log.new"));
             // 重放已存在的 run 文件(若有)重建内存态,先于打开写句柄。返回最后一条有效记录
             // 的字节偏移(validLen);若尾部存在撕裂记录(崩溃 mid-append),validLen < 文件大小。
             long validLen = loadRun();
@@ -188,6 +191,81 @@ public final class TailIndex implements AutoCloseable {
 
     public int size() {
         return byId.size();
+    }
+
+    /**
+     * 若 run 文件超过阈值,执行 compaction:将内存镜像(byId/byExecuteAt)写出为新文件,
+     * 只含未被 TOMBSTONE 覆盖的 PUT 记录,原子替换旧文件。
+     *
+     * <p>调用时机:恢复时(loadRun 后,无并发写入)或优雅关闭时(所有写入已停止)。
+     * 崩溃安全性:写 tail.log.new -> 关旧 channel -> Files.move 原子替换 -> 重开 APPEND。
+     * 若崩溃在替换前,tail.log 未变;若崩溃在替换后,tail.log 已是 compacted 数据。
+     */
+    public void compactIfNeeded(long thresholdBytes) {
+        long fileSize;
+        try {
+            fileSize = Files.size(runFile);
+        } catch (IOException e) {
+            log.warn("Cannot check tail run file size for compaction", e);
+            return;
+        }
+        if (fileSize <= thresholdBytes) return;
+
+        Path compactFile = runFile.resolveSibling("tail.log.new");
+        boolean channelClosed = false;
+        try {
+            // 1. Write compacted file
+            try (FileChannel ch = FileChannel.open(compactFile,
+                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                ByteBuffer buf = ByteBuffer.allocate(8192).order(ByteOrder.BIG_ENDIAN);
+                for (var e : byExecuteAt.entrySet()) {
+                    long execMs = e.getKey();
+                    for (String intentId : e.getValue()) {
+                        TailRecord r = byId.get(intentId);
+                        if (r == null) continue;
+                        byte[] idBytes = intentId.getBytes(StandardCharsets.UTF_8);
+                        int recordLen = 1 + 8 + 1 + idBytes.length + SlotCodec.SLOT_SIZE;
+                        if (buf.remaining() < recordLen) {
+                            buf.flip();
+                            while (buf.hasRemaining()) ch.write(buf);
+                            buf.clear();
+                        }
+                        buf.put(TYPE_PUT);
+                        buf.putLong(execMs);
+                        buf.put((byte) idBytes.length);
+                        buf.put(idBytes);
+                        buf.put(r.encodedSlot());
+                    }
+                }
+                buf.flip();
+                while (buf.hasRemaining()) ch.write(buf);
+                ch.force(false);
+            }
+
+            // 2. Atomic replace: close old channel -> move -> reopen
+            runChannel.close();
+            channelClosed = true;
+            Files.move(compactFile, runFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            runChannel = FileChannel.open(runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+            channelClosed = false;
+
+            log.info("Tail compaction: {} bytes -> {} bytes ({} live entries)",
+                fileSize, Files.size(runFile), byId.size());
+        } catch (Exception e) {
+            log.error("Tail compaction failed", e);
+            // Safety: if channel was closed and not reopened, try to reopen
+            if (channelClosed && (runChannel == null || !runChannel.isOpen())) {
+                try {
+                    runChannel = FileChannel.open(runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
+                    log.info("Reopened tail run channel after compaction failure");
+                } catch (IOException reopenEx) {
+                    log.error("Failed to reopen tail run channel; engine unable to write tail entries", reopenEx);
+                    throw new RuntimeException("Tail compaction failed and channel could not be reopened", e);
+                }
+            }
+        } finally {
+            try { Files.deleteIfExists(compactFile); } catch (IOException ignored) { }
+        }
     }
 
     @Override

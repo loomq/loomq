@@ -21,7 +21,9 @@ public record WheelConfig(
     long awaitCommitTimeoutMs,
     long hotBoundaryMs,
     long promotionLeadMs,
-    PrecisionTier defaultTier
+    PrecisionTier defaultTier,
+    long bucketRetentionMs,
+    long compactionThresholdBytes
 ) {
     public WheelConfig {
         dataDir = requireText(dataDir, "dataDir");
@@ -32,7 +34,19 @@ public record WheelConfig(
         requirePositive(awaitCommitTimeoutMs, "awaitCommitTimeoutMs");
         requirePositive(hotBoundaryMs, "hotBoundaryMs");
         requirePositive(promotionLeadMs, "promotionLeadMs");
+        requirePositive(bucketRetentionMs, "bucketRetentionMs");
+        requirePositive(compactionThresholdBytes, "compactionThresholdBytes");
         defaultTier = defaultTier != null ? defaultTier : PrecisionTierCatalog.defaultCatalog().defaultTier();
+    }
+
+    /** Backward-compatible 9-arg constructor: defaults bucketRetentionMs and compactionThresholdBytes. */
+    public WheelConfig(String dataDir, String shardId, int horizonDays, int slotsPerBucket,
+                       long groupCommitIntervalMs, long awaitCommitTimeoutMs,
+                       long hotBoundaryMs, long promotionLeadMs, PrecisionTier defaultTier) {
+        this(dataDir, shardId, horizonDays, slotsPerBucket, groupCommitIntervalMs,
+             awaitCommitTimeoutMs, hotBoundaryMs, promotionLeadMs, defaultTier,
+             (long) horizonDays * 24 * 60 * 60_000L + 24 * 60 * 60_000L,  // horizon + 1 day safety margin
+             512L * 1024 * 1024);  // 512 MB
     }
 
     public static WheelConfig defaultConfig() {
@@ -57,7 +71,8 @@ public record WheelConfig(
 
     public WheelConfig withDataDir(String dir) {
         return new WheelConfig(dir, shardId, horizonDays, slotsPerBucket, groupCommitIntervalMs,
-            awaitCommitTimeoutMs, hotBoundaryMs, promotionLeadMs, defaultTier);
+            awaitCommitTimeoutMs, hotBoundaryMs, promotionLeadMs, defaultTier,
+            bucketRetentionMs, compactionThresholdBytes);
     }
 
     private static String requireText(String value, String fieldName) {

@@ -3,6 +3,7 @@ package com.loomq.application.recovery;
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
@@ -14,6 +15,7 @@ import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import com.loomq.tracing.IntentTraceStore;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -62,12 +64,12 @@ class WheelRecoveryTest {
              TailIndex tail2 = new TailIndex(tmp, clock);
              ConcurrentIntentStore mem = new ConcurrentIntentStore();
              IntentLocationIndex idx = new IntentLocationIndex();
-             PromotionDaemon daemon = new PromotionDaemon(store2, tail2, idx, clock, i -> {}, 60_000L)) {
+             PromotionDaemon daemon = new PromotionDaemon(store2, tail2, idx, clock, (i, loc) -> {}, 60_000L)) {
             // PrecisionScheduler 非 AutoCloseable,且未 start(),无需 close/stop。
             // 构造对 deliveryHandler 做 requireNonNull,故传 no-op(本测试仅 restore,不投递)。
             PrecisionScheduler scheduler = new PrecisionScheduler(
                 mem, i -> CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.SUCCESS), null);
-            WheelRecovery rec = new WheelRecovery(store2, tail2, 60L * 60_000L);
+            WheelRecovery rec = new WheelRecovery(store2, tail2, 60L * 60_000L, new MetricsCollector());
             WheelRecoveryReport rpt = rec.recover(mem, scheduler, idx, daemon);
             verifier.accept(new Recovered(rpt, mem, idx, daemon));
         }
@@ -102,7 +104,7 @@ class WheelRecoveryTest {
     }
 
     @Test
-    void shouldSkipTerminalIntentButStillIndexIt() {
+    void shouldSkipTerminalIntentAndNotIndexIt() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
@@ -119,12 +121,12 @@ class WheelRecoveryTest {
             assertEquals(0, r.report().hotRestored(), "terminal intent must not be hot-loaded");
             assertEquals(0, r.report().coldRegistered(), "terminal intent must not be registered for promotion");
             assertNull(r.mem().findById("intent_cancel00001"), "terminal intent must not be in memStore");
-            assertNotNull(r.idx().get("intent_cancel00001"), "terminal intent should still be indexed for cancel locate");
+            assertNull(r.idx().get("intent_cancel00001"), "terminal intent must not be indexed (Spec B: locationIndex only retains non-terminal)");
         });
     }
 
     @Test
-    void shouldSkipExpiredIntentButStillIndexIt() {
+    void shouldSkipExpiredIntentAndNotIndexIt() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
         try (WheelStore store = new WheelStore(cfg, clock::get);
@@ -140,7 +142,7 @@ class WheelRecoveryTest {
             assertEquals(0, r.report().hotRestored(), "expired intent must not be hot-loaded");
             assertEquals(0, r.report().coldRegistered(), "expired intent must not be registered for promotion");
             assertNull(r.mem().findById("intent_expired00001"), "expired intent must not be in memStore");
-            assertNotNull(r.idx().get("intent_expired00001"), "expired intent should still be indexed");
+            assertNull(r.idx().get("intent_expired00001"), "overdue intent marked terminal must not be indexed (Spec B)");
             assertFalse(r.daemon().remove("intent_expired00001"), "expired intent must not be registered in daemon");
         });
     }
@@ -170,8 +172,7 @@ class WheelRecoveryTest {
             assertEquals(0, r.report().coldRegistered(), "terminal winner must not be registered for promotion");
             assertNull(r.mem().findById("intent_dedup000001"), "terminal winner must not be in memStore");
             SlotLocation loc = r.idx().get("intent_dedup000001");
-            assertNotNull(loc, "winner should be indexed");
-            assertFalse(loc.inTail(), "winner loc should be a day-wheel slot, not tail");
+            assertNull(loc, "terminal winner must not be indexed (Spec B)");
         });
     }
 
@@ -209,5 +210,38 @@ class WheelRecoveryTest {
             assertTrue(r.daemon().remove("intent_resched0001"),
                 "tail entry should be registered in promotion daemon");
         });
+    }
+
+    @Test
+    void shouldMarkOverdueIntentAndIncrementMetric() {
+        AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        try (WheelStore store = new WheelStore(cfg, clock::get);
+             TailIndex tail = new TailIndex(tmp, clock::get)) {
+            // executeAt in the past (< now) -> overdue at recover time
+            Intent overdue = new Intent("intent_overdue_metric1");
+            overdue.setExecuteAt(Instant.ofEpochMilli(clock.get() - 5_000));
+            overdue.transitionTo(IntentStatus.SCHEDULED);
+            store.put(overdue);
+        }
+
+        MetricsCollector mc = new MetricsCollector();
+        long beforeOverdue = mc.getRecoveryOverdueTotal();
+
+        try (WheelStore store2 = new WheelStore(cfg, clock::get);
+                 TailIndex tail2 = new TailIndex(tmp, clock::get);
+                 ConcurrentIntentStore mem = new ConcurrentIntentStore();
+                 IntentLocationIndex idx = new IntentLocationIndex();
+                 PromotionDaemon daemon = new PromotionDaemon(store2, tail2, idx, clock::get, (i, loc) -> {}, 60_000L)) {
+                PrecisionScheduler scheduler = new PrecisionScheduler(
+                    mem, i -> CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.SUCCESS), null, null, mc, new IntentTraceStore());
+                WheelRecovery rec = new WheelRecovery(store2, tail2, 60L * 60_000L, mc);
+                WheelRecoveryReport rpt = rec.recover(mem, scheduler, idx, daemon);
+                assertEquals(0, rpt.hotRestored(), "overdue intent must not be hot-loaded");
+                assertEquals(0, rpt.coldRegistered(), "overdue intent must not be registered for promotion");
+                long afterOverdue = mc.getRecoveryOverdueTotal();
+                assertEquals(1, afterOverdue - beforeOverdue,
+                    "recovery overdue metric must increment by 1");
+            }
     }
 }

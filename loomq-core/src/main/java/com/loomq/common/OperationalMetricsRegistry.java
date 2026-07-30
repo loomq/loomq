@@ -17,6 +17,7 @@ final class OperationalMetricsRegistry {
     private final AtomicLong intentsRetryTotal = new AtomicLong(0);
     private final AtomicLong intentsExpiredTotal = new AtomicLong(0);
     private final AtomicLong intentsDeadLetterTotal = new AtomicLong(0);
+    private final AtomicLong recoveryOverdueTotal = new AtomicLong(0);
     private final AtomicLong webhookRequestsTotal = new AtomicLong(0);
     private final AtomicLong webhookTimeoutTotal = new AtomicLong(0);
     private final AtomicLong webhookErrorTotal = new AtomicLong(0);
@@ -64,6 +65,10 @@ final class OperationalMetricsRegistry {
         intentsDeadLetterTotal.incrementAndGet();
     }
 
+    void incrementRecoveryOverdue() {
+        recoveryOverdueTotal.incrementAndGet();
+    }
+
     void updateBucketMetrics(long bucketIntentCount, long readyQueueSize) {
         this.bucketIntentCount = bucketIntentCount;
         this.readyQueueSize = readyQueueSize;
@@ -95,6 +100,10 @@ final class OperationalMetricsRegistry {
 
     long getIntentsDeadLetterTotal() {
         return intentsDeadLetterTotal.get();
+    }
+
+    long getRecoveryOverdueTotal() {
+        return recoveryOverdueTotal.get();
     }
 
     void appendPrometheusMetrics(Map<String, Long> intentStats, StringBuilder sb) {
@@ -153,6 +162,11 @@ final class OperationalMetricsRegistry {
         sb.append("# HELP loomq_intents_dead_letter_total Total intents in dead letter\n");
         sb.append("# TYPE loomq_intents_dead_letter_total counter\n");
         appendMetric(sb, "loomq_intents_dead_letter_total", intentsDeadLetterTotal.get());
+        sb.append("\n");
+
+        sb.append("# HELP loomq_recovery_overdue_total Total intents marked overdue during recovery\n");
+        sb.append("# TYPE loomq_recovery_overdue_total counter\n");
+        appendMetric(sb, "loomq_recovery_overdue_total", recoveryOverdueTotal.get());
         sb.append("\n");
 
         // Bucket 指标

@@ -46,15 +46,16 @@ class CancelColdConcurrencyTest {
             ConcurrentIntentStore memStore = new ConcurrentIntentStore();
             AtomicBoolean running = new AtomicBoolean(true);
             AtomicLong seq = new AtomicLong();
+            MetricsCollector mc = new MetricsCollector();
             PrecisionScheduler scheduler = new PrecisionScheduler(memStore, intent ->
                 java.util.concurrent.CompletableFuture.completedFuture(
                     com.loomq.spi.DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, i -> {}, 60_000L);
+            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> {}, 60_000L);
             ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
 
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                MetricsCollector.getInstance(), cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
+                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
             barrier.start(); daemon.start(); scheduler.start();
 
             // 冷 Intent:executeAt 远超 60min → 落 wheel(非 tail),不在内存 store
@@ -66,7 +67,7 @@ class CancelColdConcurrencyTest {
             var loc = store.put(cold);
             idx.put(cold.getIntentId(), loc); // 模拟 createIntent 已注册索引(冷,不进 memStore)
 
-            long beforeCancelled = MetricsCollector.getInstance().getIntentsCancelledTotal();
+            long beforeCancelled = mc.getIntentsCancelledTotal();
 
             int n = 8;
             CountDownLatch ready = new CountDownLatch(n);
@@ -91,7 +92,7 @@ class CancelColdConcurrencyTest {
             try {
                 assertEquals(1, successes.get(), "exactly one concurrent cold cancel must succeed");
                 assertEquals(n - 1, failures.get(), "others must see terminal state and return false");
-                assertEquals(1L, MetricsCollector.getInstance().getIntentsCancelledTotal() - beforeCancelled,
+                assertEquals(1L, mc.getIntentsCancelledTotal() - beforeCancelled,
                     "cancel counter must increment exactly once (no double-count)");
             } finally {
                 // scheduler/daemon 不在 try-with-resources 中,需显式关闭;
@@ -119,15 +120,16 @@ class CancelColdConcurrencyTest {
             ConcurrentIntentStore memStore = new ConcurrentIntentStore();
             AtomicBoolean running = new AtomicBoolean(true);
             AtomicLong seq = new AtomicLong();
+            MetricsCollector mc = new MetricsCollector();
             PrecisionScheduler scheduler = new PrecisionScheduler(memStore, intent ->
                 java.util.concurrent.CompletableFuture.completedFuture(
                     com.loomq.spi.DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, i -> {}, 60_000L);
+            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> {}, 60_000L);
             ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
 
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                MetricsCollector.getInstance(), cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
+                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
             barrier.start(); daemon.start(); scheduler.start();
 
             // 远期冷 Intent:executeAt > 30d 视界 → 落 tail(非 wheel),不在内存 store。
@@ -140,7 +142,7 @@ class CancelColdConcurrencyTest {
             tail.put(cold);                                   // 落 tail run 文件
             idx.put(cold.getIntentId(), SlotLocation.tail(execMs)); // 模拟 createIntent 已注册索引
 
-            long beforeCancelled = MetricsCollector.getInstance().getIntentsCancelledTotal();
+            long beforeCancelled = mc.getIntentsCancelledTotal();
 
             int n = 8;
             CountDownLatch ready = new CountDownLatch(n);
@@ -166,7 +168,7 @@ class CancelColdConcurrencyTest {
                 assertEquals(1, successes.get(), "exactly one concurrent tail cold cancel must succeed");
                 assertEquals(n - 1, failures.get(),
                     "others' tailIndex.remove must return false (already cancelled) → return false");
-                assertEquals(1L, MetricsCollector.getInstance().getIntentsCancelledTotal() - beforeCancelled,
+                assertEquals(1L, mc.getIntentsCancelledTotal() - beforeCancelled,
                     "cancel counter must increment exactly once on tail path (no double-count)");
             } finally {
                 scheduler.stop();

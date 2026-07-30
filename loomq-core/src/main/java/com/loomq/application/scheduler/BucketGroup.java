@@ -12,7 +12,6 @@ import java.util.List;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -178,24 +177,6 @@ public class BucketGroup {
         }
 
         return dueIntents;
-    }
-
-    /**
-     * 计算休眠时长
-     *
-     * @param delay    延迟时间（毫秒）
-     * @return 休眠时长（毫秒），0 表示直接入桶
-     */
-    public long calculateSleepMs(long delay) {
-        long precisionWindowMs = profile.precisionWindowMs();
-        if (delay <= precisionWindowMs) {
-            // 短延迟场景：跳过休眠，直接进入 Bucket
-            return 0;
-        }
-
-        // 长延迟场景：引入随机抖动，避免海量任务同时苏醒
-        long jitter = ThreadLocalRandom.current().nextLong(precisionWindowMs);
-        return delay - precisionWindowMs - jitter;
     }
 
     /**

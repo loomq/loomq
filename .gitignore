@@ -26,6 +26,11 @@ replay_pid*
 # IDE
 .idea/workspace.xml
 
+# Eclipse
+.project
+.settings/
+.classpath
+
 # Maven
 target/
 dependency-reduced-pom.xml

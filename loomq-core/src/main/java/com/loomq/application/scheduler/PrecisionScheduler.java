@@ -31,6 +31,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -38,6 +39,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -56,6 +58,8 @@ public class PrecisionScheduler {
     private static final long BACKPRESSURE_LOG_INTERVAL_MS = 1000;
     // AdapTBF constraints: max lend ratio per tier (protects low-priority tiers)
     private static final double MAX_LEND_RATIO = 0.5; // lend at most 50% of tier's slots
+    // 投递超时(单条/批量统一);后续如需可配,移入 PrecisionTierCatalog
+    private static final long DELIVERY_TIMEOUT_SECONDS = 30;
 
     private final IntentStore intentStore;
     private final PrecisionTierCatalog precisionTierCatalog;
@@ -71,6 +75,21 @@ public class PrecisionScheduler {
 
     // 档位级并发控制（可动态调整上限）
     private final Map<PrecisionTier, ResizableSemaphore> tierSemaphores;
+
+    /**
+     * 在途投递计数（含跨档借用的投递）。
+     * stop() 排空的可靠依据：semaphore 只能感知本档 permit，借用他档 permit 的
+     * 在途投递会被漏检，导致 sharedExecutor 提前关闭、完成回调被 reject、
+     * ACK/重试决策丢失。dispatch 前 +1，finalize 任务结束 -1。
+     */
+    private final Map<PrecisionTier, AtomicInteger> tierInFlight;
+
+    /**
+     * 状态变更持久化钩子（由 LoomqEngine 注入，接到 IntentCommandService 的 DURABLE 落盘）。
+     * 重试重排程是新的调度承诺而非中间态：必须落盘，否则崩溃恢复看到的是
+     * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。
+     */
+    private volatile Consumer<Intent> stateChangePersister;
 
     // 档位级有界队列（容量 = maxConcurrency × 4，满时触发 backpressure）
     private final Map<PrecisionTier, BlockingQueue<Intent>> tierDispatchQueues;
@@ -169,7 +188,8 @@ public class PrecisionScheduler {
     private volatile boolean paused = false;
 
     // Metrics
-    private final MetricsCollector metrics = MetricsCollector.getInstance();
+    private final MetricsCollector metrics;
+    private final IntentTraceStore traceStore;
 
     /**
      * 创建调度器（完整参数）。
@@ -179,23 +199,26 @@ public class PrecisionScheduler {
      * @param redeliveryDecider 重投决策器（null 则使用默认）
      */
     public PrecisionScheduler(IntentStore intentStore, DeliveryHandler deliveryHandler, RedeliveryDecider redeliveryDecider) {
-        this(intentStore, deliveryHandler, redeliveryDecider, null);
+        this(intentStore, deliveryHandler, redeliveryDecider, null, new MetricsCollector(), new IntentTraceStore());
     }
 
-    /**
-     * 创建调度器（完整参数）
-     *
-     * @param intentStore       Intent 存储
-     * @param deliveryHandler   投递处理器（null 则使用 ServiceLoader 加载）
-     * @param redeliveryDecider 重投决策器（null 则使用默认）
-     * @param precisionTierCatalog 精度档位目录
-     */
     public PrecisionScheduler(IntentStore intentStore,
                               DeliveryHandler deliveryHandler,
                               RedeliveryDecider redeliveryDecider,
                               PrecisionTierCatalog precisionTierCatalog) {
+        this(intentStore, deliveryHandler, redeliveryDecider, precisionTierCatalog, new MetricsCollector(), new IntentTraceStore());
+    }
+
+    public PrecisionScheduler(IntentStore intentStore,
+                              DeliveryHandler deliveryHandler,
+                              RedeliveryDecider redeliveryDecider,
+                              PrecisionTierCatalog precisionTierCatalog,
+                              MetricsCollector metricsCollector,
+                              IntentTraceStore traceStore) {
         this.intentStore = intentStore;
         this.deliveryHandler = Objects.requireNonNull(deliveryHandler, "deliveryHandler must not be null");
+        this.metrics = metricsCollector;
+        this.traceStore = traceStore;
         this.precisionTierCatalog = precisionTierCatalog != null
             ? precisionTierCatalog
             : PrecisionTierCatalog.defaultCatalog();
@@ -219,7 +242,7 @@ public class PrecisionScheduler {
                     }
                 }
             }
-        });
+        }, this.metrics);
 
         // 加载重投决策器
         if (redeliveryDecider != null) {
@@ -235,6 +258,7 @@ public class PrecisionScheduler {
         // 初始化档位级信号量和队列
         this.tierSemaphores = new EnumMap<>(PrecisionTier.class);
         this.tierDispatchQueues = new EnumMap<>(PrecisionTier.class);
+        this.tierInFlight = new EnumMap<>(PrecisionTier.class);
         this.expiredCheckCounters = new EnumMap<>(PrecisionTier.class);
 
         for (PrecisionTier tier : this.precisionTierCatalog.supportedTiers()) {
@@ -242,6 +266,7 @@ public class PrecisionScheduler {
             int queueCapacity = this.precisionTierCatalog.dispatchQueueCapacity(tier);
             tierDispatchQueues.put(tier, new ArrayBlockingQueue<>(queueCapacity));
             expiredCheckCounters.put(tier, new AtomicLong(0));
+            tierInFlight.put(tier, new AtomicInteger(0));
         }
 
         if (this.deliveryHandler == null) {
@@ -336,19 +361,20 @@ public class PrecisionScheduler {
         }
         scanSchedulers.clear();
 
-        // 排空 in-flight dispatch: 获取全部 permit 证明所有投递已完成
-        for (Map.Entry<PrecisionTier, ResizableSemaphore> entry : tierSemaphores.entrySet()) {
+        // 排空 in-flight dispatch: 依据 per-tier 在途计数而非 semaphore——
+        // 借用他档 permit 的投递 semaphore 感知不到,提前关 sharedExecutor 会让
+        // 完成回调的 submit 被 reject,ACK/重试决策静默丢失。
+        long drainDeadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        for (Map.Entry<PrecisionTier, AtomicInteger> entry : tierInFlight.entrySet()) {
             PrecisionTier tier = entry.getKey();
-            ResizableSemaphore sem = entry.getValue();
-            int max = precisionTierCatalog.maxConcurrency(tier);
-            try {
-                if (!sem.tryAcquire(max, 5, TimeUnit.SECONDS)) {
+            AtomicInteger inFlight = entry.getValue();
+            while (inFlight.get() > 0) {
+                if (System.nanoTime() > drainDeadlineNs) {
                     logger.warn("Tier {} has {} intents still in-flight after drain timeout",
-                        tier, max - sem.availablePermits());
+                        tier, inFlight.get());
+                    break;
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
             }
         }
 
@@ -406,7 +432,7 @@ public class PrecisionScheduler {
         }
 
         // Trace: record intent creation
-        IntentTraceStore.getInstance().recordCreated(
+        traceStore.recordCreated(
             intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier());
 
         Instant executeAt = intent.getExecuteAt();
@@ -564,7 +590,7 @@ public class PrecisionScheduler {
                     enqueueTimeNanos.put(intent.getIntentId(), batchEnqueueNanos);
 
                     // Trace: record enqueued
-                    IntentTraceStore.getInstance().recordEnqueued(intent.getIntentId());
+                    traceStore.recordEnqueued(intent.getIntentId());
 
                     // 提交到档位队列（有界，带短重试）
                     BlockingQueue<Intent> queue = tierDispatchQueues.get(tier);
@@ -682,7 +708,7 @@ public class PrecisionScheduler {
 
             Intent intent = queue.poll();
             if (intent == null) {
-                acquired.release();
+                releasePermit(tier, acquired);   // Fix 7: 空 poll 释放同样配对 decrementBorrowed
                 long parkNanos = switch (tier) {
                     case ULTRA -> 100_000L;    // 100μs (10ms precision window ≈ 1%)
                     case FAST  -> 200_000L;    // 200μs
@@ -692,8 +718,17 @@ public class PrecisionScheduler {
                 continue;
             }
 
+            // Fix 3: 终态复查——已取消/已过期/已死信的 Intent 不再投递。
+            // scan 入队与 cancel 之间有竞态(cancel 只清 bucket+cohort,不清 dispatch 队列),
+            // 过期扫描也会把 EXPIRED 副本留在队列里。这里加 guard 杜绝 ghost 投递。
+            if (intent.getStatus().isTerminal()) {
+                enqueueTimeNanos.remove(intent.getIntentId());
+                releasePermit(tier, acquired);
+                continue;
+            }
+
             // Trace: record dequeued (right after pollFirst, before any other processing)
-            IntentTraceStore.getInstance().recordDequeued(intent.getIntentId());
+            traceStore.recordDequeued(intent.getIntentId());
             recordDispatchQueueLag(intent, tier);
 
             // Only accumulate acquire wait for actual deliveries so the average
@@ -701,34 +736,36 @@ public class PrecisionScheduler {
             permitTimingStats.totalAcquireWaitNanos.addAndGet(acquireEndNs - acquireStartNs);
             final long permitAcquiredNs = acquireEndNs;
 
+            // Fix 5: 在途计数(含借用),stop() 据此排空而非 semaphore
+            tierInFlight.get(tier).incrementAndGet();
+
             long deliverStartNs = System.nanoTime();
-            deliveryHandler.deliverAsync(intent)
-                .orTimeout(30, TimeUnit.SECONDS)
-                .whenComplete((result, ex) -> {
-                    long releaseNs = System.nanoTime();
+            try {
+                deliveryHandler.deliverAsync(intent)
+                    .orTimeout(DELIVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    .whenComplete((result, ex) -> {
+                        long releaseNs = System.nanoTime();
 
-                    permitTimingStats.totalPermitHoldNanos.addAndGet(releaseNs - permitAcquiredNs);
-                    permitTimingStats.deliverySampleCount.incrementAndGet();
+                        permitTimingStats.totalPermitHoldNanos.addAndGet(releaseNs - permitAcquiredNs);
+                        permitTimingStats.deliverySampleCount.incrementAndGet();
 
-                    // Release permit before finalizeIntent to maximize concurrency
-                    if (acquired != tierSemaphores.get(tier)) {
-                        acquired.decrementBorrowed();
-                    }
-                    acquired.release();
+                        // Release permit before finalizeIntent to maximize concurrency
+                        releasePermit(tier, acquired);
 
-                    // Defer finalization off the event loop (ConcurrentHashMap.compute + store update)
-                    sharedExecutor.submit(() -> {
-                        try {
+                        // Defer finalization off the event loop; Fix 5: 末尾 -1 在途计数
+                        submitFinalize(intent, tier, () -> {
                             if (ex != null) {
                                 handleDeliveryException(intent, tier, ex);
                             } else {
                                 finalizeIntent(intent, tier, result);
                             }
-                        } catch (Exception e) {
-                            logger.error("Error in delivery callback for intent {}", intent.getIntentId(), e);
-                        }
+                        });
                     });
-                });
+            } catch (RuntimeException deliverEx) {
+                // P1-9: SPI 同步抛异常会杀死消费者 VT——按失败结算,消费者继续存活
+                releasePermit(tier, acquired);
+                submitFinalize(intent, tier, () -> handleDeliveryException(intent, tier, deliverEx));
+            }
             permitTimingStats.totalDeliverAsyncNanos.addAndGet(System.nanoTime() - deliverStartNs);
         }
     }
@@ -769,6 +806,18 @@ public class PrecisionScheduler {
                 queue.drainTo(batch, batchSize - batch.size());
             }
 
+            // Fix 3: 终态复查——批内已取消/过期/死信的 intent 直接剔除(连同过期索引残留)。
+            // cancel 只清 bucket+cohort,不清 tierDispatchQueues;过期扫描也会留 EXPIRED 副本。
+            if (batch.removeIf(intent -> {
+                if (intent.getStatus().isTerminal()) {
+                    enqueueTimeNanos.remove(intent.getIntentId());
+                    return true;
+                }
+                return false;
+            }) && batch.isEmpty()) {
+                continue;
+            }
+
             // Phase 3: acquire permits for the batch
             List<ResizableSemaphore> acquiredPermits = new ArrayList<>(batch.size());
             long acquireStartNs = System.nanoTime();
@@ -777,9 +826,9 @@ public class PrecisionScheduler {
                     acquiredPermits.add(acquireWithBorrow(tier));
                 }
             } catch (InterruptedException e) {
-                // Release any already-acquired permits
+                // Fix 7: 中断释放同样配对 decrementBorrowed
                 for (ResizableSemaphore s : acquiredPermits) {
-                    s.release();
+                    releasePermit(tier, s);
                 }
                 Thread.currentThread().interrupt();
                 break;
@@ -788,52 +837,74 @@ public class PrecisionScheduler {
 
             // Trace: record dequeued for each intent
             for (Intent intent : batch) {
-                IntentTraceStore.getInstance().recordDequeued(intent.getIntentId());
+                traceStore.recordDequeued(intent.getIntentId());
                 recordDispatchQueueLag(intent, tier);
             }
 
             permitTimingStats.totalAcquireWaitNanos.addAndGet(acquireEndNs - acquireStartNs);
             final long permitAcquiredNs = acquireEndNs;
 
-            // Phase 4: batch delivery
+            // Fix 5: 批量在途计数
+            AtomicInteger inFlight = tierInFlight.get(tier);
+            for (int i = 0; i < batch.size(); i++) inFlight.incrementAndGet();
+
+            // Phase 4: batch delivery — Fix 4: per-future 独立结算,一条失败不连坐整批。
+            // 原 allOf 聚合异常会让 49 条已成功的 intent 被整批重投→下游收重复事件。
             long deliverStartNs = System.nanoTime();
-            List<CompletableFuture<DeliveryHandler.DeliveryResult>> futures =
-                deliveryHandler.deliverBatchAsync(batch);
-
-            // Wait for all futures to complete (with timeout)
-            CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
-                .orTimeout(30, TimeUnit.SECONDS)
-                .whenComplete((v, ex) -> {
-                    long releaseNs = System.nanoTime();
-                    permitTimingStats.totalPermitHoldNanos.addAndGet(releaseNs - permitAcquiredNs);
-                    permitTimingStats.deliverySampleCount.addAndGet(batch.size());
-
-                    // Release all permits
-                    for (ResizableSemaphore s : acquiredPermits) {
-                        if (s != tierSemaphores.get(tier)) {
-                            s.decrementBorrowed();
-                        }
-                        s.release();
-                    }
-
-                    // Finalize each intent
-                    sharedExecutor.submit(() -> {
-                        for (int i = 0; i < batch.size(); i++) {
-                            Intent intent = batch.get(i);
-                            try {
-                                if (ex != null) {
-                                    handleDeliveryException(intent, tier, ex);
-                                } else {
-                                    DeliveryHandler.DeliveryResult result = futures.get(i).join();
-                                    finalizeIntent(intent, tier, result);
-                                }
-                            } catch (Exception e) {
-                                logger.error("Error in batch delivery callback for intent {}",
-                                    intent.getIntentId(), e);
+            List<CompletableFuture<DeliveryHandler.DeliveryResult>> futures;
+            try {
+                futures = deliveryHandler.deliverBatchAsync(batch);
+            } catch (RuntimeException deliverEx) {
+                // P1-9: SPI 同步抛异常——按失败结算每个 intent,消费者继续存活
+                for (int i = 0; i < batch.size(); i++) {
+                    Intent intent = batch.get(i);
+                    releasePermit(tier, acquiredPermits.get(i));
+                    submitFinalize(intent, tier, () -> handleDeliveryException(intent, tier, deliverEx));
+                }
+                permitTimingStats.totalDeliverAsyncNanos.addAndGet(System.nanoTime() - deliverStartNs);
+                continue;
+            }
+            if (futures == null) {
+                // SPI returned null instead of throwing — treat entire batch as failures
+                for (int i = 0; i < batch.size(); i++) {
+                    Intent intent = batch.get(i);
+                    releasePermit(tier, acquiredPermits.get(i));
+                    submitFinalize(intent, tier, () -> handleDeliveryException(intent, tier,
+                        new IllegalStateException("deliverBatchAsync returned null")));
+                }
+                permitTimingStats.totalDeliverAsyncNanos.addAndGet(System.nanoTime() - deliverStartNs);
+                continue;
+            }
+            if (futures.size() != batch.size()) {
+                logger.error("deliverBatchAsync returned {} futures for batch of {}; missing futures treated as failures",
+                    futures.size(), batch.size());
+            }
+            for (int i = 0; i < batch.size(); i++) {
+                final Intent intent = batch.get(i);
+                final ResizableSemaphore permit = acquiredPermits.get(i);
+                CompletableFuture<DeliveryHandler.DeliveryResult> f =
+                    i < futures.size() ? futures.get(i) : null;
+                if (f == null) {
+                    releasePermit(tier, permit);
+                    submitFinalize(intent, tier, () -> handleDeliveryException(intent, tier,
+                        new IllegalStateException("deliverBatchAsync returned no future for this intent")));
+                    continue;
+                }
+                f.orTimeout(DELIVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    .whenComplete((result, ex) -> {
+                        long releaseNs = System.nanoTime();
+                        permitTimingStats.totalPermitHoldNanos.addAndGet(releaseNs - permitAcquiredNs);
+                        permitTimingStats.deliverySampleCount.incrementAndGet();
+                        releasePermit(tier, permit);
+                        submitFinalize(intent, tier, () -> {
+                            if (ex != null) {
+                                handleDeliveryException(intent, tier, ex);
+                            } else {
+                                finalizeIntent(intent, tier, result);
                             }
-                        }
+                        });
                     });
-                });
+            }
             permitTimingStats.totalDeliverAsyncNanos.addAndGet(System.nanoTime() - deliverStartNs);
         }
     }
@@ -882,6 +953,65 @@ public class PrecisionScheduler {
         this.observers.clear();
         if (observers != null) {
             this.observers.addAll(observers);
+        }
+    }
+
+    /**
+     * 运行时新增观察器——立即生效(observer 列表为 CopyOnWriteArrayList)。
+     * 修复原"启动后注册的 observer 永远收不到事件"的问题(LoomqEngine.start 时
+     * setObservers 拷贝了快照,之后 registerObserver 只改 LoomqEngine 侧列表)。
+     */
+    public void addObserver(IntentObserver observer) {
+        if (observer != null) observers.add(observer);
+    }
+
+    public void removeObserver(IntentObserver observer) {
+        observers.remove(observer);
+    }
+
+    /**
+     * 释放 permit 并在跨档借用时配对 decrementBorrowed。
+     * 统一所有 release 路径,杜绝 borrowedCount 泄漏导致跨档借用静默永久失效。
+     */
+    private void releasePermit(PrecisionTier tier, ResizableSemaphore acquired) {
+        if (acquired != tierSemaphores.get(tier)) {
+            acquired.decrementBorrowed();
+        }
+        acquired.release();
+    }
+
+    /**
+     * 把投递结算任务提交到 sharedExecutor,统一处理 RejectedExecutionException
+     * 并在任务结束时 -1 在途计数(Fix 5)。stop() 等在途归零后才关 executor,
+     * 正常路径不应 reject;此处的兜底仅作防御,避免在途决策静默丢失。
+     */
+    private void submitFinalize(Intent intent, PrecisionTier tier, Runnable task) {
+        try {
+            sharedExecutor.submit(() -> {
+                try {
+                    task.run();
+                } catch (Exception e) {
+                    logger.error("Error in delivery callback for intent {}", intent.getIntentId(), e);
+                } finally {
+                    tierInFlight.get(tier).decrementAndGet();
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            tierInFlight.get(tier).decrementAndGet();
+            logger.error("sharedExecutor rejected finalize for intent {}; outcome may be lost",
+                intent.getIntentId(), e);
+        }
+    }
+
+    /** 注入状态变更持久化钩子(接到 IntentCommandService 的 DURABLE 落盘)。 */
+    public void setStateChangePersister(Consumer<Intent> persister) {
+        this.stateChangePersister = persister;
+    }
+
+    private void persistStateChange(Intent intent) {
+        Consumer<Intent> p = stateChangePersister;
+        if (p != null) {
+            p.accept(intent);
         }
     }
 
@@ -964,24 +1094,29 @@ public class PrecisionScheduler {
     }
 
     /**
-     * 处理过期任务
+     * 处理过期任务。
+     *
+     * P1-3: synchronized(intent) 与 finalizeIntent 串行化——Intent.transitionTo 的
+     * validate+set 非原子,不加锁时两线程可同时通过校验导致状态撕裂(EXPIRED 被 DUE 回跳等)。
      */
     private void handleExpired(Intent intent) {
-        unindexIntent(intent.getIntentId(), executeAtMs(intent));
-        logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
+        synchronized (intent) {
+            unindexIntent(intent.getIntentId(), executeAtMs(intent));
+            logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
 
-        switch (intent.getExpiredAction()) {
-            case DISCARD:
-                intent.transitionTo(IntentStatus.EXPIRED);
-                break;
-            case DEAD_LETTER:
-                intent.transitionTo(IntentStatus.DEAD_LETTERED);
-                break;
+            switch (intent.getExpiredAction()) {
+                case DISCARD:
+                    intent.transitionTo(IntentStatus.EXPIRED);
+                    break;
+                case DEAD_LETTER:
+                    intent.transitionTo(IntentStatus.DEAD_LETTERED);
+                    break;
+            }
+            intentStore.update(intent);
+
+            // Notify AFTER transition so observers see the terminal state
+            notifyObservers(o -> o.onExpired(intent));
         }
-        intentStore.update(intent);
-
-        // Notify AFTER transition so observers see the terminal state
-        notifyObservers(o -> o.onExpired(intent));
     }
 
     /**
@@ -999,7 +1134,7 @@ public class PrecisionScheduler {
                 intent.incrementAttempts();
 
                 // Trace: record delivered
-                IntentTraceStore.getInstance().recordDelivered(intent.getIntentId());
+                traceStore.recordDelivered(intent.getIntentId());
 
                 final DeliveryResult finalResult = result != null ? result : DeliveryResult.RETRY;
                 if (result == null) {
@@ -1014,8 +1149,8 @@ public class PrecisionScheduler {
                         notifyObservers(o -> o.onDelivered(intent, finalResult));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         // Trace: record acked
-                        IntentTraceStore.getInstance().recordAcked(intent.getIntentId());
-                        IntentTraceStore.getInstance().updateStatus(intent.getIntentId(), IntentStatus.ACKED);
+                        traceStore.recordAcked(intent.getIntentId());
+                        traceStore.updateStatus(intent.getIntentId(), IntentStatus.ACKED);
                         logger.debug("Intent {} delivered successfully", intent.getIntentId());
                         break;
 
@@ -1029,6 +1164,10 @@ public class PrecisionScheduler {
                         intent.setExecuteAt(Instant.now().plusMillis(delayMs));
                         intent.transitionTo(IntentStatus.SCHEDULED);
                         intentStore.update(intent);
+                        // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
+                        // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
+                        // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
+                        persistStateChange(intent);
                         unindexIntent(intent.getIntentId(), oldExecuteAtMs);
                         schedule(intent);
                         break;
@@ -1087,6 +1226,8 @@ public class PrecisionScheduler {
                 intent.setExecuteAt(Instant.now().plusMillis(delayMs));
                 intent.transitionTo(IntentStatus.SCHEDULED);
                 intentStore.update(intent);
+                // Fix 6: 重排程落盘,见 finalizeIntent RETRY 分支同款说明
+                persistStateChange(intent);
                 unindexIntent(intent.getIntentId(), oldExecuteAtMs);
                 schedule(intent);
             }

@@ -18,6 +18,7 @@ import com.loomq.spi.CallbackHandler;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -177,34 +178,116 @@ public final class IntentCommandService {
 
             return seq;
         } catch (Exception e) {
-            logger.error("Failed to create intent: id={}", intent.getIntentId(), e);
-            // 回滚内存态:从调度器/store/索引/cohort 移除。
-            // 注意:已落盘的 wheel/tail 写入不回滚——若写入已成功,崩溃恢复会重建该 intent,
-            // 这与 DURABLE 语义一致(写入成功即持久)。
-            try {
-                scheduler.removeFromSchedule(intent);
-            } catch (Exception ignored) {}
-            try {
-                intentStore.delete(intent.getIntentId());
-            } catch (Exception rollbackEx) {
-                logger.error("Rollback failed for intent {}: store.delete",
-                    intent.getIntentId(), rollbackEx);
-            }
-            try {
-                promotionDaemon.remove(intent.getIntentId());
-            } catch (Exception ignored) {}
-            try {
-                locationIndex.remove(intent.getIntentId());
-            } catch (Exception ignored) {}
-            throw new RuntimeException("Failed to create intent", e);
+            logger.error("Failed to finalize intent creation: id={} (wheel write may already be persisted)",
+                intent.getIntentId(), e);
+            compensateCancel(intent);
+            throw new RuntimeException(
+                "Failed to create intent " + intent.getIntentId()
+                    + " (compensation attempted; see logs for persistence state)", e);
         }
     }
 
+    /**
+     * Compensate cancel: rollback memory state + write CANCELED terminal revision.
+     * Shared by createIntent / createIntents failure paths.
+     */
+    private void compensateCancel(Intent intent) {
+        try {
+            scheduler.removeFromSchedule(intent);
+        } catch (Exception ex) {
+            logger.error("Rollback removeFromSchedule failed for intent {}", intent.getIntentId(), ex);
+        }
+        try {
+            intentStore.delete(intent.getIntentId());
+        } catch (Exception ex) {
+            logger.error("Rollback store.delete failed for intent {}", intent.getIntentId(), ex);
+        }
+        try {
+            promotionDaemon.remove(intent.getIntentId());
+        } catch (Exception ex) {
+            logger.error("Rollback promotionDaemon.remove failed for intent {}", intent.getIntentId(), ex);
+        }
+        try {
+            locationIndex.remove(intent.getIntentId());
+        } catch (Exception ex) {
+            logger.error("Rollback locationIndex.remove failed for intent {}", intent.getIntentId(), ex);
+        }
+        try {
+            intent.transitionTo(IntentStatus.CANCELED);
+            intent.incrementRevision();
+            persistToWheel(intent, true);
+            logger.warn("Compensation cancel written for intent {}", intent.getIntentId());
+        } catch (Exception compEx) {
+            logger.error("Compensation cancel failed for intent {}; recovery may resurrect it",
+                intent.getIntentId(), compEx);
+        }
+    }
+
+    /**
+     * Batch create: share a single awaitCommit for all intents.
+     * Phase 1: write all to wheel (no awaitCommit). Phase 2: single awaitCommit. Phase 3: memory schedule.
+     */
     public List<Long> createIntents(List<Intent> intents, AckMode ackMode) {
         ensureRunning();
-        return intents.stream()
-            .map(intent -> createIntent(intent, ackMode))
-            .toList();
+        if (intents.isEmpty()) return List.of();
+
+        WalMode effectiveMode = resolveWalMode(intents.get(0), ackMode);
+        boolean durable = effectiveMode == WalMode.DURABLE;
+        List<Long> seqs = new ArrayList<>(intents.size());
+        List<SlotLocation> locs = new ArrayList<>(intents.size());
+        int written = 0;
+        long[] oldRevisions = new long[intents.size()];
+        IntentStatus[] oldStatuses = new IntentStatus[intents.size()];
+
+        try {
+            for (int i = 0; i < intents.size(); i++) {
+                Intent intent = intents.get(i);
+                long seq = sequenceNumber.incrementAndGet();
+                seqs.add(seq);
+                if (defaultTier != null) {
+                    intent.setPrecisionTier(defaultTier);
+                }
+                oldStatuses[i] = intent.getStatus();
+                oldRevisions[i] = intent.getRevision();
+                intent.transitionTo(IntentStatus.SCHEDULED);
+                intent.incrementRevision();
+                SlotLocation loc = persistToWheel(intent, false);
+                locs.add(loc);
+                written++;
+            }
+            if (durable) {
+                commitBarrier.awaitCommit();
+            }
+        } catch (Exception e) {
+            logger.error("Batch createIntent persistence failed; {} intents written, compensating", written, e);
+            for (int i = 0; i < written; i++) {
+                compensateCancel(intents.get(i));
+            }
+            for (int i = written; i < intents.size(); i++) {
+                Intent intent = intents.get(i);
+                intent.rollbackStatus(oldStatuses[i], intent.getUpdatedAt(), oldRevisions[i]);
+            }
+            throw new RuntimeException("Batch createIntent persistence failed; " + written + " intents compensated", e);
+        }
+
+        for (int i = 0; i < intents.size(); i++) {
+            Intent intent = intents.get(i);
+            try {
+                long deltaMs = intent.getExecuteAt().toEpochMilli() - System.currentTimeMillis();
+                if (deltaMs <= hotBoundaryMs) {
+                    intentStore.save(intent);
+                    scheduler.schedule(intent);
+                } else {
+                    promotionDaemon.register(intent.getIntentId(), locs.get(i), intent.getExecuteAt().toEpochMilli());
+                }
+                metricsCollector.incrementIntentsCreated();
+            } catch (Exception e) {
+                logger.error("Post-persist scheduling failed for intent {}", intent.getIntentId(), e);
+                compensateCancel(intent);
+                throw new RuntimeException("Post-persist scheduling failed for intent " + intent.getIntentId(), e);
+            }
+        }
+        return seqs;
     }
 
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater) {
@@ -225,7 +308,16 @@ public final class IntentCommandService {
                 boolean reschedule = newExecuteAt != null && !newExecuteAt.equals(oldExecuteAt);
 
                 if (reschedule) {
-                    scheduler.removeFromSchedule(intent);
+                    // P1-5: 只对可调度状态(SCHEDULED/DUE)执行 removeFromSchedule。
+                    // DISPATCHING/DELIVERED 在途投递,removeFromSchedule 已执行而 schedule/restore
+                    // 会拒收(只认 CREATED/SCHEDULED)→ Intent 从调度结构消失直到重启。
+                    IntentStatus st = intent.getStatus();
+                    if (st == IntentStatus.SCHEDULED || st == IntentStatus.DUE) {
+                        scheduler.removeFromSchedule(intent);
+                    } else {
+                        logger.warn("Cannot reschedule intent {} in {} state; keeping original schedule", intentId, st);
+                        reschedule = false;
+                    }
                 }
 
                 updater.accept(intent);
@@ -235,10 +327,15 @@ public final class IntentCommandService {
                 if (!reschedule) {
                     Instant actualExecuteAt = intent.getExecuteAt();
                     if (actualExecuteAt != null && !actualExecuteAt.equals(oldExecuteAt)) {
-                        reschedule = true;
-                        // 必须在 updater 已修改 executeAt 之后、重新调度之前，
-                        // 用旧的 executeAt 清理索引（removeFromSchedule 内部用的是当前 executeAt）
-                        scheduler.removeFromSchedule(intent, oldExecuteAt);
+                        IntentStatus st = intent.getStatus();
+                        if (st == IntentStatus.SCHEDULED || st == IntentStatus.DUE) {
+                            reschedule = true;
+                            // 必须在 updater 已修改 executeAt 之后、重新调度之前,
+                            // 用旧的 executeAt 清理索引(removeFromSchedule 内部用的是当前 executeAt)
+                            scheduler.removeFromSchedule(intent, oldExecuteAt);
+                        } else {
+                            logger.warn("Cannot reschedule intent {} in {} state after updater; keeping original", intentId, st);
+                        }
                     }
                 }
 
@@ -296,6 +393,7 @@ public final class IntentCommandService {
                 intent.incrementRevision();
                 persistIntentState(intent, AckMode.DURABLE);
                 intentStore.update(intent);
+                locationIndex.remove(intentId);  // 终态 Intent 不保留索引(桶回收依赖)
             }
 
             // 在 synchronized 块外派发回调——回滚窗口已关闭，
@@ -395,6 +493,15 @@ public final class IntentCommandService {
 
         promotionDaemon.remove(intentId);                   // 取消提升 cohort
         locationIndex.remove(intentId);
+        // P1-2: 与 promote 竞态收口——取消生效期间 intent 可能被 PromotionDaemon 并发提升入内存。
+        // 若已热载,需从调度结构+store 移除,否则 ghost 投递直到重启 max-revision 纠正。
+        // 与 LoomqEngine 中 promote 回调的 post-check 形成双向清理,确定性关闭竞态窗口。
+        Intent hot = intentStore.findByIdInternal(intentId);
+        if (hot != null) {
+            scheduler.removeFromSchedule(hot);
+            intentStore.delete(intentId);
+            logger.warn("Cold cancel raced with promotion; removed hot copy of intent {}", intentId);
+        }
         metricsCollector.incrementIntentsCancelled();
         logger.info("Cold intent cancelled: id={}", intentId);
         return true;
@@ -511,6 +618,14 @@ public final class IntentCommandService {
      */
     private void persistIntentState(Intent intent, AckMode ackMode) {
         persistToWheel(intent, resolveWalMode(intent, ackMode) == WalMode.DURABLE);
+    }
+
+    /**
+     * 状态变更持久化的公开入口(供 PrecisionScheduler 的重试重排程经 LoomqEngine 注入调用)。
+     * 恒 DURABLE:重排程是新的调度承诺,必须落盘。
+     */
+    public void persistStateChange(Intent intent) {
+        persistIntentState(intent, AckMode.DURABLE);
     }
 
     private void ensureRunning() {

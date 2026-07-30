@@ -1,7 +1,10 @@
 package com.loomq.application.recovery;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
+import com.loomq.common.MetricsCollector;
+import com.loomq.domain.intent.ExpiredAction;
 import com.loomq.domain.intent.Intent;
+import com.loomq.domain.intent.IntentStatus;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
 import com.loomq.infrastructure.wheel.SlotCodec;
@@ -33,9 +36,11 @@ public final class WheelRecovery {
     private final WheelStore store;
     private final TailIndex tail;
     private final long hotBoundaryMs;
+    private final MetricsCollector metricsCollector;
 
-    public WheelRecovery(WheelStore store, TailIndex tail, long hotBoundaryMs) {
+    public WheelRecovery(WheelStore store, TailIndex tail, long hotBoundaryMs, MetricsCollector metricsCollector) {
         this.store = store; this.tail = tail; this.hotBoundaryMs = hotBoundaryMs;
+        this.metricsCollector = metricsCollector;
     }
 
     public WheelRecoveryReport recover(IntentStore memStore, PrecisionScheduler scheduler,
@@ -64,7 +69,15 @@ public final class WheelRecovery {
         var tailIt = tail.scanFrom(0);
         while (tailIt.hasNext()) {
             TailEntry te = tailIt.next();
-            Intent intent = SlotCodec.decode(te.encodedSlot());
+            Intent intent;
+            try {
+                // P1-6: tail 条目无 isTorn 预检(wheel 槽有)。一条 CRC 损坏即让 decode 抛异常
+                // 中断 recover、引擎起不来。防御性解码,损坏条目跳过并告警。
+                intent = SlotCodec.decode(te.encodedSlot());
+            } catch (RuntimeException dex) {
+                log.warn("Recovery: skipping corrupt tail entry (decode failed)", dex);
+                continue;
+            }
             SlotEntry tailEntry = new SlotEntry(SlotLocation.tail(te.executeAtMs()), intent);
             SlotEntry prev = latest.get(intent.getIntentId());
             if (prev == null || intent.getRevision() > prev.intent().getRevision()) {
@@ -76,10 +89,27 @@ public final class WheelRecovery {
         int hot = 0, cold = 0;
         for (SlotEntry e : latest.values()) {
             Intent intent = e.intent();
-            idx.put(intent.getIntentId(), e.loc());          // rebuild index with the winning loc
-            if (intent.getStatus().isTerminal()) continue;
+            if (intent.getStatus().isTerminal()) continue;  // 终态不索引(桶回收依赖)
             long execMs = intent.getExecuteAt().toEpochMilli();
-            if (execMs < nowMs) continue;                       // expired, skip
+            if (execMs < nowMs) {
+                // P0-2: 停机窗口到期的 Intent 不再静默丢弃。按 ExpiredAction 补终态
+                // 并持久化终态 revision,使下次重启恢复时被 terminal 跳过(避免每次重启重复处理)。
+                // 不补投——投递窗口已过,补投对下游往往是过时事件;留终态痕迹与告警即可。
+                IntentStatus terminal = intent.getExpiredAction() == ExpiredAction.DEAD_LETTER
+                    ? IntentStatus.DEAD_LETTERED : IntentStatus.EXPIRED;
+                try {
+                    intent.transitionTo(terminal);
+                    intent.incrementRevision();
+                    SlotLocation newLoc = store.put(intent);   // 写终态 revision(append-only)
+                    metricsCollector.incrementRecoveryOverdue();
+                    log.warn("Recovery: intent {} overdue (execMs={} < now={}); marked {}",
+                        intent.getIntentId(), execMs, nowMs, terminal);
+                } catch (Exception ex) {
+                    log.error("Recovery: failed to mark overdue intent {}", intent.getIntentId(), ex);
+                }
+                continue;
+            }
+            idx.put(intent.getIntentId(), e.loc());          // rebuild index: only non-terminal, non-overdue
             if (execMs <= hotBoundary) {
                 memStore.upsert(intent);
                 scheduler.restore(intent);

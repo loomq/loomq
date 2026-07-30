@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
@@ -27,12 +28,12 @@ class CohortManagerTest {
 
     private static CohortManager createCohortManager() {
         BucketGroupManager bucketGroupManager = new BucketGroupManager();
-        return new CohortManager(bucketGroupManager, PrecisionTierCatalog.defaultCatalog(), null);
+        return new CohortManager(bucketGroupManager, PrecisionTierCatalog.defaultCatalog(), null, new MetricsCollector());
     }
 
     private static CohortManager createCohortManager(Consumer<Collection<Intent>> scanTrigger) {
         BucketGroupManager bucketGroupManager = new BucketGroupManager();
-        return new CohortManager(bucketGroupManager, PrecisionTierCatalog.defaultCatalog(), scanTrigger);
+        return new CohortManager(bucketGroupManager, PrecisionTierCatalog.defaultCatalog(), scanTrigger, new MetricsCollector());
     }
 
     private static Intent readyIntent(String id, long delaySeconds, PrecisionTier tier) {

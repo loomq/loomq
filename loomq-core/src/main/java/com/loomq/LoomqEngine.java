@@ -9,9 +9,11 @@ import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.infrastructure.wheel.BucketReclaimer;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.SlotLocation;
 import com.loomq.infrastructure.wheel.TailIndex;
 import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.infrastructure.wheel.WheelStore;
@@ -75,6 +77,7 @@ public class LoomqEngine implements AutoCloseable {
     private final MetricsCollector metricsCollector;
     private final PrecisionScheduler scheduler;
     private final IntentCommandService commandService;
+    private final BucketReclaimer bucketReclaimer;
 
     // ========== 观察器 ==========
     private final List<IntentObserver> observers = new CopyOnWriteArrayList<>();
@@ -124,12 +127,14 @@ public class LoomqEngine implements AutoCloseable {
                 : new ConcurrentIntentStore();
             this.wheelStore = new WheelStore(wheelConfig, System::currentTimeMillis);
             this.tailIndex = new TailIndex(dataDir, System::currentTimeMillis);
+            // Spec B: 恢复时若 tail run 文件超过阈值则 compaction(无并发写入)
+            tailIndex.compactIfNeeded(wheelConfig.compactionThresholdBytes());
             this.commitBarrier = new GroupCommitBarrier(
                 wheelStore, tailIndex,
                 wheelConfig.groupCommitIntervalMs(),
                 wheelConfig.awaitCommitTimeoutMs());
             this.locationIndex = new IntentLocationIndex();
-            this.metricsCollector = MetricsCollector.getInstance();
+            this.metricsCollector = builder.metricsCollector != null ? builder.metricsCollector : new MetricsCollector();
 
             // 初始化调度器(未配置 deliveryHandler 时使用默认 DEAD_LETTER 处理器)
             DeliveryHandler deliveryHandler = builder.deliveryHandler != null
@@ -138,18 +143,31 @@ public class LoomqEngine implements AutoCloseable {
             this.scheduler = new PrecisionScheduler(
                 intentStore,
                 deliveryHandler,
-                builder.redeliveryDecider
+                builder.redeliveryDecider,
+                null,
+                metricsCollector,
+                builder.intentTraceStore != null ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore()
             );
 
             // 初始化冷→热提升 daemon:到点把冷 Intent 从磁盘载入内存并调度
-            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, intent -> {
+            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, (intent, loc) -> {
                 if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
                     intentStore.upsert(intent);          // 幂等:已在内存则跳过
                     scheduler.schedule(intent);
+                    // P1-2: promote↔cancelCold TOCTOU 收口(promote 侧)。promote 读槽→落地
+                    // 期间若发生冷取消,索引已迁移到 CANCELED 槽或被移除。复核不匹配则回滚
+                    // 热载,杜绝 ghost 投递。与 cancelCold 末尾的 store 复查形成双向清理,
+                    // 确定性关闭竞态窗口(两可见动作 upsert 与 index.put 有全序,后到者必见先到者)。
+                    SlotLocation after = locationIndex.get(intent.getIntentId());
+                    if (after == null || !after.equals(loc)) {
+                        scheduler.removeFromSchedule(intent);
+                        intentStore.delete(intent.getIntentId());
+                        logger.warn("Promotion rolled back for intent {} (raced with cold cancel)", intent.getIntentId());
+                    }
                 }
             }, wheelConfig.promotionLeadMs());
 
-            this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex, wheelConfig.hotBoundaryMs());
+            this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex, wheelConfig.hotBoundaryMs(), metricsCollector);
 
             this.commandService = new IntentCommandService(
                 intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
@@ -157,6 +175,28 @@ public class LoomqEngine implements AutoCloseable {
                 metricsCollector, callbackExecutor, running, sequenceNumber,
                 builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs(),
                 wheelConfig.hotBoundaryMs());
+
+            // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
+            scheduler.setStateChangePersister(commandService::persistStateChange);
+
+            // Spec B: 终态 Intent 从 locationIndex 移除(桶回收依赖索引判断活跃桶)。
+            // 调度器的 finalizeIntent/handleExpired/handleDeliveryFailure 经 observer 回调清理,
+            // cancelIntent(热路径)和 cancelCold 在 IntentCommandService 内直接清理。
+            scheduler.addObserver(new IntentObserver() {
+                @Override public void onScheduled(Intent intent) { /* no-op */ }
+                @Override public void onDelivered(Intent i, com.loomq.spi.DeliveryHandler.DeliveryResult r) {
+                    locationIndex.remove(i.getIntentId());
+                }
+                @Override public void onDeadLettered(Intent i) {
+                    locationIndex.remove(i.getIntentId());
+                }
+                @Override public void onExpired(Intent i) {
+                    locationIndex.remove(i.getIntentId());
+                }
+                @Override public void onDeliveryFailed(Intent i, Throwable e) { /* no-op */ }
+            });
+
+            this.bucketReclaimer = new BucketReclaimer(wheelStore, locationIndex, wheelConfig.bucketRetentionMs());
 
             logger.info(
                 "LoomqEngine created: nodeId={}, dataDir={}, horizonDays={}, slotsPerBucket={}, groupCommitIntervalMs={}, hotBoundaryMs={}, promotionLeadMs={}",
@@ -205,6 +245,9 @@ public class LoomqEngine implements AutoCloseable {
         scheduler.setObservers(observers);
         scheduler.start();
 
+        // 5. 启动桶回收 daemon(删除过期无活跃引用的桶文件)
+        bucketReclaimer.start();
+
         logger.info("Engine started successfully");
     }
 
@@ -220,11 +263,26 @@ public class LoomqEngine implements AutoCloseable {
         running.set(false);
         logger.info("Shutting down LoomqEngine...");
 
+        // 停止桶回收 daemon(在 wheelStore 关闭前停止)
+        bucketReclaimer.close();
+
         // 停止提升 daemon
         promotionDaemon.close();
 
-        // 停止调度器
+        // 停止调度器(内部排空在途投递)
         scheduler.stop();
+
+        // P1-7: 先关操作执行器,等在途 createIntent 排空,避免后续 wheelStore/tail 关闭后
+        // 仍有 createIntent 写已关闭的 MemorySegment 抛 ISE。
+        operationExecutor.shutdown();
+        try {
+            if (!operationExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                operationExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            operationExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
 
         // 停止存储后台清理线程
         intentStore.shutdown();
@@ -242,9 +300,6 @@ public class LoomqEngine implements AutoCloseable {
         if (callbackExecutor instanceof AutoCloseable) {
             ((AutoCloseable) callbackExecutor).close();
         }
-
-        // 关闭操作执行器
-        operationExecutor.close();
 
         logger.info("Engine shutdown complete");
     }
@@ -337,10 +392,12 @@ public class LoomqEngine implements AutoCloseable {
 
     /**
      * 注册 Intent 生命周期观察器。
-     * 可在引擎运行中随时注册/移除，线程安全。
+     * 可在引擎运行中随时注册/移除,线程安全——直接路由到调度器的 CopyOnWriteArrayList,
+     * 修复原"启动后注册的 observer 永远收不到事件"的问题(start 时 setObservers 拷贝快照)。
      */
     public void registerObserver(IntentObserver observer) {
         observers.add(observer);
+        scheduler.addObserver(observer);
     }
 
     /**
@@ -348,6 +405,7 @@ public class LoomqEngine implements AutoCloseable {
      */
     public void removeObserver(IntentObserver observer) {
         observers.remove(observer);
+        scheduler.removeObserver(observer);
     }
 
     /**
@@ -364,6 +422,11 @@ public class LoomqEngine implements AutoCloseable {
      */
     public PrecisionScheduler getScheduler() {
         return scheduler;
+    }
+
+    /** 获取引擎级 MetricsCollector 实例(供 HealthNarrator 等工具读取)。 */
+    public MetricsCollector getMetricsCollector() {
+        return metricsCollector;
     }
 
     /**
@@ -458,6 +521,8 @@ public class LoomqEngine implements AutoCloseable {
         private RedeliveryDecider redeliveryDecider;
         private PrecisionTier defaultTier;
         private IntentStore intentStore;
+        private MetricsCollector metricsCollector;
+        private com.loomq.tracing.IntentTraceStore intentTraceStore;
 
         /**
          * @deprecated 改用 {@link #dataDir(Path)};PHTW 已无 WAL,字段名陈旧。委托 dataDir。
@@ -512,6 +577,18 @@ public class LoomqEngine implements AutoCloseable {
 
         public Builder intentStore(IntentStore store) {
             this.intentStore = store;
+            return this;
+        }
+
+        /** Inject a custom MetricsCollector (default: new instance per engine). */
+        public Builder metricsCollector(MetricsCollector metrics) {
+            this.metricsCollector = metrics;
+            return this;
+        }
+
+        /** Inject a custom IntentTraceStore (default: new instance per engine). */
+        public Builder intentTraceStore(com.loomq.tracing.IntentTraceStore store) {
+            this.intentTraceStore = store;
             return this;
         }
 

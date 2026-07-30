@@ -19,17 +19,11 @@ public class MetricsCollector {
     // 运行时指标
     private final RuntimeMetricsRegistry runtimeMetrics;
 
-    private static final MetricsCollector INSTANCE = new MetricsCollector();
-
-    private MetricsCollector() {
+    public MetricsCollector() {
         this.operationalMetrics = new OperationalMetricsRegistry();
         this.tierMetrics = new PrecisionTierMetricsRegistry(com.loomq.domain.intent.PrecisionTierCatalog.defaultCatalog());
         this.latencyMetrics = new LatencyMetricsRegistry();
         this.runtimeMetrics = new RuntimeMetricsRegistry();
-    }
-
-    public static MetricsCollector getInstance() {
-        return INSTANCE;
     }
 
     public void setWalDataDir(String walDataDir) {
@@ -80,6 +74,10 @@ public class MetricsCollector {
 
     public void incrementIntentsDeadLetter() {
         operationalMetrics.incrementIntentsDeadLetter();
+    }
+
+    public void incrementRecoveryOverdue() {
+        operationalMetrics.incrementRecoveryOverdue();
     }
 
     public void updateBucketMetrics(long bucketIntentCount, long readyQueueSize) {
@@ -474,6 +472,10 @@ public class MetricsCollector {
 
     public long getIntentsDeadLetterTotal() {
         return operationalMetrics.getIntentsDeadLetterTotal();
+    }
+
+    public long getRecoveryOverdueTotal() {
+        return operationalMetrics.getRecoveryOverdueTotal();
     }
 
     public void resetRuntimeIntentMetrics() {

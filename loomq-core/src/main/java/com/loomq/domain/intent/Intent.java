@@ -51,7 +51,7 @@ public class Intent {
     /**
      * 最晚有效时间 (RFC3339)
      */
-    private Instant deadline;
+    private volatile Instant deadline;
 
     /**
      * 过期后动作：DISCARD 或 DEAD_LETTER
@@ -61,7 +61,7 @@ public class Intent {
     /**
      * 精度档位：由 PrecisionTierCatalog 提供默认 preset
      */
-    private PrecisionTier precisionTier;
+    private volatile PrecisionTier precisionTier;
 
     /**
      * WAL 持久化级别，覆盖精度档位默认值。

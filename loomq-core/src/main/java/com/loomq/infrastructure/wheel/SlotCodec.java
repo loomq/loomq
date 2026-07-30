@@ -19,7 +19,8 @@ import java.util.zip.CRC32;
  * 定长槽编解码。格式(256B):
  * status(1) | revision(8) | CRC(4) | executeAt(8) | intentIdLen(1) | intentId(≤24) | payload(≤210)
  *
- * status=0 表示空槽。CRC 覆盖 revision 之后全部字节(含 intentId + payload),撕裂写可检出。
+ * status=0 表示空槽。CRC 覆盖 status+revision([0..8]) 和 executeAt..end([13..255]),
+ * 跳过 CRC 自身([9..12]),撕裂写可检出。
  */
 public final class SlotCodec {
     public static final int SLOT_SIZE = 256;
@@ -60,8 +61,8 @@ public final class SlotCodec {
         System.arraycopy(idBytes, 0, slot, OFF_ID, idBytes.length);
         System.arraycopy(payload, 0, slot, OFF_PAYLOAD, payload.length);
 
-        // CRC over [executeAt .. end]
-        int crc = crc(slot, OFF_EXECUTE_AT, SLOT_SIZE - OFF_EXECUTE_AT);
+        // CRC over [0..8] (status+revision) + [13..end] (executeAt..end), skipping CRC field [9..12]
+        int crc = computeCrc(slot);
         buf.putInt(OFF_CRC, crc);
         return slot;
     }
@@ -75,9 +76,9 @@ public final class SlotCodec {
         if (statusOrd == 0) return null; // empty
 
         int storedCrc = buf.getInt(OFF_CRC);
-        int actualCrc = crc(slot, OFF_EXECUTE_AT, SLOT_SIZE - OFF_EXECUTE_AT);
+        int actualCrc = computeCrc(slot);
         if (storedCrc != actualCrc) {
-            throw new SlotOverflowException("CRC mismatch: torn slot");
+            throw new IllegalStateException("CRC mismatch: torn slot");
         }
 
         long revision = buf.getLong(OFF_REVISION);
@@ -100,7 +101,7 @@ public final class SlotCodec {
         if (!isOccupied(slot)) return false;
         ByteBuffer buf = ByteBuffer.wrap(slot).order(ByteOrder.BIG_ENDIAN);
         int stored = buf.getInt(OFF_CRC);
-        int actual = crc(slot, OFF_EXECUTE_AT, SLOT_SIZE - OFF_EXECUTE_AT);
+        int actual = computeCrc(slot);
         return stored != actual;
     }
 
@@ -264,6 +265,17 @@ public final class SlotCodec {
     private static int crc(byte[] data, int off, int len) {
         CRC32 c = CRC.get(); c.reset();
         c.update(data, off, len);
+        return (int) c.getValue();
+    }
+
+    /**
+     * 计算槽 CRC,覆盖 status+revision([0..8]) 和 executeAt..end([13..255]),
+     * 跳过 CRC 自身([9..12])。两段累加,CRC32.update 可多次调用。
+     */
+    private static int computeCrc(byte[] slot) {
+        CRC32 c = CRC.get(); c.reset();
+        c.update(slot, 0, OFF_CRC);                              // [0..8]: status + revision
+        c.update(slot, OFF_EXECUTE_AT, SLOT_SIZE - OFF_EXECUTE_AT); // [13..255]: executeAt..end
         return (int) c.getValue();
     }
 }

@@ -4,6 +4,7 @@ import com.loomq.domain.intent.Intent;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,9 +17,13 @@ import java.util.EnumMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -123,42 +128,133 @@ public final class WheelStore implements AutoCloseable {
         return acc.iterator();
     }
 
+    /**
+     * 流式扫描所有有效槽(from 起始),返回惰性迭代器。
+     * 不预物化到 ArrayList--按 tier -> bucket -> slot 顺序逐个读取 MemorySegment。
+     * 空槽和 torn 槽被跳过。
+     */
     public java.util.Iterator<SlotEntry> scanSlotsFrom(java.time.Instant from) {
-        long fromMs = from.toEpochMilli();
-        java.util.List<SlotEntry> acc = new java.util.ArrayList<>();
-        for (WheelTier tier : WheelTier.values()) {
-            ConcurrentHashMap<Long, Bucket> buckets = wheels.get(tier);
-            java.util.List<Long> keys = new java.util.ArrayList<>(buckets.keySet());
-            java.util.Collections.sort(keys);
-            for (long key : keys) {
-                Bucket b = buckets.get(key);
-                for (int i = 0; i < slotsPerBucket; i++) {
-                    byte[] slot = b.read(i);
-                    if (SlotCodec.isOccupied(slot) && !SlotCodec.isTorn(slot)) {
-                        Intent it = SlotCodec.decode(slot);
-                        SlotLocation loc = new SlotLocation(tier, key, i, false);
-                        acc.add(new SlotEntry(loc, it));
-                    }
+        return new LazySlotIterator(from.toEpochMilli());
+    }
+
+    /**
+     * 惰性槽迭代器:按 tier -> bucket(sorted keys) -> slot(0..N) 顺序读取。
+     * hasNext() 时扫描到下一个有效槽并缓存;next() 返回缓存并推进。
+     * 跳过时间窗口终点 <= fromMs 的桶(已无需恢复的过期桶)。
+     */
+    private final class LazySlotIterator implements java.util.Iterator<SlotEntry> {
+        private final java.util.List<WheelTier> tiers = java.util.List.of(WheelTier.values());
+        private final long fromMs;
+        private int tierIdx = 0;
+        private java.util.List<Long> bucketKeys;
+        private int bucketIdx = 0;
+        private Bucket currentBucket;
+        private int slotIdx = 0;
+        private SlotEntry cached;
+
+        LazySlotIterator(long fromMs) {
+            this.fromMs = fromMs;
+            advanceTier();
+        }
+
+        private void advanceTier() {
+            while (tierIdx < tiers.size()) {
+                WheelTier tier = tiers.get(tierIdx);
+                ConcurrentHashMap<Long, Bucket> buckets = wheels.get(tier);
+                bucketKeys = new java.util.ArrayList<>();
+                for (long key : buckets.keySet()) {
+                    if (key * tier.windowMs + tier.windowMs <= fromMs) continue;
+                    bucketKeys.add(key);
                 }
+                java.util.Collections.sort(bucketKeys);
+                bucketIdx = 0;
+                if (!bucketKeys.isEmpty()) {
+                    currentBucket = buckets.get(bucketKeys.get(0));
+                    slotIdx = 0;
+                    return;
+                }
+                tierIdx++;
+            }
+            currentBucket = null;
+        }
+
+        private void advanceBucket() {
+            bucketIdx++;
+            if (bucketIdx < bucketKeys.size()) {
+                WheelTier tier = tiers.get(tierIdx);
+                currentBucket = wheels.get(tier).get(bucketKeys.get(bucketIdx));
+                slotIdx = 0;
+            } else {
+                tierIdx++;
+                advanceTier();
             }
         }
-        // 过滤 by executeAt(返回全部,由调用方按时间筛)
-        return acc.iterator();
+
+        @Override public boolean hasNext() {
+            if (cached != null) return true;
+            while (currentBucket != null) {
+                while (slotIdx < slotsPerBucket) {
+                    byte[] slot = currentBucket.read(slotIdx);
+                    slotIdx++;
+                    if (SlotCodec.isOccupied(slot) && !SlotCodec.isTorn(slot)) {
+                        Intent it = SlotCodec.decode(slot);
+                        WheelTier tier = tiers.get(tierIdx);
+                        long key = bucketKeys.get(bucketIdx);
+                        SlotLocation loc = new SlotLocation(tier, key, slotIdx - 1, false);
+                        cached = new SlotEntry(loc, it);
+                        return true;
+                    }
+                }
+                advanceBucket();
+            }
+            return false;
+        }
+
+        @Override public SlotEntry next() {
+            if (cached == null && !hasNext()) throw new java.util.NoSuchElementException();
+            SlotEntry result = cached;
+            cached = null;
+            return result;
+        }
     }
 
     public void forceDirty() {
         for (var buckets : wheels.values()) {
             for (Bucket b : buckets.values()) {
-                if (!b.closed && b.hasUnflushed()) {
-                    long before = b.writeCount.get();
-                    b.seg.force();
-                    b.flushedWriteCount = before;
-                }
+                b.forceIfDirty();
             }
         }
     }
 
     public long getMinTailExecuteAt() { return clock.getAsLong() + horizonMs; }
+
+    /** 列出指定 tier 的所有桶 key(供 BucketReclaimer 遍历)。 */
+    public Set<Long> listBucketKeys(WheelTier tier) {
+        return wheels.get(tier).keySet();
+    }
+
+    /**
+     * 删除指定桶:close(force 脏数据)-> 从 wheels 移除 -> 删除文件。
+     * 仅在桶无活跃引用(BucketReclaimer 已确认)时调用。
+     */
+    public void deleteBucket(WheelTier tier, long bucketKey) {
+        Bucket b = wheels.get(tier).remove(bucketKey);
+        if (b == null) return;
+        b.close();
+        try {
+            Files.deleteIfExists(Paths.get(config.dataDir(), tier.name().toLowerCase(),
+                String.format("%020d.bin", bucketKey)));
+            log.info("Deleted expired bucket: {}/{}", tier, bucketKey);
+        } catch (IOException e) {
+            log.warn("Failed to delete bucket file: {}/{}", tier, bucketKey, e);
+        }
+    }
+
+    /** 暴露 WheelTier 的 windowMs(供 BucketReclaimer 计算过期)。 */
+    public long tierWindowMs(WheelTier tier) { return tier.windowMs; }
+
+    /** 暴露 clock(供 BucketReclaimer 判断过期)。 */
+    public LongSupplier clock() { return clock; }
 
     private WheelTier pickTier(long delta) {
         if (delta <= WheelTier.SEC.windowMs * WheelTier.SEC.count) return WheelTier.SEC;
@@ -179,7 +275,12 @@ public final class WheelStore implements AutoCloseable {
         Files.createDirectories(dir);
         Path file = dir.resolve(String.format("%020d.bin", bucketKey));
         FileChannel ch = FileChannel.open(file, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
-        if (ch.size() < bucketBytes) ch.truncate(bucketBytes);
+        if (ch.size() < bucketBytes) {
+            // FileChannel.truncate 只缩不扩:新建 0 字节文件 truncate 后仍为 0,mmap 映射超 EOF
+            // 的页在 Linux 上首次访问即 SIGBUS 进程崩溃(Windows CreateFileMapping 自动扩展只是侥幸)。
+            // 在末字节位置写 1 字节,把文件显式扩展到 bucketBytes 后再映射。
+            ch.write(ByteBuffer.allocate(1), bucketBytes - 1L);
+        }
         MemorySegment mapped = ch.map(FileChannel.MapMode.READ_WRITE, 0, bucketBytes, arena);
         return new Bucket(tier, bucketKey, file, ch, mapped);
     }
@@ -197,17 +298,35 @@ public final class WheelStore implements AutoCloseable {
         private final AtomicLong writeCount = new AtomicLong();
         private volatile long flushedWriteCount = 0;
         private volatile boolean closed = false;
+        /**
+         * 写/force 互斥锁。P1-4: 写者持 readLock(彼此并发),force 持 writeLock(独占)。
+         * 修复"memcpy 后未 increment 时 force 的 hasUnflushed 快照漏写 → frontier 误发布"
+         * 的微窗口:写者在 readLock 内完成 memcpy+increment,force 在 writeLock 内
+         * hasUnflushed 检查+seg.force+更新 flushedWriteCount,二者互斥,不再漏写。
+         */
+        private final ReadWriteLock forceLock = new ReentrantReadWriteLock();
         Bucket(WheelTier t, long k, Path p, FileChannel ch, MemorySegment m) { tier=t; bucketKey=k; path=p; channel=ch; seg=m; }
         int alloc() {
             int idx = next.getAndIncrement();
-            if (idx >= slotsPerBucket) throw new IllegalStateException("bucket overflow: " + tier + "/" + bucketKey);
+            if (idx >= slotsPerBucket) {
+                // Wave3: 用可识别的 SlotOverflowException 替代裸 IllegalStateException,
+                // 让调用方能区分"桶满"与其他 ISE,并在文档明示容量模型(1024 槽/桶)。
+                throw new SlotOverflowException("bucket overflow: " + tier + "/" + bucketKey
+                    + " (slotsPerBucket=" + slotsPerBucket + "); consider widening the time window or adding overflow chain");
+            }
             return idx;
         }
         void write(int slot, byte[] data) {
             long off = (long) slot * SlotCodec.SLOT_SIZE;
-            MemorySegment src = MemorySegment.ofArray(data);
-            MemorySegment.copy(src, 0, seg, off, data.length);
-            writeCount.incrementAndGet();
+            Lock rl = forceLock.readLock();
+            rl.lock();
+            try {
+                MemorySegment src = MemorySegment.ofArray(data);
+                MemorySegment.copy(src, 0, seg, off, data.length);
+                writeCount.incrementAndGet();
+            } finally {
+                rl.unlock();
+            }
         }
         byte[] read(int slot) {
             long off = (long) slot * SlotCodec.SLOT_SIZE;
@@ -227,11 +346,36 @@ public final class WheelStore implements AutoCloseable {
             next.set(high);
         }
         boolean hasUnflushed() { return writeCount.get() > flushedWriteCount; }
+
+        /** 桶的时间窗口是否已过期(超过保留期)。bucketWindowEnd = (bucketKey+1) * windowMs。 */
+        boolean isExpired(long retentionMs, LongSupplier clock) {
+            long windowEndMs = (bucketKey + 1) * tier.windowMs;
+            return clock.getAsLong() - windowEndMs > retentionMs;
+        }
+        /** P1-4: 在 writeLock 内检查+force+更新 flushedWriteCount,与 write() 互斥。 */
+        void forceIfDirty() {
+            if (closed) return;
+            Lock wl = forceLock.writeLock();
+            wl.lock();
+            try {
+                if (!hasUnflushed()) return;
+                long before = writeCount.get();
+                seg.force();
+                flushedWriteCount = before;
+            } finally {
+                wl.unlock();
+            }
+        }
         void close() {
             if (closed) return;
             closed = true;
-            try { seg.force(); } catch (Exception ignored) {}
-            try { channel.close(); } catch (IOException ignored) {}
+            try { seg.force(); } catch (Exception e) {
+                // P1-4: 不再吞异常——close 期 force 失败意味着脏数据可能未落盘,需可见。
+                log.warn("force on bucket close failed: {}/{}", tier, bucketKey, e);
+            }
+            try { channel.close(); } catch (IOException e) {
+                log.warn("close channel failed: {}/{}", tier, bucketKey, e);
+            }
         }
     }
 }
