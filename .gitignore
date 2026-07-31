@@ -71,3 +71,5 @@ __pycache__/
 
 # Temp output
 test-output.txt
+# AI agent local config
+.agents/

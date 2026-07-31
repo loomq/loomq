@@ -14,6 +14,9 @@ import java.util.UUID;
  */
 public class Intent {
 
+    /** intentId 最大 UTF-8 字节数（槽格式上限；SlotCodec 布局与入口校验的单一约束来源）。 */
+    public static final int MAX_ID_BYTES = 24;
+
     // ========== 系统字段 ==========
 
     /**

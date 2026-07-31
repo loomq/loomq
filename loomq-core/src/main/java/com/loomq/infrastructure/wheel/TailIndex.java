@@ -38,7 +38,7 @@ import org.slf4j.LoggerFactory;
  * <p><b>同毫秒冲突修复</b>:byExecuteAt 的 value 是 {@code Set<String>},同一 executeAtMs
  * 的多个 intentId 共存于一个集合,不再像旧版按 ms 直接做 skip-list 键而互相覆盖。</p>
  *
- * <p><b>已知限制(v1)</b>:无 compaction,run 文件随 put+tombstone 单调增长(spec §11 延后)。
+ * <p><b>Compaction</b>:{@link #compactIfNeeded(long)} 在 run 文件超阈值时重写为紧凑文件（仅保留 byId 镜像中的 live entry），原子替换后重开 channel。默认阈值 512MB。
  * 崩溃恢复依赖 {@link #flush()} 已强制到磁盘的记录;未 flush 的尾部记录可能丢失——这与
  * DURABLE 契约一致(返回 DURABLE 前 barrier 必已 flush)。</p>
  */

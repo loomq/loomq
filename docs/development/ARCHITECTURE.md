@@ -43,6 +43,7 @@ flowchart TB
         GCB["GroupCommitBarrier<br/>ticket 式 rendezvous msync"]
         Idx["IntentLocationIndex<br/>intentId → SlotLocation"]
         PD["PromotionDaemon<br/>冷→热提升 (executeAt - 60s)"]
+        BR["BucketReclaimer<br/>过期桶文件回收 daemon"]
     end
 
     Recovery["WheelRecovery<br/>重启扫描重建"]
@@ -165,7 +166,7 @@ stateDiagram-v2
 
 ### 4.4 并发控制：ResizableSemaphore + Arrow 借用 + AdapTBF
 
-- `ResizableSemaphore extends Semaphore`：热路径 `acquire/tryAcquire` 零开销（继承）；仅覆写 `release()` 实现缩容时逐步丢弃多余 permit（无需后台线程，随投递完成收敛）。另维护 `borrowedCount` 用于跨档借出统计。
+- `ResizableSemaphore extends Semaphore`：热路径 `acquire/tryAcquire` 零开销（继承）；不再覆写 `release()`（resize 功能已移除）。维护 `currentMax` 与 `borrowedCount` 用于跨档借出统计。
 - **Arrow 跨档借用**（`acquireWithBorrow`）：本档 `tryAcquire` 失败 → 依次尝试向**更低优先级档位**（ordinal 更大）非阻塞借 permit；全部借不到则阻塞在本档 `acquire()` 上兜底。
 - **AdapTBF 借出上限**：某档 `borrowedCount ≥ currentMax × 50%`（`MAX_LEND_RATIO = 0.5`）即停止对外借出，防止低优先级档位被高优先级流量饿死。
 
@@ -191,7 +192,7 @@ stateDiagram-v2
 - 记录格式：`type(1) | execMs(8) | idLen(1) | intentId | [256B encodedSlot if PUT]`；`type=1` PUT、`type=0` TOMBSTONE。同一毫秒的多 Intent 以 Set 共存。
 - 启动时 `loadRun()` 逐条重放重建内存态，返回最后有效偏移 `validLen`；若尾部存在撕裂记录（崩溃 mid-append），`truncateTornTail(validLen)` 先截断再以 APPEND 打开，防止污染后续重放。
 - `promoteInto(store)`：恢复时把已进入 day 视界的 entry 写回 wheel 并追加 tombstone。崩溃窗口内可能重复分配槽位，由恢复去重兜底（宁可多分配，不可丢失）。
-- **已知限制**：无 compaction，run 文件随 put+tombstone 单调增长。
+- **Compaction**：`compactIfNeeded(thresholdBytes)` 在 run 文件超过阈值时重写为紧凑文件（仅保留 `byId` 镜像中的 live entry），原子替换后重开 channel。默认阈值 512MB。
 
 ### 5.3 GroupCommitBarrier —— ticket 式 group-commit
 
@@ -275,6 +276,8 @@ LoomqEngine.createIntent (虚拟线程异步)
 | `wheel.hot_boundary_ms` | `3600000`（60min） | 冷/热分界（创建与恢复共用） |
 | `wheel.promotion_lead_ms` | `60000`（60s） | 冷→热提升提前量 |
 | `wheel.default_tier` | `STANDARD` | 默认精度档 |
+| `wheel.bucket_retention_ms`（record-only） | `horizon + 1 天` | BucketReclaimer 桶文件保留期（超期且无引用时删除） |
+| `wheel.compaction_threshold_bytes`（record-only） | `536870912`（512MB） | TailIndex run 文件 compaction 阈值 |
 
 `LoomqEngine.builder()` 支持 `dataDir` / `wheelConfig`（后者优先）/ `nodeId` / `defaultTier` / 各 SPI / `intentStore` 注入。
 
@@ -282,9 +285,8 @@ LoomqEngine.createIntent (虚拟线程异步)
 
 以下均为代码中确认存在的限制，新 Contributor 须知：
 
-1. **无生命周期治理**：`WheelStore` append-only 且**从不删除桶**（类注释虽称"旧桶可删"，但无任何删除实现），桶文件只增不减；`TailIndex` run 文件**无 compaction**，随 put+tombstone 单调增长；`WheelRecovery` 启动时**全量物化**所有槽到内存 HashMap（O(N)），数据量大时恢复耗时与内存压力可观。
+1. **无生命周期治理**：`WheelStore` append-only，旧槽残留由 recovery 去重处理（无 ghost 投递）；`BucketReclaimer` 定期删除过期且无引用的桶文件（默认保留期 = horizon + 1 天）；`TailIndex` run 文件超阈值时触发 compaction（默认 512MB）；`WheelRecovery` 启动时**全量物化**所有槽到内存 HashMap（O(N)），数据量大时恢复耗时与内存压力可观。
 2. **桶槽数硬上限**：每桶固定 `slotsPerBucket`（默认 1024）槽，同一 bucketKey 写满后 `alloc()` 抛 `IllegalStateException("bucket overflow")`。上限只能在初始化时经 `WheelConfig` 调整，运行期不可变。
-3. **`ResizableSemaphore.resize` 未接线**：`resize()` / `resizeImmediate()` 已实现在类内，但主代码无任何调用方——运行期动态调档能力尚未接通。
 3. **`IntentTraceStore` 非注入路径**：`PrecisionScheduler` 的无参构造仍 `new IntentTraceStore()`，非 `LoomqEngine` 创建的调度器实例不共享引擎级 trace store。`MetricsCollector` 已改为引擎注入（无 `getInstance()`）。
 4. **冷操作不完整**：冷 Intent 支持取消，但**不支持改期与 fireNow**（见 §5.4）。
 5. **intentId / payload 尺寸约束**：槽内 intentId ≤ 24B、payload ≤ 210B（超出抛 `SlotOverflowException`）；tail run 记录 intentId ≤ 255B。超长标识需上层自行散列。

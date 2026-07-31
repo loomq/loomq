@@ -218,7 +218,7 @@ public class LoomqEngine implements AutoCloseable {
 
         logger.info("╔════════════════════════════════════════════════════════╗");
         logger.info("║       LoomQ Core Engine Starting...                    ║");
-        logger.info("║       Mode: Embedded (Zero HTTP dependencies)          ║");
+        logger.info("║       Mode: Embedded                                   ║");
         logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
         logger.info("╚════════════════════════════════════════════════════════╝");
 
@@ -305,6 +305,32 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
+     * 模拟进程崩溃（测试专用）：停止所有后台线程但不调用 wheelStore.close()/tailIndex.close()。
+     *
+     * <p>验证范围：终态写入不依赖 close() 的最终 forceDirty——若终态从未写盘，重开引擎时
+     * recovery 会把它当作 SCHEDULED 处理（overdue 补终态），测试即失败。</p>
+     *
+     * <p>已知局限：进程退出后 OS 仍会把脏 mmap 页写回 page cache，且 stopWithoutFlush 后
+     * daemon 可能完成一次在途 force。因此本测试<b>不能</b>区分 awaitCommit 的 msync 与
+     * page-cache writeback；它证明的是终态记录已进入 wheel（可被 recovery 读取并跳过），
+     * 而非内核级持久化。内核级验证需 OS crash 注入，超出 JVM 测试范围。</p>
+     */
+    void simulateCrash() {
+        if (!closed.compareAndSet(false, true)) return;
+        running.set(false);
+        logger.info("Simulating crash (no flush)...");
+
+        bucketReclaimer.close();
+        promotionDaemon.close();
+        scheduler.stop();
+        operationExecutor.shutdownNow();
+        intentStore.shutdown();
+        commitBarrier.stopWithoutFlush();
+        // 故意不调用 wheelStore.close() / tailIndex.close() / commitBarrier.close()
+        // -- 测试正是要证明 awaitCommit 的 msync 已足够
+    }
+
+    /**
      * 创建 Intent（异步）
      *
      * @param intent  Intent 对象
@@ -328,6 +354,10 @@ public class LoomqEngine implements AutoCloseable {
 
     /**
      * 查询 Intent
+     *
+     * <p><b>可见性窗口：</b>[create, terminal + 24h]。终态 Intent 在驱逐周期（默认 24h）
+     * 后从内存 store 移除，此时 getIntent 返回 empty。磁盘仍保留权威记录，
+     * 重启后由 recovery 跳过（终态不重新加载入内存）。</p>
      *
      * @param intentId Intent ID
      * @return Optional<Intent>

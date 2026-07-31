@@ -126,20 +126,37 @@ public class BucketGroup {
     /**
      * 从桶中移除 Intent。
      *
+     * <p>使用 peek-then-CAS 策略：先读取索引条目但不消耗它，
+     * 仅在成功从桶中移除后才用条件删除消耗索引条目。
+     * 这避免了 scanDue 摘除桶但 CAS 未执行时，remove 消耗索引条目
+     * 导致 scanDue CAS 失败、Intent 丢失的问题。</p>
+     *
+     * <p><b>锁纪律（I1 补充）</b>：同一 intentId 的 add/remove 必须串行（命令路径经
+     * synchronized(intent)）；scanDue 是唯一锁外变更方，其重注册恒为同 bucketKey +
+     * 同 revision。桶条目与索引条目在 add 的 compute 内原子写入，remove 的两步摘除
+     * 均按 revision 校验，索引永不与桶内容脱节（无悬垂索引/计数漏减）。</p>
+     *
      * @param intent 待移除的 Intent
      * @return true 表示已移除
      */
     public boolean remove(Intent intent) {
         String intentId = intent.getIntentId();
-        ClaimEntry entry = intentIndex.remove(intentId);
-        if (entry != null && removeFromBucket(entry.bucketKey(), intentId)) {
+        ClaimEntry entry = intentIndex.get(intentId);
+        if (entry == null) return false;
+
+        if (removeEntryFromBucket(entry.bucketKey(), intentId, entry.revision())) {
+            // 成功从桶中移除后才消耗索引条目（CAS：仅当条目未被 add 替换时）
+            intentIndex.remove(intentId, entry);
             return true;
         }
 
-        if (entry != null) {
-            return removeByScan(intentId);
+        if (removeByScan(intentId, entry.revision())) {
+            intentIndex.remove(intentId, entry);
+            return true;
         }
 
+        // 桶未找到（可能已被 scanDue 摘除）。不消耗索引条目，
+        // 让 scanDue 的 CAS 仍能成功认领该 Intent。
         return false;
     }
 
@@ -286,10 +303,38 @@ public class BucketGroup {
         return true;
     }
 
-    private boolean removeByScan(String intentId) {
+    /**
+     * 带 revision 校验的桶条目摘除：只摘除 revisionAtAdd 与索引条目一致的条目，
+     * 避免并发 add（不同 bucketKey）替换后，remove 误摘新注册条目导致索引 CAS
+     * 失败、留下悬垂索引与计数漏减。正常路径下索引与桶条目恒一致，行为等价于
+     * 无条件摘除。
+     */
+    private boolean removeEntryFromBucket(long bucketKey, String intentId, long expectedRevision) {
+        ConcurrentHashMap<String, BucketEntry> bucket = buckets.get(bucketKey);
+        if (bucket == null) {
+            return false;
+        }
+
+        BucketEntry current = bucket.get(intentId);
+        if (current == null || current.revisionAtAdd() != expectedRevision) {
+            return false;
+        }
+
+        // CHM.remove(key, value) 返回 boolean（值匹配才删除），等价于 CAS
+        if (!bucket.remove(intentId, current)) {
+            return false;
+        }
+
+        pendingCount.decrementAndGet();
+        if (bucket.isEmpty()) {
+            buckets.remove(bucketKey, bucket);
+        }
+        return true;
+    }
+
+    private boolean removeByScan(String intentId, long expectedRevision) {
         for (Long bucketKey : new ArrayList<>(buckets.keySet())) {
-            if (removeFromBucket(bucketKey, intentId)) {
-                // Index entry already removed by caller (remove(Intent)).
+            if (removeEntryFromBucket(bucketKey, intentId, expectedRevision)) {
                 return true;
             }
         }

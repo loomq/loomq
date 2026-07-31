@@ -16,9 +16,6 @@ import java.util.Objects;
  */
 public final class IntentValidator {
 
-    /** 槽格式 intentId 最大字节数（SlotCodec 限制） */
-    static final int MAX_INTENT_ID_BYTES = 24;
-
     private IntentValidator() {
     }
 
@@ -48,9 +45,9 @@ public final class IntentValidator {
 
         if (intentId != null) {
             int byteLen = intentId.getBytes(StandardCharsets.UTF_8).length;
-            if (byteLen > MAX_INTENT_ID_BYTES) {
+            if (byteLen > Intent.MAX_ID_BYTES) {
                 throw new IllegalArgumentException(
-                    "intentId exceeds " + MAX_INTENT_ID_BYTES + " bytes (got " + byteLen + ")");
+                    "intentId exceeds " + Intent.MAX_ID_BYTES + " bytes (got " + byteLen + ")");
             }
         }
     }

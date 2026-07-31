@@ -29,7 +29,7 @@ public final class SlotCodec {
     private static final int OFF_EXECUTE_AT = 13;
     private static final int OFF_ID_LEN = 21;
     private static final int OFF_ID = 22;
-    private static final int MAX_ID_LEN = 24;
+    public static final int MAX_ID_LEN = Intent.MAX_ID_BYTES;
     private static final int OFF_PAYLOAD = OFF_ID + MAX_ID_LEN; // 46
     private static final int PAYLOAD_SIZE = SLOT_SIZE - OFF_PAYLOAD; // 210
 

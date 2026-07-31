@@ -7,25 +7,29 @@ import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import java.time.Instant;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 /**
- * P1-2 极端竞态测试:CAS 成功后 fireNow 重注册。
+ * P1-2 极端竞态测试:CAS 成功后 fireNow 不再重注册。
  *
  * <p>场景:scanDue 的 CAS 认领成功(旧 revision 匹配),但在加入 dueIntents 前,
- * fireNow 介入并重新注册了 intent(新 revision)。此时:
+ * fireNow 介入。fireNow 的 removeFromSchedule 返回 false（索引条目已被 CAS 消耗），
+ * 跳过 restore -- 不产生新桶条目。
  * <ul>
  *   <li>第一次 scanDue 返回 intent(CAS 已成功) -- 投递一次</li>
- *   <li>fireNow 的 add 把 intent 放入新桶 -- 第二次 scanDue 再次投递</li>
+ *   <li>fireNow 不重注册 -> 第二次 scanDue 返回空</li>
  * </ul>
- * 这是 at-least-once 语义的固有边界。防御由消费者的终态守卫
- * (isTerminal check before deliverAsync) + finalizeIntent 的 synchronized(intent)
- * 串行化兜底。本测试固化此行为,确保即使极端竞态发生,系统行为也是可预测的。
+ * CAS 认领窗口已确定性关闭:唯一的确定性重复投递向量被消除。
+ *
+ * <p><b>覆盖边界：</b>本测试固化 BucketGroup 契约（认领后 remove 返回 false + 无重注册），
+ * 不直接调用 fireNow——fireNow/updateIntent 认领分支的端到端回归由
+ * {@code ClaimedInFlightRaceTest} 承担。</p>
  */
 class ScanDueFireNowRaceTest {
 
     @Test
-    void casSucceedsThenFireNowReRegisters_intentAppearsTwiceButPredictably() {
+    void casSucceedsThenFireNowSkipsReRegister_noDuplicateDelivery() {
         BucketGroup group = new BucketGroup(PrecisionTier.STANDARD);
         Intent intent = new Intent("intent_race_test_001");
         intent.setExecuteAt(Instant.now().minusMillis(100)); // past = due
@@ -35,31 +39,31 @@ class ScanDueFireNowRaceTest {
         group.add(intent, intent.getExecuteAt());
         assertEquals(1, group.getPendingCount());
 
-        // Set up hook: after CAS succeeds, simulate fireNow re-register
+        AtomicBoolean removeResult = new AtomicBoolean();
+        // Set up hook: after CAS succeeds, simulate fireNow's removeFromSchedule.
+        // Index entry has been consumed by CAS -> BucketGroup.remove MUST return false,
+        // and fireNow skips restore -> no re-registration.
         group.testScanPostClaimHook = () -> {
             intent.incrementRevision();  // fireNow increments revision
-            group.add(intent, intent.getExecuteAt());  // fireNow re-registers
+            removeResult.set(group.remove(intent));  // fireNow's removeFromSchedule
         };
 
-        // First scanDue: CAS succeeds (old revision matches), hook fires (re-register),
-        // intent is added to dueIntents
+        // First scanDue: CAS succeeds, hook fires, intent added to dueIntents
         List<Intent> due1 = group.scanDue(Instant.now());
-        assertEquals(1, due1.size(), "intent should be in dueIntents (CAS succeeded before fireNow)");
+        assertEquals(1, due1.size(), "intent should be in dueIntents (CAS succeeded)");
         assertEquals("intent_race_test_001", due1.get(0).getIntentId());
+        assertFalse(removeResult.get(),
+            "claimed intent must report not-scheduled -- fix contract under test");
 
-        // The intent is ALSO in a new bucket (from fireNow's add in the hook)
-        assertEquals(1, group.getPendingCount(),
-            "intent should also be in new bucket (fireNow re-registered during scan)");
-
-        // Second scanDue: picks up the re-registered intent from the new bucket
-        List<Intent> due2 = group.scanDue(Instant.now());
-        assertEquals(1, due2.size(), "re-registered intent should be picked up by second scanDue");
-
-        // Total: intent was returned twice (once from each scanDue)
-        // This is the at-least-once scenario -- defense is at consumer level:
-        // - Terminal state guard before deliverAsync
-        // - synchronized(intent) in finalizeIntent prevents state corruption
+        // No new bucket entry -- fireNow skipped restore
         assertEquals(0, group.getPendingCount(),
-            "all buckets should be drained after two scanDue calls");
+            "fireNow must not re-register a claimed intent");
+
+        // Second scanDue: nothing to pick up -- no duplicate delivery
+        List<Intent> due2 = group.scanDue(Instant.now());
+        assertTrue(due2.isEmpty(), "second scanDue must return empty -- no duplicate delivery");
+
+        assertEquals(0, group.getPendingCount(),
+            "no pending intents after fix");
     }
 }

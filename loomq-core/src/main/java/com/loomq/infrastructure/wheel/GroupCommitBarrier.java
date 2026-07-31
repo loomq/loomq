@@ -220,4 +220,9 @@ public final class GroupCommitBarrier implements AutoCloseable {
             Thread.currentThread().interrupt();
         }
     }
+
+    /** 仅停止 daemon，不执行最终 force（test-only：供 simulateCrash 使用；非生产 API）。 */
+    public void stopWithoutFlush() {
+        running.set(false);
+    }
 }

@@ -45,6 +45,11 @@ public final class IntentCommandService {
 
     private static final Logger logger = LoggerFactory.getLogger(IntentCommandService.class);
 
+    /** updateIntent 认领分支跳过重排的告警模板（两处分支共用，避免字符串漂移）。 */
+    private static final String CLAIMED_SKIP_WARN =
+        "updateIntent: intent {} already claimed by scanDue; update will be persisted but "
+            + "in-flight delivery may carry pre-update content (no reschedule)";
+
     private final IntentStore intentStore;
     private final PrecisionScheduler scheduler;
     private final WheelStore wheelStore;
@@ -300,6 +305,21 @@ public final class IntentCommandService {
         return updateIntent(intentId, updater, null);
     }
 
+    /**
+     * 更新 Intent（可选改期）。
+     *
+     * <p><b>与在途投递的竞态语义：</b>若 scanDue 已 CAS 认领该 Intent（投递在途），
+     * 本方法仍会应用 updater 的变更并 DURABLE 持久化，但<b>不重排程</b>。本次在途
+     * 投递携带的内容无确定保证（可能为旧值或新值）；更新只在投递失败后的重试路径
+     * 或崩溃恢复（max-revision 胜者）中确定生效。依赖"更新后的内容必须被投递"的
+     * 调用方应在投递完成后二次确认。</p>
+     *
+     * @param intentId     待更新 Intent ID
+     * @param updater      变更消费者（在 synchronized(intent) 内执行）
+     * @param newExecuteAt 新的执行时间；null 表示不改期
+     * @return 更新后的 Intent；intent 不存在时返回 empty；intent 已处终态时返回未修改的
+     *         intent（no-op，不持久化）
+     */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater, Instant newExecuteAt) {
         ensureRunning();
 
@@ -310,6 +330,10 @@ public final class IntentCommandService {
 
         try {
             synchronized (intent) {
+                if (intent.getStatus().isTerminal()) {
+                    logger.warn("Cannot update intent {} in terminal state {}; no-op", intentId, intent.getStatus());
+                    return Optional.of(intent);
+                }
                 Instant oldExecuteAt = intent.getExecuteAt();
                 boolean reschedule = newExecuteAt != null && !newExecuteAt.equals(oldExecuteAt);
 
@@ -319,7 +343,14 @@ public final class IntentCommandService {
                     // 会拒收(只认 CREATED/SCHEDULED)→ Intent 从调度结构消失直到重启。
                     IntentStatus st = intent.getStatus();
                     if (st == IntentStatus.SCHEDULED || st == IntentStatus.DUE) {
-                        scheduler.removeFromSchedule(intent);
+                        boolean wasScheduled = scheduler.removeFromSchedule(intent);
+                        if (!wasScheduled) {
+                            // 已被 scanDue CAS 认领，在途投递正在执行。
+                            // updater 的变更随后仍会持久化，但不重排--在途投递可能携带
+                            // 旧内容，更新仅在重试/崩溃恢复路径确定生效（见方法 javadoc）。
+                            logger.warn(CLAIMED_SKIP_WARN, intentId);
+                            reschedule = false;
+                        }
                     } else {
                         logger.warn("Cannot reschedule intent {} in {} state; keeping original schedule", intentId, st);
                         reschedule = false;
@@ -335,10 +366,14 @@ public final class IntentCommandService {
                     if (actualExecuteAt != null && !actualExecuteAt.equals(oldExecuteAt)) {
                         IntentStatus st = intent.getStatus();
                         if (st == IntentStatus.SCHEDULED || st == IntentStatus.DUE) {
-                            reschedule = true;
                             // 必须在 updater 已修改 executeAt 之后、重新调度之前,
                             // 用旧的 executeAt 清理索引(removeFromSchedule 内部用的是当前 executeAt)
-                            scheduler.removeFromSchedule(intent, oldExecuteAt);
+                            boolean wasScheduled = scheduler.removeFromSchedule(intent, oldExecuteAt);
+                            if (wasScheduled) {
+                                reschedule = true;
+                            } else {
+                                logger.warn(CLAIMED_SKIP_WARN, intentId);
+                            }
                         } else {
                             logger.warn("Cannot reschedule intent {} in {} state after updater; keeping original", intentId, st);
                         }
@@ -548,19 +583,31 @@ public final class IntentCommandService {
 
         Instant oldExecuteAt = null;
         long oldRevision = 0;
+        boolean wasScheduled = false;
         try {
             synchronized (intent) {
                 oldExecuteAt = intent.getExecuteAt();
                 oldRevision = intent.getRevision();
-                scheduler.removeFromSchedule(intent);
-                intent.setExecuteAt(Instant.now());
-                intent.incrementRevision();
-                persistIntentState(intent, AckMode.DURABLE);
-                intentStore.update(intent);
-                scheduler.restore(intent);
+                wasScheduled = scheduler.removeFromSchedule(intent);
+                if (wasScheduled) {
+                    intent.setExecuteAt(Instant.now());
+                    intent.incrementRevision();
+                    persistIntentState(intent, AckMode.DURABLE);
+                    intentStore.update(intent);
+                    scheduler.restore(intent);
+                } else {
+                    // 已被 scanDue CAS 认领（索引条目已消耗），在途投递即为 fireNow 的效果。
+                    // 不改写 executeAt/revision、不落盘 SCHEDULED@now：消除重复投递（in-flight
+                    // delivery 已是 fireNow 的语义等价），避免写下一条 executeAt=now 的
+                    // SCHEDULED@now 记录与原 SCHEDULED 槽自相矛盾（两者 max-revision 仲裁无意义）。
+                    logger.debug("fireNow: intent {} already claimed by scanDue; in-flight delivery serves as fire-now",
+                        intentId);
+                }
             }
 
-            logger.info("Intent fired immediately: id={}", intentId);
+            logger.info(wasScheduled
+                ? "Intent fired immediately: id={}"
+                : "Intent already in-flight; fireNow served by in-flight delivery: id={}", intentId);
             return true;
         } catch (RuntimeException e) {
             logger.error("Failed to fire intent: id={}", intentId, e);
@@ -632,7 +679,9 @@ public final class IntentCommandService {
     }
 
     /**
-     * 持久化 intent 当前态到 PHTW 并同步索引。状态变更操作(update/cancel/fireNow)恒为 DURABLE。
+     * 持久化 intent 当前态到 PHTW 并同步索引。状态变更操作（update/cancel/fireNow 正常路径）
+     * 经此方法恒为 DURABLE；fireNow 认领分支不调用本方法——在途投递即为效果，不落盘
+     * SCHEDULED@now（避免崩溃恢复将其判 overdue 丢弃）。
      *
      * <p>WheelStore 为 append-only:每次写入分配新槽,旧槽残留。recovery 按 intentId 取
      * max revision 胜者,故旧槽不会引发 ghost 投递。</p>

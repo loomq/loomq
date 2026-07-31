@@ -434,7 +434,7 @@ public class MetricsCollector {
         return runtimeMetrics.getSchedulerMaxPendingIntents();
     }
 
-    // ========== 系统状态更新 (从 LoomQMetrics 迁移) ==========
+    // ========== 系统状态更新 ==========
 
     public void updatePendingIntents(long count) {
         runtimeMetrics.updatePendingIntents(count);
@@ -452,7 +452,7 @@ public class MetricsCollector {
         return runtimeMetrics.getIntentStatusCounts();
     }
 
-    // ========== Intent 生命周期计数器 getter (供 LoomQMetrics.snapshot() 使用) ==========
+    // ========== Intent 生命周期计数器 getter ==========
 
     public long getIntentsCreatedTotal() {
         return operationalMetrics.getIntentsCreatedTotal();
