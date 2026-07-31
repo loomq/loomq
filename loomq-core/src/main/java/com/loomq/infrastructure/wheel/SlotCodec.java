@@ -1,6 +1,5 @@
 package com.loomq.infrastructure.wheel;
 
-import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.ExpiredAction;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
@@ -120,7 +119,6 @@ public final class SlotCodec {
         if (intent.getWalMode() != null) putByte(b, (byte) 0x07, (byte) intent.getWalMode().ordinal());
         if (intent.getShardKey() != null) putStr(b, (byte) 0x08, intent.getShardKey());
         if (intent.getShardId() != null) putStr(b, (byte) 0x09, intent.getShardId());
-        if (intent.getAckMode() != null) putByte(b, (byte) 0x0A, (byte) intent.getAckMode().ordinal());
         if (intent.getAttempts() > 0) putInt(b, (byte) 0x0B, intent.getAttempts());
         if (intent.getLastDeliveryId() != null) putStr(b, (byte) 0x0C, intent.getLastDeliveryId());
         if (intent.getIdempotencyKey() != null) putStr(b, (byte) 0x0D, intent.getIdempotencyKey());
@@ -136,7 +134,7 @@ public final class SlotCodec {
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
         String traceId = null; long createdAt = 0, updatedAt = 0, deadline = 0;
         ExpiredAction expiredAction = null; PrecisionTier tier = null; WalMode walMode = null;
-        String shardKey = null, shardId = null; AckMode ackMode = null;
+        String shardKey = null, shardId = null;
         int attempts = 0; String lastDeliveryId = null, idempotencyKey = null;
         Map<String, String> tags = null; // ADAPTATION: 支持 tags 回读
 
@@ -158,7 +156,6 @@ public final class SlotCodec {
                 case 0x07 -> walMode = WalMode.values()[b.get()];
                 case 0x08 -> shardKey = getStr(b, len);
                 case 0x09 -> shardId = getStr(b, len);
-                case 0x0A -> ackMode = AckMode.values()[b.get()];
                 case 0x0B -> attempts = b.getInt();
                 case 0x0C -> lastDeliveryId = getStr(b, len);
                 case 0x0D -> idempotencyKey = getStr(b, len);
@@ -173,7 +170,7 @@ public final class SlotCodec {
             Instant.ofEpochMilli(createdAt), Instant.ofEpochMilli(updatedAt),
             unpackExecuteAt(executeAtPacked),
             deadline == 0 ? null : Instant.ofEpochMilli(deadline),
-            expiredAction, tier, walMode, shardKey, shardId, ackMode,
+            expiredAction, tier, walMode, shardKey, shardId,
             null, null, idempotencyKey, tags, attempts, lastDeliveryId, revision);
     }
 
@@ -232,7 +229,6 @@ public final class SlotCodec {
         if (intent.getWalMode() != null) n += 6;
         if (intent.getShardKey() != null) n += 7 + utf8Len(intent.getShardKey());
         if (intent.getShardId() != null) n += 7 + utf8Len(intent.getShardId());
-        if (intent.getAckMode() != null) n += 6;
         if (intent.getAttempts() > 0) n += 9;
         if (intent.getLastDeliveryId() != null) n += 7 + utf8Len(intent.getLastDeliveryId());
         if (intent.getIdempotencyKey() != null) n += 7 + utf8Len(intent.getIdempotencyKey());

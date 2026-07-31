@@ -49,6 +49,14 @@ import org.slf4j.LoggerFactory;
  * 支持多精度档位的 Intent 调度，每个档位独立的扫描线程。
  * 核心架构：虚拟线程独立休眠 + 分层 Bucket 唤醒。
  *
+ * <h2>核心不变量</h2>
+ * <ul>
+ *   <li><b>I1 单持有方</b>: 任一 intentId 同一时刻最多存在于一个调度结构（bucket / cohort / 派发队列 / promotion cohort）</li>
+ *   <li><b>I2 持久化先于承诺</b>: 状态对调用方可见前必须已对磁盘可见（DURABLE 落盘）</li>
+ *   <li><b>I3 revision 单调 + 终态不可逆</b>: append-only + max-revision 去重的基础</li>
+ *   <li><b>I4 索引即所有权账本</b>: 认领必须经 {@code intentIndex} 原子摘除（CAS）</li>
+ * </ul>
+ *
  * @author loomq
  */
 public class PrecisionScheduler {
@@ -421,6 +429,7 @@ public class PrecisionScheduler {
      *
      * 根据 executeAt 和 precisionTier 计算休眠时间，然后添加到对应桶。
      *
+     * @implNote 维护 I1：将 intent 放入唯一调度结构（bucket 或 cohort）。
      * @param intent Intent 实例
      */
     public void schedule(Intent intent) {
@@ -1008,7 +1017,13 @@ public class PrecisionScheduler {
         this.stateChangePersister = persister;
     }
 
+    /**
+     * 状态变更持久化(I3 不变量收口):revision 递增 + DURABLE 落盘。
+     * 所有调用方只需调此方法,revision 递增由本方法统一负责,
+     * 杜绝未来调用方遗忘递增导致 recovery 去重失效。
+     */
     private void persistStateChange(Intent intent) {
+        intent.incrementRevision();
         Consumer<Intent> p = stateChangePersister;
         if (p != null) {
             p.accept(intent);
@@ -1098,6 +1113,8 @@ public class PrecisionScheduler {
      *
      * P1-3: synchronized(intent) 与 finalizeIntent 串行化——Intent.transitionTo 的
      * validate+set 非原子,不加锁时两线程可同时通过校验导致状态撕裂(EXPIRED 被 DUE 回跳等)。
+     *
+     * @implNote 维护 I2/I3：过期终态落盘，防止恢复时被改写。
      */
     private void handleExpired(Intent intent) {
         synchronized (intent) {
@@ -1113,6 +1130,7 @@ public class PrecisionScheduler {
                     break;
             }
             intentStore.update(intent);
+            persistStateChange(intent);           // P1-1
 
             // Notify AFTER transition so observers see the terminal state
             notifyObservers(o -> o.onExpired(intent));
@@ -1123,6 +1141,8 @@ public class PrecisionScheduler {
      * 终态处理——根据异步投递结果更新状态并持久化。
      *
      * 在 Netty/异步回调线程中执行。单次 intentStore.update() 写入终态。
+     *
+     * @implNote 维护 I2/I3：终态落盘（persistStateChange）确保磁盘权威记录。
      */
     private void finalizeIntent(Intent intent, PrecisionTier tier, DeliveryResult result) {
         long startTime = System.nanoTime();
@@ -1146,6 +1166,7 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.DELIVERED);
                         intent.transitionTo(IntentStatus.ACKED);
                         intentStore.update(intent);
+                        persistStateChange(intent);           // P1-1: incrementRevision + DURABLE write
                         notifyObservers(o -> o.onDelivered(intent, finalResult));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         // Trace: record acked
@@ -1176,6 +1197,7 @@ public class PrecisionScheduler {
                     case DEAD_LETTER:
                         intent.transitionTo(IntentStatus.DEAD_LETTERED);
                         intentStore.update(intent);
+                        persistStateChange(intent);           // P1-1
                         notifyObservers(o -> o.onDeadLettered(intent));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.warn("Intent {} dead-lettered", intent.getIntentId());
@@ -1184,6 +1206,7 @@ public class PrecisionScheduler {
                     case EXPIRED:
                         intent.transitionTo(IntentStatus.EXPIRED);
                         intentStore.update(intent);
+                        persistStateChange(intent);           // P1-1
                         notifyObservers(o -> o.onExpired(intent));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.info("Intent {} expired", intent.getIntentId());
@@ -1199,6 +1222,8 @@ public class PrecisionScheduler {
 
     /**
      * 处理投递失败
+     *
+     * @implNote 维护 I2/I3：死信终态落盘；重试路径 persistStateChange 递增 revision。
      */
     private void handleDeliveryFailure(Intent intent) {
         synchronized (intent) {
@@ -1213,6 +1238,7 @@ public class PrecisionScheduler {
             if (intent.getAttempts() >= maxAttempts) {
                 intent.transitionTo(IntentStatus.DEAD_LETTERED);
                 intentStore.update(intent);
+                persistStateChange(intent);           // P1-1
                 unindexIntent(intent.getIntentId(), executeAtMs(intent));
                 notifyObservers(o -> o.onDeadLettered(intent));
                 logger.warn("Intent dead-lettered after max attempts: id={}", intent.getIntentId());

@@ -424,7 +424,7 @@ public class LoomqEngine implements AutoCloseable {
         return scheduler;
     }
 
-    /** 获取引擎级 MetricsCollector 实例(供 HealthNarrator 等工具读取)。 */
+    /** 获取引擎级 MetricsCollector 实例。 */
     public MetricsCollector getMetricsCollector() {
         return metricsCollector;
     }
@@ -440,11 +440,9 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取原始 Intent 存储（内部使用，可读写）。
-     *
-     * 外部调用方应使用 {@link #getIntentStore()} 只读视图。
+     * 获取原始 Intent 存储（包级可见，内部使用）。
      */
-    public IntentStore getIntentStoreInternal() {
+    IntentStore getIntentStoreInternal() {
         return intentStore;
     }
 

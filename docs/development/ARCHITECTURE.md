@@ -115,6 +115,8 @@ stateDiagram-v2
 
 说明：`DUE`/`DISPATCHING` 等中间态主要在内存流转（`finalizeIntent` 中瞬时穿过），终态才做 `intentStore.update()` + PHTW 落盘。可取消状态为 `SCHEDULED` 与 `DUE`。
 
+**取消语义**：cancel 是 best-effort 操作。对于已进入 DISPATCHING 状态的 Intent，异步投递可能已完成、事件可能已到达下游，cancel 无法撤销。下游业务方必须自行保证处理逻辑的幂等性。
+
 ### 3.2 五档精度
 
 预置于 `PrecisionTierCatalog.createDefault()`，默认档位 **STANDARD**。每档拥有独立的扫描线程、有界派发队列、批量消费者组和信号量。
@@ -283,9 +285,9 @@ LoomqEngine.createIntent (虚拟线程异步)
 1. **无生命周期治理**：`WheelStore` append-only 且**从不删除桶**（类注释虽称"旧桶可删"，但无任何删除实现），桶文件只增不减；`TailIndex` run 文件**无 compaction**，随 put+tombstone 单调增长；`WheelRecovery` 启动时**全量物化**所有槽到内存 HashMap（O(N)），数据量大时恢复耗时与内存压力可观。
 2. **桶槽数硬上限**：每桶固定 `slotsPerBucket`（默认 1024）槽，同一 bucketKey 写满后 `alloc()` 抛 `IllegalStateException("bucket overflow")`。上限只能在初始化时经 `WheelConfig` 调整，运行期不可变。
 3. **`ResizableSemaphore.resize` 未接线**：`resize()` / `resizeImmediate()` 已实现在类内，但主代码无任何调用方——运行期动态调档能力尚未接通。
-4. **全局单例**：`MetricsCollector.getInstance()`、`IntentTraceStore.getInstance()` 为进程级单例，同 JVM 多引擎实例共享指标，测试隔离性差。
-5. **冷操作不完整**：冷 Intent 支持取消，但**不支持改期与 fireNow**（见 §5.4）。
-6. **intentId / payload 尺寸约束**：槽内 intentId ≤ 24B、payload ≤ 210B（超出抛 `SlotOverflowException`）；tail run 记录 intentId ≤ 255B。超长标识需上层自行散列。
+3. **`IntentTraceStore` 非注入路径**：`PrecisionScheduler` 的无参构造仍 `new IntentTraceStore()`，非 `LoomqEngine` 创建的调度器实例不共享引擎级 trace store。`MetricsCollector` 已改为引擎注入（无 `getInstance()`）。
+4. **冷操作不完整**：冷 Intent 支持取消，但**不支持改期与 fireNow**（见 §5.4）。
+5. **intentId / payload 尺寸约束**：槽内 intentId ≤ 24B、payload ≤ 210B（超出抛 `SlotOverflowException`）；tail run 记录 intentId ≤ 255B。超长标识需上层自行散列。
 
 ## 11. 源码包结构导览（`com.loomq`）
 
@@ -299,6 +301,5 @@ LoomqEngine.createIntent (虚拟线程异步)
 | `infrastructure.wheel` | PHTW 全栈：`WheelStore`/`WheelTier`/`WheelConfig`/`SlotCodec`、`TailIndex`、`GroupCommitBarrier`、`IntentLocationIndex`、`PromotionDaemon` |
 | `store` | `IntentStore`、`ConcurrentIntentStore`、`ReadOnlyIntentStoreView`、幂等记录 |
 | `spi` | `DeliveryHandler`、`CallbackHandler`、`IntentObserver`、`RedeliveryDecider`、`DeliveryContext` |
-| `retry` | `RetryPolicy`、指数退避 / 固定间隔实现 |
-| `config` | `SchedulerConfig` 等配置记录 + `SimpleYamlConfigLoader` |
+| `config` | `SchedulerConfig` 等配置记录 |
 | `common` / `metrics` / `tracing` | 指标（`MetricsCollector` 及各 registry）、校验、`IntentTrace(Store)`、异常体系 |

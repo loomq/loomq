@@ -256,7 +256,6 @@ class IntentStateTransitionTest {
             null,
             "shard-a",
             "shard-1",
-            AckMode.REPLICATED,
             null,
             null,
             "idem-123",
@@ -276,7 +275,6 @@ class IntentStateTransitionTest {
         assertEquals(PrecisionTier.FAST, restored.getPrecisionTier());
         assertEquals("shard-a", restored.getShardKey());
         assertEquals("shard-1", restored.getShardId());
-        assertEquals(AckMode.REPLICATED, restored.getAckMode());
         assertEquals("idem-123", restored.getIdempotencyKey());
         assertEquals(Map.of("team", "core"), restored.getTags());
         assertEquals(3, restored.getAttempts());
@@ -291,7 +289,7 @@ class IntentStateTransitionTest {
             "intent-acked", IntentStatus.ACKED,
             Instant.now(), Instant.now(), Instant.now(), null,
             ExpiredAction.DISCARD, PrecisionTier.HIGH, null,
-            "s", "s1", AckMode.DURABLE,
+            "s", "s1",
             null, null, null, Map.of(), 1, null, 2L
         );
         assertEquals(IntentStatus.ACKED, restored.getStatus());

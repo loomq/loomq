@@ -11,7 +11,7 @@ import java.util.Map;
  * 提供完整的监控指标收集和查询能力
  *
  * <p>注:持久化已由 PHTW(持久化分层时间轮)承担,原 WAL 健康指标退化为默认值
- * (恒健康、零延迟),仅为兼容 {@link MetricsSnapshot} 字段与 {@code HealthNarrator} 读取。</p>
+ * (恒健康、零延迟),仅为兼容 {@link MetricsSnapshot} 字段保留。</p>
  *
  * @author loomq
  * @since v0.5.0
@@ -122,7 +122,7 @@ public class LoomQMetrics {
         long snapshotsCreated,
         long pendingIntents,
         long activeDispatches,
-        // WAL 健康指标(PHTW 下为默认值,保留字段以兼容 HealthNarrator)
+        // WAL 健康指标(PHTW 下为默认值,保留字段以兼容 MetricsSnapshot)
         boolean walHealthy,
         long walLastFlushTime,
         long walIdleTimeMs,

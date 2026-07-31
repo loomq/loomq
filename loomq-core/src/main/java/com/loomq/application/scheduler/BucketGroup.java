@@ -44,17 +44,32 @@ public class BucketGroup {
      * Key: 执行时间戳按精度窗口向下取整
      * Value: 该时间窗口内的 Intent 索引
      */
-    private final ConcurrentSkipListMap<Long, ConcurrentHashMap<String, Intent>> buckets;
+    private final ConcurrentSkipListMap<Long, ConcurrentHashMap<String, BucketEntry>> buckets;
 
     /**
-     * Intent 到桶的反向索引，便于 O(1) 删除和重调度
+     * Intent 到桶的反向索引，便于 O(1) 删除和重调度。
+     * Value: ClaimEntry(bucketKey, revisionAtAdd) -- scanDue 认领时用 CAS 比对。
      */
-    private final ConcurrentHashMap<String, Long> intentIndex;
+    private final ConcurrentHashMap<String, ClaimEntry> intentIndex;
 
     /**
      * 当前待处理任务计数
      */
     private final AtomicLong pendingCount;
+
+    /**
+     * 索引条目:记录 intent 入桶时的 (bucketKey, revision)。
+     * scanDue 认领时用 CAS 比对 -- 若 fireNow/重排程已替换条目(revision 不同),
+     * remove(key, expectedValue) 失败,旧桶条目不被误删。
+     */
+    record ClaimEntry(long bucketKey, long revision) {}
+
+    /**
+     * 桶条目:封装 Intent + 入桶时的 revision 快照(不可变)。
+     * scanDue 从 BucketEntry 取 revisionAtAdd 构造 CAS 期望值,
+     * 而非从可变 Intent 对象或当前索引状态读取。
+     */
+    record BucketEntry(Intent intent, long revisionAtAdd) {}
 
     /**
      * 构造函数
@@ -88,17 +103,18 @@ public class BucketGroup {
     public void add(Intent intent, Instant executeAt) {
         long bucketKey = floorToBucket(executeAt.toEpochMilli());
         String intentId = intent.getIntentId();
+        long rev = intent.getRevision();
 
-        intentIndex.compute(intentId, (id, previousBucketKey) -> {
-            if (previousBucketKey != null && previousBucketKey != bucketKey) {
-                removeFromBucket(previousBucketKey, intentId);
+        intentIndex.compute(intentId, (id, prev) -> {
+            if (prev != null && prev.bucketKey() != bucketKey) {
+                removeFromBucket(prev.bucketKey(), intentId);
             }
 
-            ConcurrentHashMap<String, Intent> bucket = buckets.computeIfAbsent(bucketKey, key -> new ConcurrentHashMap<>());
-            if (bucket.put(intentId, intent) == null) {
+            ConcurrentHashMap<String, BucketEntry> bucket = buckets.computeIfAbsent(bucketKey, key -> new ConcurrentHashMap<>());
+            if (bucket.put(intentId, new BucketEntry(intent, rev)) == null) {
                 pendingCount.incrementAndGet();
             }
-            return bucketKey;
+            return new ClaimEntry(bucketKey, rev);
         });
 
         if (logger.isTraceEnabled()) {
@@ -115,12 +131,12 @@ public class BucketGroup {
      */
     public boolean remove(Intent intent) {
         String intentId = intent.getIntentId();
-        Long bucketKey = intentIndex.remove(intentId);
-        if (bucketKey != null && removeFromBucket(bucketKey, intentId)) {
+        ClaimEntry entry = intentIndex.remove(intentId);
+        if (entry != null && removeFromBucket(entry.bucketKey(), intentId)) {
             return true;
         }
 
-        if (bucketKey != null) {
+        if (entry != null) {
             return removeByScan(intentId);
         }
 
@@ -137,7 +153,7 @@ public class BucketGroup {
         long currentBucketKey = floorToBucket(now.toEpochMilli());
 
         // 获取所有 <= 当前时间桶的条目
-        NavigableMap<Long, ConcurrentHashMap<String, Intent>> dueBuckets = buckets.headMap(currentBucketKey, true);
+        NavigableMap<Long, ConcurrentHashMap<String, BucketEntry>> dueBuckets = buckets.headMap(currentBucketKey, true);
 
         if (dueBuckets.isEmpty()) {
             return Collections.emptyList();
@@ -147,13 +163,30 @@ public class BucketGroup {
 
         // 遍历到期桶，收集任务
         for (Long bucketKey : new ArrayList<>(dueBuckets.keySet())) {
-            ConcurrentHashMap<String, Intent> bucketIntents = buckets.remove(bucketKey);
+            ConcurrentHashMap<String, BucketEntry> bucketIntents = buckets.remove(bucketKey);
             if (bucketIntents != null) {
-                pendingCount.addAndGet(-bucketIntents.size());
+                for (var entry : bucketIntents.entrySet()) {
+                    String intentId = entry.getKey();
+                    long revAtAdd = entry.getValue().revisionAtAdd();
 
-                // 过滤真正到期的任务（考虑精度窗口内的实际执行时间）
-                for (Intent intent : bucketIntents.values()) {
-                    intentIndex.remove(intent.getIntentId(), bucketKey);
+                    // 桶已摘除,无论 CAS 成功与否都减计数(桶正在销毁)
+                    pendingCount.decrementAndGet();
+
+                    // 原子认领:只有索引条目仍是我们放入的那条时才能移除。
+                    // 若 fireNow/重排程已替换条目(revision 不同),CAS 失败,跳过不投递。
+                    if (!intentIndex.remove(intentId, new ClaimEntry(bucketKey, revAtAdd))) {
+                        logger.debug("scanDue CAS failed for intent {}: already re-claimed by newer revision", intentId);
+                        continue;  // 已被 fireNow/重排程替换 - 不投递
+                    }
+
+                    // Test hook: fires after CAS success, before dueIntents/re-add.
+                    // Used by integration tests to simulate fireNow in the extreme race window.
+                    if (testScanPostClaimHook != null) {
+                        testScanPostClaimHook.run();
+                        testScanPostClaimHook = null;
+                    }
+
+                    Intent intent = entry.getValue().intent();
                     if (!intent.getExecuteAt().isAfter(now)) {
                         dueIntents.add(intent);
                     } else {
@@ -236,12 +269,12 @@ public class BucketGroup {
     }
 
     private boolean removeFromBucket(long bucketKey, String intentId) {
-        ConcurrentHashMap<String, Intent> bucket = buckets.get(bucketKey);
+        ConcurrentHashMap<String, BucketEntry> bucket = buckets.get(bucketKey);
         if (bucket == null) {
             return false;
         }
 
-        Intent removed = bucket.remove(intentId);
+        BucketEntry removed = bucket.remove(intentId);
         if (removed == null) {
             return false;
         }
@@ -256,10 +289,26 @@ public class BucketGroup {
     private boolean removeByScan(String intentId) {
         for (Long bucketKey : new ArrayList<>(buckets.keySet())) {
             if (removeFromBucket(bucketKey, intentId)) {
-                intentIndex.remove(intentId, bucketKey);
+                // Index entry already removed by caller (remove(Intent)).
                 return true;
             }
         }
         return false;
+    }
+
+    // ========== Test hooks (package-private) ==========
+
+    /** Test-only: if set, fires after CAS claim succeeds but before dueIntents/re-add. */
+    volatile Runnable testScanPostClaimHook;
+
+    /** Test-only: detach bucket without iterating (simulates scanDue's buckets.remove step). */
+    boolean testDetachBucket(Instant executeAt) {
+        long bucketKey = floorToBucket(executeAt.toEpochMilli());
+        return buckets.remove(bucketKey) != null;
+    }
+
+    /** Test-only: attempt CAS claim on intentIndex. Returns true if claim succeeded. */
+    boolean testClaim(String intentId, long bucketKey, long revision) {
+        return intentIndex.remove(intentId, new ClaimEntry(bucketKey, revision));
     }
 }

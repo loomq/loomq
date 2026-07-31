@@ -1,6 +1,7 @@
 package com.loomq.application.command;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
+import com.loomq.common.IntentValidator;
 import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
@@ -132,6 +133,7 @@ public final class IntentCommandService {
      */
     public long createIntent(Intent intent, AckMode ackMode) {
         ensureRunning();
+        IntentValidator.validate(intent);
 
         long seq = sequenceNumber.incrementAndGet();
 
@@ -230,6 +232,10 @@ public final class IntentCommandService {
     public List<Long> createIntents(List<Intent> intents, AckMode ackMode) {
         ensureRunning();
         if (intents.isEmpty()) return List.of();
+
+        for (Intent intent : intents) {
+            IntentValidator.validate(intent);
+        }
 
         WalMode effectiveMode = resolveWalMode(intents.get(0), ackMode);
         boolean durable = effectiveMode == WalMode.DURABLE;
@@ -362,6 +368,21 @@ public final class IntentCommandService {
         }
     }
 
+    /**
+     * 取消 Intent。
+     *
+     * <p><b>语义：best-effort。</b>取消操作对于已进入投递流程（DISPATCHING）的 Intent 无效--
+     * 异步投递可能已完成，事件可能已到达下游。调用方必须确保下游处理逻辑的幂等性。</p>
+     *
+     * <p>对于热 Intent（在内存 store 中）：经 synchronized(intent) 串行化状态迁移，
+     * 成功则 removeFromSchedule + DURABLE 落盘 CANCELED 终态。</p>
+     *
+     * <p>对于冷 Intent（不在内存 store 中）：经 locationIndex 定位磁盘槽，
+     * 互斥写 CANCELED 终态槽。</p>
+     *
+     * @param intentId 待取消的 Intent ID
+     * @return true 如果取消成功；false 如果 Intent 不存在或已处于终态
+     */
     public boolean cancelIntent(String intentId) {
         ensureRunning();
 

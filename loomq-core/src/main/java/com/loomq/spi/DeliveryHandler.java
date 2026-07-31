@@ -11,6 +11,10 @@ import java.util.concurrent.CompletableFuture;
  * 内核通过此接口投递 Intent，实现方必须返回 CompletableFuture。
  * 实现必须是异步的——不得在调用线程中阻塞等待 I/O。
  *
+ * <p><b>并发语义：</b>{@code deliverAsync} 可能与 {@code cancelIntent} 并发执行。
+ * 已取消的 Intent 仍可能被投递（cancel 是 best-effort，在途投递不可撤销）。
+ * 实现方必须确保下游处理逻辑的幂等性。</p>
+ *
  * @author loomq
  * @since v0.8.0
  */
