@@ -89,6 +89,7 @@ public class LoomqEngine implements AutoCloseable {
     // ========== 状态 ==========
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
     // ========== 配置 ==========
@@ -212,43 +213,55 @@ public class LoomqEngine implements AutoCloseable {
      * 启动引擎
      */
     public void start() {
-        if (!running.compareAndSet(false, true)) {
+        if (!started.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is already running");
         }
+        try {
+            logger.info("╔════════════════════════════════════════════════════════╗");
+            logger.info("║       LoomQ Core Engine Starting...                    ║");
+            logger.info("║       Mode: Embedded                                   ║");
+            logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
+            logger.info("╚════════════════════════════════════════════════════════╝");
 
-        logger.info("╔════════════════════════════════════════════════════════╗");
-        logger.info("║       LoomQ Core Engine Starting...                    ║");
-        logger.info("║       Mode: Embedded                                   ║");
-        logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
-        logger.info("╚════════════════════════════════════════════════════════╝");
+            if (!deliveryHandlerConfigured) {
+                logger.warn("No DeliveryHandler configured; intents will be silently dead-lettered. "
+                    + "Supply one via Builder.deliveryHandler(...) to enable delivery.");
+            }
 
-        if (!deliveryHandlerConfigured) {
-            logger.warn("No DeliveryHandler configured; intents will be silently dead-lettered. "
-                + "Supply one via Builder.deliveryHandler(...) to enable delivery.");
+            // 1. 恢复:扫所有槽 -> 重建索引 + 热载入内存 + 冷注册 promotion cohort
+            WheelRecoveryReport recoveryReport =
+                wheelRecovery.recover(intentStore, scheduler, locationIndex, promotionDaemon);
+            if (recoveryReport.hotRestored() > 0 || recoveryReport.coldRegistered() > 0) {
+                logger.info("WheelRecovery: hotRestored={}, coldRegistered={}",
+                    recoveryReport.hotRestored(), recoveryReport.coldRegistered());
+            }
+
+            // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
+            commitBarrier.start();
+
+            // 3. 启动 promotion daemon(冷->热提升 cohort)
+            promotionDaemon.start();
+
+            // 4. 启动调度器
+            scheduler.setObservers(observers);
+            scheduler.start();
+
+            // 5. 启动桶回收 daemon(删除过期无活跃引用的桶文件)
+            bucketReclaimer.start();
+
+            // P2-1: running 闸门在所有 daemon 就绪后开放。此前 ensureRunning() 拒绝
+            // 所有写操作，杜绝恢复期间 DURABLE 写入命中 awaitCommit 超时兖底慢路径。
+            running.set(true);
+            logger.info("Engine started successfully");
+        } catch (Exception e) {
+            // Best-effort 清理已部分启动的 daemon（各 daemon 有自身防重入守卫，双关闭安全）
+            try { commitBarrier.close(); } catch (Exception ignored) {}
+            try { promotionDaemon.close(); } catch (Exception ignored) {}
+            try { scheduler.stop(); } catch (Exception ignored) {}
+            try { bucketReclaimer.close(); } catch (Exception ignored) {}
+            started.set(false);  // 允许重试
+            throw e;
         }
-
-        // 1. 恢复:扫所有槽 → 重建索引 + 热载入内存 + 冷注册 promotion cohort
-        WheelRecoveryReport recoveryReport =
-            wheelRecovery.recover(intentStore, scheduler, locationIndex, promotionDaemon);
-        if (recoveryReport.hotRestored() > 0 || recoveryReport.coldRegistered() > 0) {
-            logger.info("WheelRecovery: hotRestored={}, coldRegistered={}",
-                recoveryReport.hotRestored(), recoveryReport.coldRegistered());
-        }
-
-        // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
-        commitBarrier.start();
-
-        // 3. 启动 promotion daemon(冷→热提升 cohort)
-        promotionDaemon.start();
-
-        // 4. 启动调度器
-        scheduler.setObservers(observers);
-        scheduler.start();
-
-        // 5. 启动桶回收 daemon(删除过期无活跃引用的桶文件)
-        bucketReclaimer.start();
-
-        logger.info("Engine started successfully");
     }
 
     /**
@@ -256,11 +269,11 @@ public class LoomqEngine implements AutoCloseable {
      */
     @Override
     public void close() throws Exception {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
+        if (!started.get()) return;                      // fast path: never started or already closed
+        if (!closed.compareAndSet(false, true)) return;  // 并发首次关闭守卫
 
         running.set(false);
+        started.set(false);
         logger.info("Shutting down LoomqEngine...");
 
         // 停止桶回收 daemon(在 wheelStore 关闭前停止)
@@ -316,8 +329,10 @@ public class LoomqEngine implements AutoCloseable {
      * 而非内核级持久化。内核级验证需 OS crash 注入，超出 JVM 测试范围。</p>
      */
     void simulateCrash() {
+        if (!started.get()) return;
         if (!closed.compareAndSet(false, true)) return;
         running.set(false);
+        started.set(false);
         logger.info("Simulating crash (no flush)...");
 
         bucketReclaimer.close();
