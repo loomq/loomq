@@ -1,5 +1,6 @@
 package com.loomq.domain.intent;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -79,6 +80,19 @@ public class Callback {
 
     public void setBody(Object body) {
         this.body = body;
+    }
+
+    /**
+     * 创建当前 Callback 的独立副本（I5 边界不变量）。
+     *
+     * <p>headers 经防御性拷贝（可变副本，容许 null 值）。body（Object 类型）无法泛型深拷贝，
+     * 按引用共享--已知限制，使用方不应通过 body 间接变异内核状态。</p>
+     *
+     * @return 独立副本
+     */
+    public Callback copy() {
+        return new Callback(url, method,
+            headers != null ? new HashMap<>(headers) : null, body);
     }
 
     @Override

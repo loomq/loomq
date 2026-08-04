@@ -10,7 +10,8 @@ import com.loomq.spi.DeliveryHandler.DeliveryResult;
  * 在不侵入内核调度逻辑的前提下观测 intent 状态变化。
  *
  * <p><b>I5 快照语义</b>：Intent 参数为事件发生时刻的防御性快照。修改快照不影响内核状态。
- * 观察器在锁外被调用，不会阻塞内核结算路径。</p>
+ * 观察器在 intent 锁外被调用（不持有 per-intent 监视器），但仍同步执行于调用线程--
+ * 实现应保持轻量，避免阻塞结算流水线。</p>
  */
 public interface IntentObserver {
 

@@ -4,8 +4,10 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loomq.domain.intent.AckMode;
+import com.loomq.domain.intent.Callback;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.RedeliveryPolicy;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
@@ -50,6 +52,13 @@ class ObserverMutationIsolationTest {
             intent.setExecuteAt(Instant.now().plusSeconds(999));
             intent.setDeadline(Instant.now().plusSeconds(999));
             intent.setTags(Map.of("mutated", "true"));
+            // P1: Attempt to mutate nested mutable objects via the snapshot
+            if (intent.getRedelivery() != null) {
+                intent.getRedelivery().setMaxAttempts(1);
+            }
+            if (intent.getCallback() != null) {
+                intent.getCallback().setUrl("http://mutated.example.com");
+            }
             delivered.countDown();
         }
 
@@ -81,6 +90,8 @@ class ObserverMutationIsolationTest {
             intent.setDeadline(originalDeadline);
             intent.setPrecisionTier(PrecisionTier.STANDARD);
             intent.setTags(Map.of("original", "true"));
+            intent.setCallback(new Callback("http://original.example.com"));
+            intent.setRedelivery(new RedeliveryPolicy(5, "exponential", 1000, 60000, 2.0, true));
 
             engine.createIntent(intent, AckMode.DURABLE).get();
 
@@ -102,6 +113,12 @@ class ObserverMutationIsolationTest {
                 "tags must contain original key");
             assertTrue(!stored.getTags().containsKey("mutated"),
                 "mutated tag must not appear in kernel state");
+
+            // P1: nested mutable fields must be deep-copied
+            assertEquals(5, stored.getRedelivery().getMaxAttempts(),
+                "redelivery.maxAttempts must be original (observer tried to mutate via nested setter)");
+            assertEquals("http://original.example.com", stored.getCallback().getUrl(),
+                "callback.url must be original (observer tried to mutate via nested setter)");
         }
         System.gc();
         Thread.sleep(200);

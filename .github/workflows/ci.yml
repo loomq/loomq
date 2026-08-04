@@ -50,9 +50,22 @@ jobs:
       - name: Slow tests
         run: mvn test -Pslow-tests
 
+  integration-tests:
+    needs: format-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oracle-actions/setup-java@v1
+        with:
+          website: jdk.java.net
+          release: 25
+      - name: Integration tests
+        run: mvn test -Pintegration-tests
+
   package:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [fast-tests, slow-tests]
+    needs: [fast-tests, slow-tests, integration-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -44,6 +44,7 @@ Tests are categorized with `@Tag` annotations. Maven Surefire uses `groups`/`exc
 |-----|--------------|------|
 | *(none)* | default / `fast-tests` | Fast unit tests, always run |
 | `slow` | `slow-tests` | PrecisionSchedulerTest, LoomqEnginePhtwRecoveryTest |
+| `integration` | `integration-tests` | Engine-level tests (mutation isolation, lock-free dispatch, recovery) |
 | `benchmark` | (included in `full-tests`) | Performance benchmarks |
 
 ## Architecture
@@ -86,7 +87,7 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`): Oracle JDK 25. Jobs: `format-check` → `fast-tests`, `slow-tests`. On push to main: `package`. Use `make check` locally to simulate the CI gate.
+GitHub Actions (`.github/workflows/ci.yml`): Oracle JDK 25. Jobs: `format-check` → `fast-tests`, `slow-tests`, `integration-tests`. On push to main: `package`. Use `make check` locally to simulate the CI gate.
 
 ## Language
 
