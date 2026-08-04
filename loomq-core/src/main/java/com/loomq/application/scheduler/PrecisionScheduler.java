@@ -450,7 +450,11 @@ public class PrecisionScheduler {
             intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier());
 
         // I5: synchronized 内完成状态迁移 + 索引 + 路由 + 快照；
-        // onScheduled 在锁外派发，观察器代码不阻塞内核结算路径。
+        // onScheduled 在锁外派发（不持有 intent 锁），但仍同步执行于调用线程。
+        // 锁释放与锁外 schedule() 调用之间的交错窗口是良性的：
+        // - BucketGroup.add() 的 intentIndex.compute() 原子覆盖同 intentId 旧条目
+        // - scanDue CAS 捕获过期条目（revision 不匹配则跳过）
+        // - CohortManager.remove 的 removeIf 清理所有匹配条目
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         synchronized (intent) {
             // 锁内终态复查 -- cancel 可能在锁释放与 schedule() 之间发生
@@ -485,8 +489,10 @@ public class PrecisionScheduler {
                 logger.debug("Scheduled intent {} with tier {}, delay {}ms",
                     intent.getIntentId(), tier, delayMs);
 
-                final Intent snapshot = intent.copy();
-                deferredNotify = o -> o.onScheduled(snapshot);
+                if (!observers.isEmpty()) {
+                    final Intent snapshot = intent.copy();
+                    deferredNotify = o -> o.onScheduled(snapshot);
+                }
             }
         }
         // I5: onScheduled 在锁外派发
@@ -521,7 +527,9 @@ public class PrecisionScheduler {
         if (intent == null || intent.getExecuteAt() == null) {
             return;
         }
-        // I5: synchronized + 终态复查 -- cancel 可能在锁释放与 restore() 之间发生
+        // I5: synchronized + 终态复查 -- cancel 可能在锁释放与 restore() 之间发生。
+        // 重复注册（并发 fireNow/reschedule）是良性的：BucketGroup.add() 原子覆盖，
+        // scanDue CAS 去重，CohortManager.remove 的 removeIf 清理全部匹配条目。
         synchronized (intent) {
             if (intent.getStatus().isTerminal()) {
                 logger.debug("Skipping restore for terminal intent {}", intent.getIntentId());
@@ -733,23 +741,12 @@ public class PrecisionScheduler {
 
     /**
      * 单 Intent 消费循环（batchSize == 1）。
-     * 流程：acquire → poll(1) → I5 快照(synchronized+copy) → deliver(snapshot) → release in callback。
+     * 流程：poll → acquire → I5 快照(synchronized+copy) → deliver(snapshot) → release in callback。
      */
     private void runSingleIntentConsumer(PrecisionTier tier, BlockingQueue<Intent> queue) {
         while (running) {
-            long acquireStartNs = System.nanoTime();
-            ResizableSemaphore acquired;
-            try {
-                acquired = acquireWithBorrow(tier);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            long acquireEndNs = System.nanoTime();
-
             Intent intent = queue.poll();
             if (intent == null) {
-                releasePermit(tier, acquired);   // Fix 7: 空 poll 释放同样配对 decrementBorrowed
                 long parkNanos = switch (tier) {
                     case ULTRA -> 100_000L;    // 100μs (10ms precision window ≈ 1%)
                     case FAST  -> 200_000L;    // 200μs
@@ -758,6 +755,18 @@ public class PrecisionScheduler {
                 LockSupport.parkNanos(parkNanos);
                 continue;
             }
+
+            long acquireStartNs = System.nanoTime();
+            ResizableSemaphore acquired;
+            try {
+                acquired = acquireWithBorrow(tier);
+            } catch (InterruptedException e) {
+                // intent 已出队但不重新入队：中断仅在 shutdown 路径发生，
+                // intent 持久化在 wheel 中，重启经 WheelRecovery 恢复。
+                Thread.currentThread().interrupt();
+                break;
+            }
+            long acquireEndNs = System.nanoTime();
 
             // I5: 派发即快照——在 synchronized(intent) 内原子完成终态复查 + 防御性拷贝。
             // 快照与 cancel/update 互斥：要么取自变更前的完整状态，要么复查拦截（不投递）。
@@ -776,8 +785,6 @@ public class PrecisionScheduler {
             traceStore.recordDequeued(intent.getIntentId());
             recordDispatchQueueLag(intent, tier);
 
-            // Only accumulate acquire wait for actual deliveries so the average
-            // denominator (deliverySampleCount) matches.
             permitTimingStats.totalAcquireWaitNanos.addAndGet(acquireEndNs - acquireStartNs);
             final long permitAcquiredNs = acquireEndNs;
 
@@ -854,7 +861,9 @@ public class PrecisionScheduler {
 
             // I5: 派发即快照--在 synchronized(intent) 内原子完成终态复查 + 防御性拷贝。
             // 构建 liveBatch（结算用活对象）和 snapshotBatch（SPI 用快照）并行列表。
-            // 许可获取在确定非终态数量之后，同时修掉“先申请再剥除终态”的 permit 临时过配问题。
+            // 许可获取在 synchronized(intent) 终态复查 + copy 之后，
+            // 确保只为非终态 intent 占用 permit。终态复查与快照在同一个
+            // 监视器下原子完成，消除了旧 removeIf 路径的 TOCTOU 窗口。
             List<Intent> liveBatch = new ArrayList<>(batch.size());
             List<Intent> snapshotBatch = new ArrayList<>(batch.size());
             for (Intent intent : batch) {
@@ -1178,8 +1187,10 @@ public class PrecisionScheduler {
             intentStore.update(intent);
             persistStateChange(intent);           // P1-1
 
-            final Intent snapshot = intent.copy();
-            deferredNotify = o -> o.onExpired(snapshot);
+            if (!observers.isEmpty()) {
+                final Intent snapshot = intent.copy();
+                deferredNotify = o -> o.onExpired(snapshot);
+            }
         }
         // I5: onExpired 在锁外派发
         if (deferredNotify != null) {
@@ -1225,7 +1236,7 @@ public class PrecisionScheduler {
                         traceStore.recordAcked(intent.getIntentId());
                         traceStore.updateStatus(intent.getIntentId(), IntentStatus.ACKED);
                         logger.debug("Intent {} delivered successfully", intent.getIntentId());
-                        {
+                        if (!observers.isEmpty()) {
                             final Intent snapshot = intent.copy();
                             deferredNotify = o -> o.onDelivered(snapshot, finalResult);
                         }
@@ -1257,7 +1268,7 @@ public class PrecisionScheduler {
                         persistStateChange(intent);           // P1-1
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.warn("Intent {} dead-lettered", intent.getIntentId());
-                        {
+                        if (!observers.isEmpty()) {
                             final Intent snapshot = intent.copy();
                             deferredNotify = o -> o.onDeadLettered(snapshot);
                         }
@@ -1269,7 +1280,7 @@ public class PrecisionScheduler {
                         persistStateChange(intent);           // P1-1
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.info("Intent {} expired", intent.getIntentId());
-                        {
+                        if (!observers.isEmpty()) {
                             final Intent snapshot = intent.copy();
                             deferredNotify = o -> o.onExpired(snapshot);
                         }
@@ -1315,7 +1326,7 @@ public class PrecisionScheduler {
                 persistStateChange(intent);           // P1-1
                 unindexIntent(intent.getIntentId(), executeAtMs(intent));
                 logger.warn("Intent dead-lettered after max attempts: id={}", intent.getIntentId());
-                {
+                if (!observers.isEmpty()) {
                     final Intent snapshot = intent.copy();
                     deferredNotify = o -> o.onDeadLettered(snapshot);
                 }
