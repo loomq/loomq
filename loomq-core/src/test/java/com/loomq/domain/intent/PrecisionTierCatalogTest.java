@@ -1,6 +1,7 @@
 package com.loomq.domain.intent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -109,9 +110,19 @@ class PrecisionTierCatalogTest {
     }
 
     @Test
-    void defaultCatalogShouldHaveAllFiveTiers() {
+    void defaultCatalogShouldHaveAllSixTiers() {
         PrecisionTierCatalog catalog = PrecisionTierCatalog.defaultCatalog();
-        assertEquals(5, catalog.tierCount());
+        assertEquals(6, catalog.tierCount());
+    }
+
+    @Test
+    void milliProfileRegisters() {
+        PrecisionTierCatalog c = PrecisionTierCatalog.defaultCatalog();
+        assertTrue(c.isDirectBucket(PrecisionTier.MILLI));
+        assertTrue(c.isAdaptive(PrecisionTier.MILLI));
+        assertEquals(200_000, c.maxBuckets(PrecisionTier.MILLI));
+        assertFalse(c.isDirectBucket(PrecisionTier.STANDARD));
+        assertEquals(1, c.precisionWindowMs(PrecisionTier.MILLI));
     }
 
     @Test

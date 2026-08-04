@@ -2,6 +2,7 @@ package com.loomq.scheduler;
 
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
@@ -19,13 +20,31 @@ class PrecisionTierTest {
     @Test
     @DisplayName("精度档位枚举值正确")
     void testPrecisionTierValues() {
-        assertEquals(5, PrecisionTier.values().length);
+        assertEquals(6, PrecisionTier.values().length);
 
         assertEquals(10, PrecisionTier.ULTRA.getPrecisionWindowMs());
         assertEquals(50, PrecisionTier.FAST.getPrecisionWindowMs());
         assertEquals(100, PrecisionTier.HIGH.getPrecisionWindowMs());
         assertEquals(500, PrecisionTier.STANDARD.getPrecisionWindowMs());
         assertEquals(1000, PrecisionTier.ECONOMY.getPrecisionWindowMs());
+        assertEquals(1, PrecisionTier.MILLI.getPrecisionWindowMs());
+    }
+
+    @Test
+    @DisplayName("枚举声明序即 SlotCodec 持久化序（ordinal 稳定）")
+    void ordinalIsStableForPersistence() {
+        assertEquals(0, PrecisionTier.ULTRA.ordinal());
+        assertEquals(1, PrecisionTier.FAST.ordinal());
+        assertEquals(2, PrecisionTier.HIGH.ordinal());
+        assertEquals(3, PrecisionTier.STANDARD.ordinal());
+        assertEquals(4, PrecisionTier.ECONOMY.ordinal());
+        assertEquals(5, PrecisionTier.MILLI.ordinal());
+    }
+
+    @Test
+    @DisplayName("MILLI 是最紧档位")
+    void milliIsTightest() {
+        assertTrue(PrecisionTier.MILLI.getPrecisionWindowMs() < PrecisionTier.ULTRA.getPrecisionWindowMs());
     }
 
     @Test

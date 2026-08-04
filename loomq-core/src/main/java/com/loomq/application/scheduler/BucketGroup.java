@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.NavigableMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -71,6 +72,22 @@ public class BucketGroup {
      */
     record BucketEntry(Intent intent, long revisionAtAdd) {}
 
+    /** add() 的结果：放入桶或触发高水位降级。 */
+    public enum AddResult { ADDED, FALLBACK_TO_COHORT }
+
+    /** 新桶创建监听器（仅在新桶 key 出现时触发，成员增删不触发）。 */
+    public interface BucketAddListener { void onBucketAdded(long bucketKey); }
+
+    private volatile BucketAddListener bucketAddListener;
+    private final int maxBuckets;
+
+    public Long earliestBucketKey() {
+        return buckets.isEmpty() ? null : buckets.firstKey();
+    }
+
+    public void setBucketAddListener(BucketAddListener l) { this.bucketAddListener = l; }
+    public int getMaxBuckets() { return maxBuckets; }
+
     /**
      * 构造函数
      *
@@ -89,6 +106,7 @@ public class BucketGroup {
     public BucketGroup(PrecisionTier tier, PrecisionTierCatalog catalog) {
         this.tier = tier;
         this.profile = catalog.profile(tier);
+        this.maxBuckets = catalog.maxBuckets(tier);
         this.buckets = new ConcurrentSkipListMap<>();
         this.intentIndex = new ConcurrentHashMap<>();
         this.pendingCount = new AtomicLong();
@@ -100,27 +118,78 @@ public class BucketGroup {
      * @param intent    Intent 实例
      * @param executeAt 执行时间
      */
-    public void add(Intent intent, Instant executeAt) {
+    public AddResult add(Intent intent, Instant executeAt) {
+        return add(intent, executeAt, true);
+    }
+
+    /** 再入路径（cohort flush / scanDue 未到期重入）：intent 已被系统接受，强制入桶，忽略高水位，防丢。 */
+    AddResult addForced(Intent intent, Instant executeAt) {
+        return add(intent, executeAt, false);
+    }
+
+    private AddResult add(Intent intent, Instant executeAt, boolean enforceHighWater) {
         long bucketKey = floorToBucket(executeAt.toEpochMilli());
         String intentId = intent.getIntentId();
         long rev = intent.getRevision();
+        AtomicBoolean fallback = new AtomicBoolean(false);
+        AtomicBoolean newBucketCreated = new AtomicBoolean(false);
 
         intentIndex.compute(intentId, (id, prev) -> {
+            // 高水位（P3-2）：目标 key 为新桶且桶数已达上限 → 降级（不建桶）。
+            // 先判水位再摘旧条目：降级路径移除旧桶条目并清空索引（intent 移交 cohort），
+            // 避免双注册（旧桶 + cohort 的 stale-time 派发）且不留 stale index。
+            // 仅初次 schedule()/restore() 路由（enforceHighWater=true）受此门控；
+            // 再入路径（cohort flush / scanDue 重入）强制入桶，忽略高水位，防丢。
+            if (enforceHighWater && buckets.get(bucketKey) == null && buckets.size() >= maxBuckets) {
+                fallback.set(true);
+                // 降级：intent 移交 cohort，移除旧桶条目并清空索引——避免双注册
+                // （旧桶 + cohort 的 stale-time 派发）且不留 stale index。
+                if (prev != null) {
+                    removeFromBucket(prev.bucketKey(), intentId);
+                }
+                return null;  // 清空索引条目（intent 现归 cohort）
+            }
             if (prev != null && prev.bucketKey() != bucketKey) {
                 removeFromBucket(prev.bucketKey(), intentId);
             }
-
-            ConcurrentHashMap<String, BucketEntry> bucket = buckets.computeIfAbsent(bucketKey, key -> new ConcurrentHashMap<>());
+            ConcurrentHashMap<String, BucketEntry> newBucket = new ConcurrentHashMap<>();
+            ConcurrentHashMap<String, BucketEntry> bucket =
+                buckets.computeIfAbsent(bucketKey, k -> newBucket);
             if (bucket.put(intentId, new BucketEntry(intent, rev)) == null) {
                 pendingCount.incrementAndGet();
+            }
+            if (bucket == newBucket) {
+                newBucketCreated.set(true);
             }
             return new ClaimEntry(bucketKey, rev);
         });
 
-        if (logger.isTraceEnabled()) {
-            logger.trace("Added intent {} to bucket {} for tier {}",
-                intent.getIntentId(), bucketKey, tier);
+        // P3-1：新桶监听器在 compute 完成后、锁外触发（intentIndex bin 锁已释放）。
+        // addForced 新桶也触发（cohort flush 落入全新更早桶须唤醒 scanner）。
+        if (newBucketCreated.get()) {
+            BucketAddListener l = bucketAddListener;
+            if (l != null) l.onBucketAdded(bucketKey);
         }
+        if (fallback.get()) {
+            return AddResult.FALLBACK_TO_COHORT;
+        }
+        return AddResult.ADDED;
+    }
+
+    /**
+     * 返回最早桶内所有条目的最小精确 executeAt（epoch ms）。
+     * 空桶已由 removeFromBucket / scanDue 从 buckets 摘除，故最早桶恒非空；
+     * 防御性返回 null 于空表。
+     */
+    public Long earliestExecuteAt() {
+        var entry = buckets.firstEntry();
+        if (entry == null) return null;
+        long min = Long.MAX_VALUE;
+        for (BucketEntry be : entry.getValue().values()) {
+            long e = be.intent().getExecuteAt().toEpochMilli();
+            if (e < min) min = e;
+        }
+        return min == Long.MAX_VALUE ? null : min;
     }
 
     /**
@@ -207,8 +276,9 @@ public class BucketGroup {
                     if (!intent.getExecuteAt().isAfter(now)) {
                         dueIntents.add(intent);
                     } else {
-                        // 未到期的任务重新入桶
-                        add(intent, intent.getExecuteAt());
+                        // 未到期的任务重新入桶（再入路径：intent 已被系统接受，强制入桶，
+                        // 忽略高水位，绝不丢弃已接受的 intent）
+                        addForced(intent, intent.getExecuteAt());
                     }
                 }
             }

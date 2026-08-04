@@ -9,12 +9,14 @@ package com.loomq.domain.intent;
  * @since v0.5.1
  */
 public enum PrecisionTier {
+    // 警告：枚举声明序即 SlotCodec 持久化序（ordinal）。新档必须追加末尾，禁止插入重排。
 
     ULTRA,
     FAST,
     HIGH,
     STANDARD,
-    ECONOMY;
+    ECONOMY,
+    MILLI;
 
     private static PrecisionTierCatalog catalog() {
         return PrecisionTierCatalog.defaultCatalog();

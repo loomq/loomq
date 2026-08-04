@@ -133,6 +133,11 @@ public class MetricsCollector {
         tierMetrics.incrementBackpressureEvent(tier);
     }
 
+    /** 记录 directBucket 高水位降级（Phase 2 起使用；按实际档归因，非 defaultTier）。 */
+    public void incrementMilliFallback(PrecisionTier tier) { tierMetrics.incrementMilliFallback(tier); }
+    public void recordScannerPark(PrecisionTier tier) { tierMetrics.recordScannerPark(tier); }
+    public void recordScannerWakeEarly(PrecisionTier tier) { tierMetrics.recordScannerWakeEarly(tier); }
+
     /**
      * 记录 dispatch 队列 offer 失败（队满）
      */

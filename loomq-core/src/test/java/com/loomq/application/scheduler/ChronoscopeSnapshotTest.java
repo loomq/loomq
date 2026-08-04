@@ -42,7 +42,7 @@ class ChronoscopeSnapshotTest {
                 assertNotNull(snapshot);
                 assertNotNull(snapshot.tiers());
                 assertNotNull(snapshot.timestamp());
-                assertEquals(5, snapshot.tiers().size());
+                assertEquals(PrecisionTier.values().length, snapshot.tiers().size());
 
                 for (PrecisionTier tier : PrecisionTier.values()) {
                     ChronoscopeSnapshot.TierSnapshot tierSnapshot = snapshot.tiers().get(tier);

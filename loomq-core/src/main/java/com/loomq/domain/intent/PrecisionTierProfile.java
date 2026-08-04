@@ -14,7 +14,10 @@ public record PrecisionTierProfile(
     int consumerCount,
     int dispatchQueueCapacity,
     WalMode walMode,
-    long scanIntervalMs
+    long scanIntervalMs,
+    boolean directBucket,
+    boolean adaptiveScan,
+    int maxBuckets
 ) {
 
     public PrecisionTierProfile {
@@ -42,6 +45,26 @@ public record PrecisionTierProfile(
         if (scanIntervalMs <= 0) {
             throw new IllegalArgumentException("scanIntervalMs must be positive");
         }
+        if (maxBuckets <= 0) {
+            throw new IllegalArgumentException("maxBuckets must be positive");
+        }
+    }
+
+    /** 8-arg convenience: directives default to false/false and maxBuckets to Integer.MAX_VALUE (disabled). */
+    public PrecisionTierProfile(long precisionWindowMs, int maxConcurrency, int batchSize,
+                                int batchWindowMs, int consumerCount, int dispatchQueueCapacity,
+                                WalMode walMode, long scanIntervalMs) {
+        this(precisionWindowMs, maxConcurrency, batchSize, batchWindowMs, consumerCount,
+             dispatchQueueCapacity, walMode, scanIntervalMs, false, false, Integer.MAX_VALUE);
+    }
+
+    /** 10-arg convenience: defaults maxBuckets to Integer.MAX_VALUE (disabled). */
+    public PrecisionTierProfile(long precisionWindowMs, int maxConcurrency, int batchSize,
+                                int batchWindowMs, int consumerCount, int dispatchQueueCapacity,
+                                WalMode walMode, long scanIntervalMs,
+                                boolean directBucket, boolean adaptiveScan) {
+        this(precisionWindowMs, maxConcurrency, batchSize, batchWindowMs, consumerCount,
+             dispatchQueueCapacity, walMode, scanIntervalMs, directBucket, adaptiveScan, Integer.MAX_VALUE);
     }
 
     /**

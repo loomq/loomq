@@ -68,7 +68,7 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
 
 **Intent lifecycle:** CREATED → SCHEDULED → DUE → DISPATCHING → DELIVERED → ACKED (branches: CANCELLED, EXPIRED, DEAD_LETTERED)
 
-**Five precision tiers:** ULTRA(10ms, 200 slots), FAST(50ms, 150 slots), HIGH(100ms, 50 slots), STANDARD(500ms, 50 slots), ECONOMY(1000ms, 50 slots).
+**Six precision tiers:** ULTRA(10ms, 200 slots), FAST(50ms, 150 slots), HIGH(100ms, 50 slots), STANDARD(500ms, 50 slots), ECONOMY(1000ms, 50 slots), MILLI(1ms) —— 事件驱动扫描,毫秒级触发(cohort 旁路直插桶).
 
 ## Key Design Decisions
 
@@ -84,6 +84,8 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
 - **Cold→hot promotion** — `PromotionDaemon` registers intents due beyond `WheelConfig.hotBoundaryMs()` (default 60min, create/recovery hot threshold) as cohorts, mirroring `CohortManager`; on wake (at `executeAt - WheelConfig.promotionLeadMs()`, default 60s) it loads the slot into memory and hands off to the scheduler. `IntentLocationIndex` (intentId→`SlotLocation`) enables **cold cancel**(冷改期/冷 fireNow 未实现——`updateIntent`/`fireNow` 仅作用于热内存态)。promote↔cancelCold 用双向清理收口 TOCTOU。
 - **IntentStore is hot-state only** — `ConcurrentIntentStore` holds the in-memory hot window (≤`WheelConfig.hotBoundaryMs()`, default 60min); the wheel is the durable authority. Use `upsert()` for current-state writes.
 - **Recovery overdue 语义** — `WheelRecovery` 对停机窗口期间到期的 Intent 不再静默丢弃:按 `ExpiredAction` 置 EXPIRED/DEAD_LETTERED 终态并持久化终态 revision,下次重启被 terminal 跳过(不补投,避免对下游产生过时事件)。
+- **枚举序即持久化序** — `PrecisionTier` 新增档必须追加末尾,禁止插入重排(`SlotCodec` 按 ordinal 持久化)。
+- **事件驱动扫描 + 信号驱动消费** — `PrecisionScheduler.adaptiveScanLoop` 按 tier 事件驱动触发扫描(空闲时休眠,事件到来即唤醒),替代固定轮询;`MILLI` 档走 cohort 旁路直插桶,consumer 由信号唤醒而非批量睡眠,使 1ms 级触发可用而空闲 CPU 不劣化。
 
 ## CI
 

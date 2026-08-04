@@ -62,21 +62,24 @@ public class BucketGroupManager {
      *
      * @param intent Intent 实例
      */
-    public void add(Intent intent) {
+    public BucketGroup.AddResult add(Intent intent) {
         PrecisionTier tier = intent.getPrecisionTier();
         BucketGroup group = bucketGroups.get(tier);
-
         if (group == null) {
             logger.warn("Unknown precision tier {}, using default tier {}", tier, precisionTierCatalog.defaultTier());
             group = bucketGroups.get(precisionTierCatalog.defaultTier());
         }
-
-        group.add(intent, intent.getExecuteAt());
+        return group.add(intent, intent.getExecuteAt());
     }
 
     /**
      * Batch-add intents from a cohort flush. Groups by tier first to avoid
      * redundant catalog lookups per intent.
+     *
+     * <p>这些 intent 是系统已接受的再入路径（此前已入 cohort），强制入桶
+     * （addForced），忽略高水位降级——否则高水位档（如 MILLI）在 cohort flush
+     * 时 add() 返回 FALLBACK_TO_COHORT 而结果被丢弃，intent 既不在桶也不在
+     * cohort，静默丢失。</p>
      *
      * @param intents intents to add
      */
@@ -89,7 +92,7 @@ public class BucketGroupManager {
             if (group == null) {
                 group = bucketGroups.get(precisionTierCatalog.defaultTier());
             }
-            group.add(intent, intent.getExecuteAt());
+            group.addForced(intent, intent.getExecuteAt());
         }
     }
 
