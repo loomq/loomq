@@ -9,8 +9,8 @@ import com.loomq.spi.DeliveryHandler.DeliveryResult;
  * 服务层（复制、锁服务、agent 调度器等）通过实现此接口，
  * 在不侵入内核调度逻辑的前提下观测 intent 状态变化。
  *
- * 注意：回调在调度线程中执行，观察器实现应保持轻量，
- * 避免同步阻塞操作。如需执行重操作，应异步分派。
+ * <p><b>I5 快照语义</b>：Intent 参数为事件发生时刻的防御性快照。修改快照不影响内核状态。
+ * 观察器在锁外被调用，不会阻塞内核结算路径。</p>
  */
 public interface IntentObserver {
 

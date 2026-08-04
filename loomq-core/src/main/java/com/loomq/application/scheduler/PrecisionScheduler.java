@@ -141,11 +141,16 @@ public class PrecisionScheduler {
      * 异步投递异常处理。
      *
      * 注意：onDeliveryFailed 通知在 retry/dead-letter 决策之前触发。
-     * 观察器接收到的是原始投递失败事件，此时 intent 状态尚未被修改。
-     * 观察器不应依赖 intent 状态来推断调度器的后续决策。
+     * 观察器接收到的是派发时刻的防御性快照，其状态反映投递失败时的值。
+     * 观察器不应依赖快照状态来推断调度器的后续决策。
      */
     private void handleDeliveryException(Intent intent, PrecisionTier tier, Throwable ex) {
-        notifyObservers(o -> o.onDeliveryFailed(intent, ex));
+        // I5: 快照在锁内取，dispatch 在锁外
+        final Intent snapshot;
+        synchronized (intent) {
+            snapshot = intent.copy();
+        }
+        notifyObservers(o -> o.onDeliveryFailed(snapshot, ex));
         if (ex instanceof java.util.concurrent.TimeoutException) {
             logger.warn("Delivery timeout for intent {}", intent.getIntentId());
         } else {
@@ -444,34 +449,50 @@ public class PrecisionScheduler {
         traceStore.recordCreated(
             intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier());
 
-        Instant executeAt = intent.getExecuteAt();
-        Instant now = Instant.now();
-        long delayMs = Duration.between(now, executeAt).toMillis();
+        // I5: synchronized 内完成状态迁移 + 索引 + 路由 + 快照；
+        // onScheduled 在锁外派发，观察器代码不阻塞内核结算路径。
+        java.util.function.Consumer<IntentObserver> deferredNotify = null;
+        synchronized (intent) {
+            // 锁内终态复查 -- cancel 可能在锁释放与 schedule() 之间发生
+            if (intent.getStatus() != IntentStatus.CREATED && intent.getStatus() != IntentStatus.SCHEDULED) {
+                logger.debug("Skipping schedule for intent {} (status changed to {})",
+                    intent.getIntentId(), intent.getStatus());
+            } else {
+                if (intent.getStatus() == IntentStatus.CREATED) {
+                    intent.transitionTo(IntentStatus.SCHEDULED);
+                }
 
-        PrecisionTier tier = intent.getPrecisionTier();
-        long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
+                indexIntent(intent);
 
-        // Transition to SCHEDULED if still in CREATED state
-        if (intent.getStatus() == IntentStatus.CREATED) {
-            intent.transitionTo(IntentStatus.SCHEDULED);
+                Instant executeAt = intent.getExecuteAt();
+                Instant now = Instant.now();
+                long delayMs = Duration.between(now, executeAt).toMillis();
+
+                PrecisionTier tier = intent.getPrecisionTier();
+                long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
+
+                if (delayMs <= 0) {
+                    // 已到期，直接投递
+                    addToBucketAndDispatch(intent);
+                } else if (delayMs > precisionWindowMs) {
+                    // CSA-inspired: cohort-based batched wakeup replaces per-intent VT sleep
+                    cohortManager.register(intent);
+                } else {
+                    // 短延迟：直接入桶（无需休眠，bucket 本身提供精度窗口）
+                    addToBucketAndDispatch(intent);
+                }
+
+                logger.debug("Scheduled intent {} with tier {}, delay {}ms",
+                    intent.getIntentId(), tier, delayMs);
+
+                final Intent snapshot = intent.copy();
+                deferredNotify = o -> o.onScheduled(snapshot);
+            }
         }
-
-        notifyObservers(o -> o.onScheduled(intent));
-        indexIntent(intent);
-
-        if (delayMs <= 0) {
-            // 已到期，直接投递
-            addToBucketAndDispatch(intent);
-        } else if (delayMs > precisionWindowMs) {
-            // CSA-inspired: cohort-based batched wakeup replaces per-intent VT sleep
-            cohortManager.register(intent);
-        } else {
-            // 短延迟：直接入桶（无需休眠，bucket 本身提供精度窗口）
-            addToBucketAndDispatch(intent);
+        // I5: onScheduled 在锁外派发
+        if (deferredNotify != null) {
+            notifyObservers(deferredNotify);
         }
-
-        logger.debug("Scheduled intent {} with tier {}, delay {}ms",
-            intent.getIntentId(), tier, delayMs);
     }
 
     /**
@@ -497,20 +518,26 @@ public class PrecisionScheduler {
      * 长延迟 Intent 进入 CohortManager（批量唤醒），短延迟直接入桶。
      */
     public void restore(Intent intent) {
-        if (intent == null || intent.getExecuteAt() == null || intent.getStatus().isTerminal()) {
+        if (intent == null || intent.getExecuteAt() == null) {
             return;
         }
+        // I5: synchronized + 终态复查 -- cancel 可能在锁释放与 restore() 之间发生
+        synchronized (intent) {
+            if (intent.getStatus().isTerminal()) {
+                logger.debug("Skipping restore for terminal intent {}", intent.getIntentId());
+                return;
+            }
+            long delayMs = Duration.between(Instant.now(), intent.getExecuteAt()).toMillis();
+            PrecisionTier tier = intent.getPrecisionTier();
+            long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
 
-        long delayMs = Duration.between(Instant.now(), intent.getExecuteAt()).toMillis();
-        PrecisionTier tier = intent.getPrecisionTier();
-        long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
-
-        if (delayMs > precisionWindowMs) {
-            cohortManager.register(intent);
-        } else {
-            bucketGroupManager.add(intent);
+            if (delayMs > precisionWindowMs) {
+                cohortManager.register(intent);
+            } else {
+                bucketGroupManager.add(intent);
+            }
+            indexIntent(intent);
         }
-        indexIntent(intent);
     }
 
     /**
@@ -617,7 +644,12 @@ public class PrecisionScheduler {
                         metrics.incrementBackpressureEvent(tier);
                         logger.error("CRITICAL: Backpressure — dispatch queue full for tier {}, requeuing intent {} for next scan cycle",
                             tier, intent.getIntentId());
-                        notifyObservers(o -> o.onDeliveryFailed(intent,
+                        // I5: 快照在锁内取，dispatch 在锁外
+                        final Intent bpSnapshot;
+                        synchronized (intent) {
+                            bpSnapshot = intent.copy();
+                        }
+                        notifyObservers(o -> o.onDeliveryFailed(bpSnapshot,
                             new com.loomq.common.exception.BackPressureException(
                                 "Dispatch queue full for tier " + tier, null, 1000)));
                         // 重新放回调度结构等待下次 scan cycle（intent 仍为 SCHEDULED 状态，无需回退）
@@ -1129,6 +1161,8 @@ public class PrecisionScheduler {
      * @implNote 维护 I2/I3：过期终态落盘，防止恢复时被改写。
      */
     private void handleExpired(Intent intent) {
+        // I5: collect-then-defer -- 锁内取快照，锁外派发
+        java.util.function.Consumer<IntentObserver> deferredNotify = null;
         synchronized (intent) {
             unindexIntent(intent.getIntentId(), executeAtMs(intent));
             logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
@@ -1144,8 +1178,12 @@ public class PrecisionScheduler {
             intentStore.update(intent);
             persistStateChange(intent);           // P1-1
 
-            // Notify AFTER transition so observers see the terminal state
-            notifyObservers(o -> o.onExpired(intent));
+            final Intent snapshot = intent.copy();
+            deferredNotify = o -> o.onExpired(snapshot);
+        }
+        // I5: onExpired 在锁外派发
+        if (deferredNotify != null) {
+            notifyObservers(deferredNotify);
         }
     }
 
@@ -1158,6 +1196,9 @@ public class PrecisionScheduler {
      */
     private void finalizeIntent(Intent intent, PrecisionTier tier, DeliveryResult result) {
         long startTime = System.nanoTime();
+        // I5: collect-then-defer -- 锁内取快照 + 收集 deferred action，锁外派发
+        java.util.function.Consumer<IntentObserver> deferredNotify = null;
+        boolean needReschedule = false;
         try {
             synchronized (intent) {
                 // 内存中状态转换（不持久化 — 终态才做一次 upsert）
@@ -1179,12 +1220,15 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.ACKED);
                         intentStore.update(intent);
                         persistStateChange(intent);           // P1-1: incrementRevision + DURABLE write
-                        notifyObservers(o -> o.onDelivered(intent, finalResult));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         // Trace: record acked
                         traceStore.recordAcked(intent.getIntentId());
                         traceStore.updateStatus(intent.getIntentId(), IntentStatus.ACKED);
                         logger.debug("Intent {} delivered successfully", intent.getIntentId());
+                        {
+                            final Intent snapshot = intent.copy();
+                            deferredNotify = o -> o.onDelivered(snapshot, finalResult);
+                        }
                         break;
 
                     case RETRY: {
@@ -1202,7 +1246,8 @@ public class PrecisionScheduler {
                         // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
                         persistStateChange(intent);
                         unindexIntent(intent.getIntentId(), oldExecuteAtMs);
-                        schedule(intent);
+                        // I5: schedule() 移到锁外 (deferred)
+                        needReschedule = true;
                         break;
                     }
 
@@ -1210,20 +1255,34 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.DEAD_LETTERED);
                         intentStore.update(intent);
                         persistStateChange(intent);           // P1-1
-                        notifyObservers(o -> o.onDeadLettered(intent));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.warn("Intent {} dead-lettered", intent.getIntentId());
+                        {
+                            final Intent snapshot = intent.copy();
+                            deferredNotify = o -> o.onDeadLettered(snapshot);
+                        }
                         break;
 
                     case EXPIRED:
                         intent.transitionTo(IntentStatus.EXPIRED);
                         intentStore.update(intent);
                         persistStateChange(intent);           // P1-1
-                        notifyObservers(o -> o.onExpired(intent));
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.info("Intent {} expired", intent.getIntentId());
+                        {
+                            final Intent snapshot = intent.copy();
+                            deferredNotify = o -> o.onExpired(snapshot);
+                        }
                         break;
                 }
+            }
+            // I5: 观察器通知在锁外派发
+            if (deferredNotify != null) {
+                notifyObservers(deferredNotify);
+            }
+            // I5: schedule() 在锁外调用 (schedule() 有自己的 synchronized + 终态检查)
+            if (needReschedule) {
+                schedule(intent);
             }
         } finally {
             long durationMs = (System.nanoTime() - startTime) / 1_000_000;
@@ -1238,6 +1297,9 @@ public class PrecisionScheduler {
      * @implNote 维护 I2/I3：死信终态落盘；重试路径 persistStateChange 递增 revision。
      */
     private void handleDeliveryFailure(Intent intent) {
+        // I5: collect-then-defer -- 锁内取快照 + 收集 deferred action，锁外派发
+        java.util.function.Consumer<IntentObserver> deferredNotify = null;
+        boolean needReschedule = false;
         synchronized (intent) {
             int maxAttempts = intent.getRedelivery() != null
                 ? intent.getRedelivery().getMaxAttempts()
@@ -1252,8 +1314,11 @@ public class PrecisionScheduler {
                 intentStore.update(intent);
                 persistStateChange(intent);           // P1-1
                 unindexIntent(intent.getIntentId(), executeAtMs(intent));
-                notifyObservers(o -> o.onDeadLettered(intent));
                 logger.warn("Intent dead-lettered after max attempts: id={}", intent.getIntentId());
+                {
+                    final Intent snapshot = intent.copy();
+                    deferredNotify = o -> o.onDeadLettered(snapshot);
+                }
             } else {
                 long oldExecuteAtMs = executeAtMs(intent);
                 long delayMs = intent.getRedelivery() != null
@@ -1267,8 +1332,17 @@ public class PrecisionScheduler {
                 // Fix 6: 重排程落盘,见 finalizeIntent RETRY 分支同款说明
                 persistStateChange(intent);
                 unindexIntent(intent.getIntentId(), oldExecuteAtMs);
-                schedule(intent);
+                // I5: schedule() 移到锁外 (deferred)
+                needReschedule = true;
             }
+        }
+        // I5: 观察器通知在锁外派发
+        if (deferredNotify != null) {
+            notifyObservers(deferredNotify);
+        }
+        // I5: schedule() 在锁外调用
+        if (needReschedule) {
+            schedule(intent);
         }
     }
 

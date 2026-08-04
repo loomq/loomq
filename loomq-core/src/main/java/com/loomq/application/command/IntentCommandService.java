@@ -327,6 +327,7 @@ public final class IntentCommandService {
             return Optional.empty();
         }
 
+        boolean reschedule = false;
         try {
             synchronized (intent) {
                 if (intent.getStatus().isTerminal()) {
@@ -334,7 +335,7 @@ public final class IntentCommandService {
                     return Optional.of(intent);
                 }
                 Instant oldExecuteAt = intent.getExecuteAt();
-                boolean reschedule = newExecuteAt != null && !newExecuteAt.equals(oldExecuteAt);
+                reschedule = newExecuteAt != null && !newExecuteAt.equals(oldExecuteAt);
 
                 if (reschedule) {
                     // P1-5: 只对可调度状态(SCHEDULED/DUE)执行 removeFromSchedule。
@@ -386,13 +387,15 @@ public final class IntentCommandService {
                 intent.incrementRevision();
                 persistIntentState(intent, AckMode.DURABLE);
                 intentStore.update(intent);
-
-                if (reschedule) {
-                    if (intent.getStatus() == IntentStatus.DUE) {
-                        scheduler.restore(intent);
-                    } else {
-                        scheduler.schedule(intent);
-                    }
+                // I5: schedule/restore 移到锁外 (deferred)
+                // -- schedule() 有自己的 synchronized + 终态检查
+            }
+            // I5: schedule/restore 在锁外调用
+            if (reschedule) {
+                if (intent.getStatus() == IntentStatus.DUE) {
+                    scheduler.restore(intent);
+                } else {
+                    scheduler.schedule(intent);
                 }
             }
             return Optional.of(intent);
@@ -434,6 +437,7 @@ public final class IntentCommandService {
         Instant oldUpdatedAt = null;
         long oldRevision = 0;
         try {
+            Intent callbackSnapshot = null;
             synchronized (intent) {
                 // 在 transitionTo 之前记录原始状态，用于回滚。
                 oldStatus = intent.getStatus();
@@ -453,11 +457,16 @@ public final class IntentCommandService {
                 persistIntentState(intent, AckMode.DURABLE);
                 intentStore.update(intent);
                 locationIndex.remove(intentId);  // 终态 Intent 不保留索引(桶回收依赖)
+                // I5: 锁内取快照，锁外派发
+                callbackSnapshot = intent.copy();
             }
 
             // 在 synchronized 块外派发回调——回滚窗口已关闭，
             // callback 异常（如 RejectedExecutionException）不会触发状态回滚。
-            dispatchCallback(intent, CallbackHandler.EventType.CANCELLED, null);
+            // I5: 传递防御性快照，用户代码无法触达内核活状态
+            if (callbackSnapshot != null) {
+                dispatchCallback(callbackSnapshot, CallbackHandler.EventType.CANCELLED, null);
+            }
 
             metricsCollector.incrementIntentsCancelled();
             logger.info("Intent cancelled: id={}", intentId);
@@ -597,7 +606,7 @@ public final class IntentCommandService {
                     intent.incrementRevision();
                     persistIntentState(intent, AckMode.DURABLE);
                     intentStore.update(intent);
-                    scheduler.restore(intent);
+                    // I5: restore 移到锁外 (deferred)
                 } else {
                     // 已被 scanDue CAS 认领（索引条目已消耗），在途投递即为 fireNow 的效果。
                     // 不改写 executeAt/revision、不落盘 SCHEDULED@now：消除重复投递（in-flight
@@ -606,6 +615,10 @@ public final class IntentCommandService {
                     logger.debug("fireNow: intent {} already claimed by scanDue; in-flight delivery serves as fire-now",
                         intentId);
                 }
+            }
+            // I5: restore 在锁外调用 (restore() 有终态检查)
+            if (wasScheduled) {
+                scheduler.restore(intent);
             }
 
             logger.info(wasScheduled
