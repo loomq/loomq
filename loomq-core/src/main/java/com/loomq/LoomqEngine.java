@@ -213,6 +213,9 @@ public class LoomqEngine implements AutoCloseable {
      * 启动引擎
      */
     public void start() {
+        if (closed.get()) {
+            throw new IllegalStateException("Engine has been closed and cannot be restarted");
+        }
         if (!started.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is already running");
         }
@@ -269,8 +272,7 @@ public class LoomqEngine implements AutoCloseable {
      */
     @Override
     public void close() throws Exception {
-        if (!started.get()) return;                      // fast path: never started or already closed
-        if (!closed.compareAndSet(false, true)) return;  // 并发首次关闭守卫
+        if (!closed.compareAndSet(false, true)) return;  // 并发首次关闭守卫（唯一门控）
 
         running.set(false);
         started.set(false);

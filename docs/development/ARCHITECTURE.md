@@ -185,6 +185,7 @@ stateDiagram-v2
 - 槽格式（`SlotCodec`）：`status(1) | revision(8) | CRC32(4) | executeAt(8) | idLen(1) | intentId(≤24B) | payload(≤210B)`。CRC 覆盖 revision 之后的字节，撕裂写可检出并跳过。
 - **Append-only**：`alloc()` 用 `AtomicInteger` 无锁分槽，每次写入（含状态变更）都分配新槽，旧槽残留；启动时 `recoverHighWaterMark()` 扫首个空槽恢复 `next`，防重启覆写。同一 intentId 的多版本由恢复时按 **max revision 去重**裁决。
 - 底层使用 Java FFM API（`Arena.ofShared()` + `MemorySegment`）做 mmap；`forceDirty()` 只对"写计数 > 已刷计数"的脏桶 `seg.force()`。
+- **终态记录语义**：wheel 是"当前真相"而非"投递历史"。在途期间 update 内容后，终态落盘记录携带的是最新内容而非首轮投递内容。append-only 模型下旧槽残留由 recovery 按 max revision 去重，不构成投递历史。
 
 ### 5.2 TailIndex —— 超视界尾区
 

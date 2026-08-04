@@ -309,10 +309,9 @@ public final class IntentCommandService {
      * 更新 Intent（可选改期）。
      *
      * <p><b>与在途投递的竞态语义：</b>若 scanDue 已 CAS 认领该 Intent（投递在途），
-     * 本方法仍会应用 updater 的变更并 DURABLE 持久化，但<b>不重排程</b>。本次在途
-     * 投递携带的内容无确定保证（可能为旧值或新值）；更新只在投递失败后的重试路径
-     * 或崩溃恢复（max-revision 胜者）中确定生效。依赖"更新后的内容必须被投递"的
-     * 调用方应在投递完成后二次确认。</p>
+     * 本方法仍会应用 updater 的变更并 DURABLE 持久化，但<b>不重排程</b>。首轮投递
+     * 携带派发时刻的内容快照（更新前）；若投递失败重试，重投携带最新持久化内容
+     * （更新后）。更新在重试路径或崩溃恢复（max-revision 胜者）中确定生效。</p>
      *
      * @param intentId     待更新 Intent ID
      * @param updater      变更消费者（在 synchronized(intent) 内执行）
@@ -408,6 +407,10 @@ public final class IntentCommandService {
      *
      * <p><b>语义：best-effort。</b>取消操作对于已进入投递流程（DISPATCHING）的 Intent 无效--
      * 异步投递可能已完成，事件可能已到达下游。调用方必须确保下游处理逻辑的幂等性。</p>
+     *
+     * <p><b>与投递快照的交互：</b>DeliveryHandler 收到的是派发时刻快照，其 status 反映
+     * 派发时刻值。若 cancel 在快照之后到达，handler 不会观察到 CANCELED 状态--
+     * 取消感知须由下游幂等承担（本就是 best-effort 契约）。</p>
      *
      * <p>对于热 Intent（在内存 store 中）：经 synchronized(intent) 串行化状态迁移，
      * 成功则 removeFromSchedule + DURABLE 落盘 CANCELED 终态。</p>

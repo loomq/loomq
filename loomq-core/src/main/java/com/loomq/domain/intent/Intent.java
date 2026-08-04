@@ -239,11 +239,14 @@ public class Intent {
     }
 
     /**
-     * 创建当前 Intent 的独立副本。
+     * 创建当前 Intent 的独立副本（I5 边界不变量）。
      *
-     * 写路径会先在内存中生成最终快照，再提交到日志，避免直接
-     * 修改 store 中的当前态对象。
+     * <p>快照用于 SPI 边界传递（DeliveryHandler），确保用户代码无法持有或变异内核活状态。
+     * 禁止将快照用于结算、调度或状态迁移路径--结算必须作用于 store 中的活对象。</p>
+     *
+     * <p>写路径亦先用本方法生成最终快照，再提交到日志，避免直接修改 store 中的当前态对象。</p>
      */
+    // TODO: 后续 PR 覆盖 IntentObserver / CallbackHandler
     public Intent copy() {
         return restore(
             traceId,

@@ -701,7 +701,7 @@ public class PrecisionScheduler {
 
     /**
      * 单 Intent 消费循环（batchSize == 1）。
-     * 与原始实现完全一致：acquire → poll(1) → deliver → release in callback。
+     * 流程：acquire → poll(1) → I5 快照(synchronized+copy) → deliver(snapshot) → release in callback。
      */
     private void runSingleIntentConsumer(PrecisionTier tier, BlockingQueue<Intent> queue) {
         while (running) {
@@ -727,13 +727,17 @@ public class PrecisionScheduler {
                 continue;
             }
 
-            // Fix 3: 终态复查——已取消/已过期/已死信的 Intent 不再投递。
-            // scan 入队与 cancel 之间有竞态(cancel 只清 bucket+cohort,不清 dispatch 队列),
-            // 过期扫描也会把 EXPIRED 副本留在队列里。这里加 guard 杜绝 ghost 投递。
-            if (intent.getStatus().isTerminal()) {
-                enqueueTimeNanos.remove(intent.getIntentId());
-                releasePermit(tier, acquired);
-                continue;
+            // I5: 派发即快照——在 synchronized(intent) 内原子完成终态复查 + 防御性拷贝。
+            // 快照与 cancel/update 互斥：要么取自变更前的完整状态，要么复查拦截（不投递）。
+            // 撕裂读在结构上消除；SPI 边界只过快照，用户代码无法触达内核活状态。
+            Intent snapshot;
+            synchronized (intent) {
+                if (intent.getStatus().isTerminal()) {
+                    enqueueTimeNanos.remove(intent.getIntentId());
+                    releasePermit(tier, acquired);
+                    continue;
+                }
+                snapshot = intent.copy();
             }
 
             // Trace: record dequeued (right after pollFirst, before any other processing)
@@ -750,7 +754,7 @@ public class PrecisionScheduler {
 
             long deliverStartNs = System.nanoTime();
             try {
-                deliveryHandler.deliverAsync(intent)
+                deliveryHandler.deliverAsync(snapshot)
                     .orTimeout(DELIVERY_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                     .whenComplete((result, ex) -> {
                         long releaseNs = System.nanoTime();
@@ -784,10 +788,11 @@ public class PrecisionScheduler {
      *
      * 流程：
      * 1. drainTo(batch, batchSize) — 一次性取出最多 batchSize 个 intent
-     * 2. 若队列为空，timed poll(batchWindowMs) 等首个 intent，再 drain 剩余
-     * 3. 为每个 intent acquire 一个信号量 permit
-     * 4. 调用 deliverBatchAsync(batch)
-     * 5. 在回调中释放所有 permit + finalize
+     * 2. 若队列为空，poll 等首个 intent，再 drain 剩余
+     * 3. I5: synchronized(intent) 终态复查 + copy, 构建 liveBatch + snapshotBatch
+     * 4. 为 liveBatch 中每个 intent acquire 一个信号量 permit
+     * 5. 调用 deliverBatchAsync(snapshotBatch)
+     * 6. 在回调中释放所有 permit + finalize(liveBatch)
      */
     private void runBatchDrainConsumer(PrecisionTier tier, BlockingQueue<Intent> queue,
                                        int batchSize, int batchWindowMs) {
@@ -815,23 +820,30 @@ public class PrecisionScheduler {
                 queue.drainTo(batch, batchSize - batch.size());
             }
 
-            // Fix 3: 终态复查——批内已取消/过期/死信的 intent 直接剔除(连同过期索引残留)。
-            // cancel 只清 bucket+cohort,不清 tierDispatchQueues;过期扫描也会留 EXPIRED 副本。
-            if (batch.removeIf(intent -> {
-                if (intent.getStatus().isTerminal()) {
-                    enqueueTimeNanos.remove(intent.getIntentId());
-                    return true;
+            // I5: 派发即快照--在 synchronized(intent) 内原子完成终态复查 + 防御性拷贝。
+            // 构建 liveBatch（结算用活对象）和 snapshotBatch（SPI 用快照）并行列表。
+            // 许可获取在确定非终态数量之后，同时修掉“先申请再剥除终态”的 permit 临时过配问题。
+            List<Intent> liveBatch = new ArrayList<>(batch.size());
+            List<Intent> snapshotBatch = new ArrayList<>(batch.size());
+            for (Intent intent : batch) {
+                synchronized (intent) {
+                    if (intent.getStatus().isTerminal()) {
+                        enqueueTimeNanos.remove(intent.getIntentId());
+                        continue;
+                    }
+                    liveBatch.add(intent);
+                    snapshotBatch.add(intent.copy());
                 }
-                return false;
-            }) && batch.isEmpty()) {
+            }
+            if (liveBatch.isEmpty()) {
                 continue;
             }
 
-            // Phase 3: acquire permits for the batch
-            List<ResizableSemaphore> acquiredPermits = new ArrayList<>(batch.size());
+            // Phase 3: acquire permits for liveBatch (non-terminal count)
+            List<ResizableSemaphore> acquiredPermits = new ArrayList<>(liveBatch.size());
             long acquireStartNs = System.nanoTime();
             try {
-                for (int i = 0; i < batch.size(); i++) {
+                for (int i = 0; i < liveBatch.size(); i++) {
                     acquiredPermits.add(acquireWithBorrow(tier));
                 }
             } catch (InterruptedException e) {
@@ -844,8 +856,8 @@ public class PrecisionScheduler {
             }
             long acquireEndNs = System.nanoTime();
 
-            // Trace: record dequeued for each intent
-            for (Intent intent : batch) {
+            // Trace: record dequeued for each intent (内核内部操作，用活对象)
+            for (Intent intent : liveBatch) {
                 traceStore.recordDequeued(intent.getIntentId());
                 recordDispatchQueueLag(intent, tier);
             }
@@ -855,18 +867,18 @@ public class PrecisionScheduler {
 
             // Fix 5: 批量在途计数
             AtomicInteger inFlight = tierInFlight.get(tier);
-            for (int i = 0; i < batch.size(); i++) inFlight.incrementAndGet();
+            for (int i = 0; i < liveBatch.size(); i++) inFlight.incrementAndGet();
 
-            // Phase 4: batch delivery — Fix 4: per-future 独立结算,一条失败不连坐整批。
-            // 原 allOf 聚合异常会让 49 条已成功的 intent 被整批重投→下游收重复事件。
+            // Phase 4: batch delivery - Fix 4: per-future 独立结算,一条失败不连坐整批。
+            // I5: deliverBatchAsync 收到 snapshotBatch（快照），finalize 用 liveBatch（活对象）。
             long deliverStartNs = System.nanoTime();
             List<CompletableFuture<DeliveryHandler.DeliveryResult>> futures;
             try {
-                futures = deliveryHandler.deliverBatchAsync(batch);
+                futures = deliveryHandler.deliverBatchAsync(snapshotBatch);
             } catch (RuntimeException deliverEx) {
-                // P1-9: SPI 同步抛异常——按失败结算每个 intent,消费者继续存活
-                for (int i = 0; i < batch.size(); i++) {
-                    Intent intent = batch.get(i);
+                // P1-9: SPI 同步抛异常--按失败结算每个 intent,消费者继续存活
+                for (int i = 0; i < liveBatch.size(); i++) {
+                    Intent intent = liveBatch.get(i);
                     releasePermit(tier, acquiredPermits.get(i));
                     submitFinalize(intent, tier, () -> handleDeliveryException(intent, tier, deliverEx));
                 }
@@ -874,9 +886,9 @@ public class PrecisionScheduler {
                 continue;
             }
             if (futures == null) {
-                // SPI returned null instead of throwing — treat entire batch as failures
-                for (int i = 0; i < batch.size(); i++) {
-                    Intent intent = batch.get(i);
+                // SPI returned null instead of throwing - treat entire batch as failures
+                for (int i = 0; i < liveBatch.size(); i++) {
+                    Intent intent = liveBatch.get(i);
                     releasePermit(tier, acquiredPermits.get(i));
                     submitFinalize(intent, tier, () -> handleDeliveryException(intent, tier,
                         new IllegalStateException("deliverBatchAsync returned null")));
@@ -884,12 +896,12 @@ public class PrecisionScheduler {
                 permitTimingStats.totalDeliverAsyncNanos.addAndGet(System.nanoTime() - deliverStartNs);
                 continue;
             }
-            if (futures.size() != batch.size()) {
+            if (futures.size() != liveBatch.size()) {
                 logger.error("deliverBatchAsync returned {} futures for batch of {}; missing futures treated as failures",
-                    futures.size(), batch.size());
+                    futures.size(), liveBatch.size());
             }
-            for (int i = 0; i < batch.size(); i++) {
-                final Intent intent = batch.get(i);
+            for (int i = 0; i < liveBatch.size(); i++) {
+                final Intent intent = liveBatch.get(i);
                 final ResizableSemaphore permit = acquiredPermits.get(i);
                 CompletableFuture<DeliveryHandler.DeliveryResult> f =
                     i < futures.size() ? futures.get(i) : null;
