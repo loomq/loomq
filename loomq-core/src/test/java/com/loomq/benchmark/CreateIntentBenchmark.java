@@ -52,6 +52,8 @@ class CreateIntentBenchmark {
 
             System.out.printf("[Benchmark] createIntent DURABLE: %d intents in %dms (%.1f QPS)%n",
                 count, elapsedMs, qps);
+            System.out.printf("RESULT|create|batch=single|count=%d|ms=%d|qps=%.0f%n",
+                count, elapsedMs, qps);
 
             assertTrue(elapsedMs > 0, "elapsed time must be positive");
             assertTrue(qps > 0, "QPS must be positive");
@@ -79,6 +81,8 @@ class CreateIntentBenchmark {
             double qps = count * 1000.0 / elapsedMs;
 
             System.out.printf("[Benchmark] createIntents batch DURABLE: %d intents in %dms (%.1f QPS)%n",
+                count, elapsedMs, qps);
+            System.out.printf("RESULT|create|batch=batch|count=%d|ms=%d|qps=%.0f%n",
                 count, elapsedMs, qps);
 
             assertTrue(elapsedMs > 0);

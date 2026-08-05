@@ -54,6 +54,21 @@ class PrecisionLatencyBenchmark {
         measurePrecision(tmp, PrecisionTier.FAST);
     }
 
+    @Test
+    void measurePrecision_High(@TempDir Path tmp) throws Exception {
+        measurePrecision(tmp, PrecisionTier.HIGH);
+    }
+
+    @Test
+    void measurePrecision_Standard(@TempDir Path tmp) throws Exception {
+        measurePrecision(tmp, PrecisionTier.STANDARD);
+    }
+
+    @Test
+    void measurePrecision_Economy(@TempDir Path tmp) throws Exception {
+        measurePrecision(tmp, PrecisionTier.ECONOMY);
+    }
+
     private void measurePrecision(Path tmp, PrecisionTier tier) throws Exception {
         try (LoomqEngine engine = LoomqEngine.builder()
                 .dataDir(tmp).nodeId("prec-" + tier.name())

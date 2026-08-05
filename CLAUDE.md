@@ -26,11 +26,11 @@ mvn test -Pfull-tests          # everything including slow/benchmark
 mvn test -Dtest=ClassName      # single test class
 mvn test -Dtest=ClassName#methodName  # single test method
 
-# Run benchmark suite (Excel + MD reports)
-benchmark\benchmark.bat                  # Windows full suite
-benchmark\benchmark.bat --quick          # quick validation
-benchmark\benchmark.bat --stress         # full + stress sweep
+# Run benchmark suite (MD reports)
+benchmark\scripts\benchmark.ps1          # Windows full suite
+benchmark\scripts\benchmark.ps1 -Quick   # quick validation
 ./benchmark/scripts/benchmark.sh         # Linux/macOS
+./benchmark/scripts/benchmark.sh --quick # quick validation
 
 # Pre-push gate (same checks CI runs)
 make check                     # check-format + test
