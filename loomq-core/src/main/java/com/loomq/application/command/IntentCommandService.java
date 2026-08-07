@@ -705,11 +705,20 @@ public final class IntentCommandService {
     }
 
     /**
-     * 状态变更持久化的公开入口(供 PrecisionScheduler 的重试重排程经 LoomqEngine 注入调用)。
-     * 恒 DURABLE:重排程是新的调度承诺,必须落盘。
+     * 状态变更持久化的 "put-only" 入口（供 PrecisionScheduler 在 synchronized(intent) 内调用）。
+     * 仅写 PHTW + 索引（非阻塞 mmap），不 awaitCommit——持久化等待由调度器在锁外调用
+     * {@link #awaitDurableCommit()} 完成，避免 VT 在 synchronized 内 park 导致 carrier pinning。
      */
-    public void persistStateChange(Intent intent) {
-        persistIntentState(intent, AckMode.DURABLE);
+    public void persistStateChangePutOnly(Intent intent) {
+        persistToWheel(intent, false);   // durable=false → 跳过 awaitCommit，仅 put
+    }
+
+    /**
+     * 阻塞到覆盖最近一次 put 的 group-commit frontier 落盘。
+     * 安全地在 synchronized(intent) 之外调用（此时 VT 可正常 unmount，不 pin carrier）。
+     */
+    public void awaitDurableCommit() {
+        commitBarrier.awaitCommit();
     }
 
     private void ensureRunning() {

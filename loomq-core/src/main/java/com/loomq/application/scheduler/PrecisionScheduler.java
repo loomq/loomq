@@ -39,7 +39,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.LockSupport;
-import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -97,7 +96,7 @@ public class PrecisionScheduler {
      * 重试重排程是新的调度承诺而非中间态：必须落盘，否则崩溃恢复看到的是
      * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。
      */
-    private volatile Consumer<Intent> stateChangePersister;
+    private volatile StateChangeSink stateChangeSink;
 
     // 档位级有界队列（容量 = maxConcurrency × 4，满时触发 backpressure）
     private final Map<PrecisionTier, BlockingQueue<Intent>> tierDispatchQueues;
@@ -1192,21 +1191,31 @@ public class PrecisionScheduler {
         }
     }
 
-    /** 注入状态变更持久化钩子(接到 IntentCommandService 的 DURABLE 落盘)。 */
-    public void setStateChangePersister(Consumer<Intent> persister) {
-        this.stateChangePersister = persister;
+    /** 注入状态变更持久化通道(接到 IntentCommandService 的 DURABLE 落盘)。 */
+    public void setStateChangeSink(StateChangeSink sink) {
+        this.stateChangeSink = sink;
     }
 
     /**
-     * 状态变更持久化(I3 不变量收口):revision 递增 + DURABLE 落盘。
+     * 状态变更持久化(I3 不变量收口):revision 递增 + 非阻塞 put。
      * 所有调用方只需调此方法,revision 递增由本方法统一负责,
      * 杜绝未来调用方遗忘递增导致 recovery 去重失效。
+     * 须在 synchronized(intent) 内调用以维持 I2/I3 原子性;阻塞的持久化等待
+     * 由 {@link #awaitStateChangeCommit()} 在锁外完成,避免 VT 在锁内 pin carrier。
      */
     private void persistStateChange(Intent intent) {
         intent.incrementRevision();
-        Consumer<Intent> p = stateChangePersister;
-        if (p != null) {
-            p.accept(intent);
+        StateChangeSink s = stateChangeSink;
+        if (s != null) {
+            s.persist(intent);   // 仅非阻塞 put；阻塞等待由 awaitStateChangeCommit 在锁外完成
+        }
+    }
+
+    /** 阻塞到最近一次 persistStateChange 的 put 落盘；须在 synchronized(intent) 之外调用。 */
+    private void awaitStateChangeCommit() {
+        StateChangeSink s = stateChangeSink;
+        if (s != null) {
+            s.awaitCommit();
         }
     }
 
@@ -1299,6 +1308,7 @@ public class PrecisionScheduler {
     private void handleExpired(Intent intent) {
         // I5: collect-then-defer -- 锁内取快照，锁外派发
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
+        boolean persisted = false;
         synchronized (intent) {
             unindexIntent(intent.getIntentId(), executeAtMs(intent));
             logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
@@ -1313,11 +1323,16 @@ public class PrecisionScheduler {
             }
             intentStore.update(intent);
             persistStateChange(intent);           // P1-1
+            persisted = true;
 
             if (!observers.isEmpty()) {
                 final Intent snapshot = intent.copy();
                 deferredNotify = o -> o.onExpired(snapshot);
             }
+        }
+        // 持久化等待移到锁外：VT 在此正常 unmount，避免在 synchronized 内 park 而 pin carrier。
+        if (persisted) {
+            awaitStateChangeCommit();
         }
         // I5: onExpired 在锁外派发
         if (deferredNotify != null) {
@@ -1337,6 +1352,7 @@ public class PrecisionScheduler {
         // I5: collect-then-defer -- 锁内取快照 + 收集 deferred action，锁外派发
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         boolean needReschedule = false;
+        boolean persisted = false;
         try {
             synchronized (intent) {
                 // 内存中状态转换（不持久化 — 终态才做一次 upsert）
@@ -1357,7 +1373,8 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.DELIVERED);
                         intent.transitionTo(IntentStatus.ACKED);
                         intentStore.update(intent);
-                        persistStateChange(intent);           // P1-1: incrementRevision + DURABLE write
+                        persistStateChange(intent);           // P1-1: incrementRevision + non-blocking put; DURABLE await deferred to awaitStateChangeCommit() (outside lock)
+                        persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         // Trace: record acked
                         traceStore.recordAcked(intent.getIntentId());
@@ -1383,6 +1400,7 @@ public class PrecisionScheduler {
                         // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
                         // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
                         persistStateChange(intent);
+                        persisted = true;
                         unindexIntent(intent.getIntentId(), oldExecuteAtMs);
                         // I5: schedule() 移到锁外 (deferred)
                         needReschedule = true;
@@ -1393,6 +1411,7 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.DEAD_LETTERED);
                         intentStore.update(intent);
                         persistStateChange(intent);           // P1-1
+                        persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.warn("Intent {} dead-lettered", intent.getIntentId());
                         if (!observers.isEmpty()) {
@@ -1405,6 +1424,7 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.EXPIRED);
                         intentStore.update(intent);
                         persistStateChange(intent);           // P1-1
+                        persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.info("Intent {} expired", intent.getIntentId());
                         if (!observers.isEmpty()) {
@@ -1413,6 +1433,10 @@ public class PrecisionScheduler {
                         }
                         break;
                 }
+            }
+            // 持久化等待移到锁外：VT 在此正常 unmount，避免在 synchronized 内 park 而 pin carrier。
+            if (persisted) {
+                awaitStateChangeCommit();
             }
             // I5: 观察器通知在锁外派发
             if (deferredNotify != null) {
@@ -1438,6 +1462,7 @@ public class PrecisionScheduler {
         // I5: collect-then-defer -- 锁内取快照 + 收集 deferred action，锁外派发
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         boolean needReschedule = false;
+        boolean persisted = false;
         synchronized (intent) {
             int maxAttempts = intent.getRedelivery() != null
                 ? intent.getRedelivery().getMaxAttempts()
@@ -1451,6 +1476,7 @@ public class PrecisionScheduler {
                 intent.transitionTo(IntentStatus.DEAD_LETTERED);
                 intentStore.update(intent);
                 persistStateChange(intent);           // P1-1
+                persisted = true;
                 unindexIntent(intent.getIntentId(), executeAtMs(intent));
                 logger.warn("Intent dead-lettered after max attempts: id={}", intent.getIntentId());
                 if (!observers.isEmpty()) {
@@ -1469,10 +1495,15 @@ public class PrecisionScheduler {
                 intentStore.update(intent);
                 // Fix 6: 重排程落盘,见 finalizeIntent RETRY 分支同款说明
                 persistStateChange(intent);
+                persisted = true;
                 unindexIntent(intent.getIntentId(), oldExecuteAtMs);
                 // I5: schedule() 移到锁外 (deferred)
                 needReschedule = true;
             }
+        }
+        // 持久化等待移到锁外：VT 在此正常 unmount，避免在 synchronized 内 park 而 pin carrier。
+        if (persisted) {
+            awaitStateChangeCommit();
         }
         // I5: 观察器通知在锁外派发
         if (deferredNotify != null) {
@@ -1482,6 +1513,20 @@ public class PrecisionScheduler {
         if (needReschedule) {
             schedule(intent);
         }
+    }
+
+    /**
+     * 状态变更持久化通道：把"非阻塞 put"与"阻塞等待落盘"分离，使调度器可在
+     * synchronized(intent) 内只做 put、在锁外 awaitCommit（VT 不再 pin carrier）。
+     *
+     * <p>根因：VT 在 synchronized 块内 park 无法 unmount，会 pin 住 carrier；把阻塞的
+     * awaitCommit 移到锁外，VT 在 LockSupport.park 上正常 unmount。</p>
+     */
+    public interface StateChangeSink {
+        /** 非阻塞：写 PHTW + 索引，不等待落盘。须在 synchronized(intent) 内调用以保持 I2/I3 原子性。 */
+        void persist(Intent intent);
+        /** 阻塞到持久化完成；仅在 synchronized(intent) 之外调用（VT 可正常 unmount）。 */
+        void awaitCommit();
     }
 
     public static class BorrowStats {
