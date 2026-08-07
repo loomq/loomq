@@ -1,92 +1,62 @@
 package com.loomq.benchmark;
 
-import static org.junit.jupiter.api.Assertions.assertTrue;
-
 import com.loomq.LoomqEngine;
-import com.loomq.domain.intent.AckMode;
-import com.loomq.domain.intent.Intent;
-import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.*;
+import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.spi.DeliveryHandler;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-/**
- * createIntent 吞吐基准:测量批量创建 + DURABLE 落盘的 QPS。
- *
- * <p>纳入 full-tests profile(@Tag("benchmark")),不阻塞 CI fast/slow 门禁。
- */
+/** 创建吞吐稳态基准：闭环在"创建完成"上，executeAt=远未来避免投递干扰。 */
 @Tag("benchmark")
 class CreateIntentBenchmark {
 
     private static final DeliveryHandler NOOP = i ->
         CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.SUCCESS);
 
+    private static final int IN_FLIGHT = 64;
+    private static final long WINDOW_MS = 2_000;
+    private static final int WINDOWS = 5;
+
     @Test
     void measureCreateIntentThroughput(@TempDir Path tmp) throws Exception {
-        int count = 500;
-        try (LoomqEngine engine = LoomqEngine.builder()
-                .dataDir(tmp).nodeId("bench-1").deliveryHandler(NOOP).build()) {
-            engine.start();
-
-            List<CompletableFuture<Long>> futures = new ArrayList<>(count);
-            long startNs = System.nanoTime();
-
-            for (int i = 0; i < count; i++) {
-                Intent intent = new Intent();
-                intent.setExecuteAt(Instant.now().plusSeconds(30));
-                intent.setPrecisionTier(PrecisionTier.STANDARD);
-                futures.add(engine.createIntent(intent, AckMode.DURABLE));
-            }
-
-            // Wait for all
-            for (var f : futures) f.get();
-
-            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
-            double qps = count * 1000.0 / elapsedMs;
-
-            System.out.printf("[Benchmark] createIntent DURABLE: %d intents in %dms (%.1f QPS)%n",
-                count, elapsedMs, qps);
-            System.out.printf("RESULT|create|batch=single|count=%d|ms=%d|qps=%.0f%n",
-                count, elapsedMs, qps);
-
-            assertTrue(elapsedMs > 0, "elapsed time must be positive");
-            assertTrue(qps > 0, "QPS must be positive");
-        }
+        measureCreate(tmp, true);   // 单发
     }
 
     @Test
     void measureBatchCreateIntentThroughput(@TempDir Path tmp) throws Exception {
-        int count = 500;
+        measureCreate(tmp, false);  // 批量
+    }
+
+    private void measureCreate(Path tmp, boolean single) throws Exception {
+        var wheel = WheelConfig.defaultConfig().withDataDir(tmp.toString()).withSlotsPerBucket(65_536);
         try (LoomqEngine engine = LoomqEngine.builder()
-                .dataDir(tmp).nodeId("bench-2").deliveryHandler(NOOP).build()) {
+                .wheelConfig(wheel).nodeId("bench-create").deliveryHandler(NOOP).build()) {
             engine.start();
-
-            List<Intent> intents = new ArrayList<>(count);
-            for (int i = 0; i < count; i++) {
+            // 数组盒绕过闭包捕获的 definite-assignment 检查：producer 线程延迟到 run() 才启动，
+            // 故盒内引用在回调真正触发前已就绪（与 SteadyStateHarness 构造注释一致）。
+            SteadyStateHarness[] ref = new SteadyStateHarness[1];
+            SteadyStateHarness harness = new SteadyStateHarness(IN_FLIGHT, () -> {
                 Intent intent = new Intent();
-                intent.setExecuteAt(Instant.now().plusSeconds(30));
+                intent.setExecuteAt(Instant.now().plusSeconds(30));  // 远未来，不投递
                 intent.setPrecisionTier(PrecisionTier.STANDARD);
-                intents.add(intent);
-            }
-
-            long startNs = System.nanoTime();
-            engine.createIntents(intents, AckMode.DURABLE).get();
-            long elapsedMs = (System.nanoTime() - startNs) / 1_000_000;
-            double qps = count * 1000.0 / elapsedMs;
-
-            System.out.printf("[Benchmark] createIntents batch DURABLE: %d intents in %dms (%.1f QPS)%n",
-                count, elapsedMs, qps);
-            System.out.printf("RESULT|create|batch=batch|count=%d|ms=%d|qps=%.0f%n",
-                count, elapsedMs, qps);
-
-            assertTrue(elapsedMs > 0);
-            assertTrue(qps > 0);
+                if (single) {
+                    engine.createIntent(intent, AckMode.DURABLE)
+                        .whenComplete((seq, err) -> ref[0].onComplete(0));
+                } else {
+                    engine.createIntents(List.of(intent), AckMode.DURABLE)
+                        .whenComplete((seq, err) -> ref[0].onComplete(0));
+                }
+            });
+            ref[0] = harness;
+            var r = harness.run(1_000, WINDOW_MS, WINDOWS);
+            System.out.printf("RESULT|create|batch=%s|qps_median=%.0f|qps_iqr=%.0f|samples=%d%n",
+                single ? "single" : "batch", r.qpsMedian(), r.qpsIqr(), r.qpsSamples());
         }
     }
 }
