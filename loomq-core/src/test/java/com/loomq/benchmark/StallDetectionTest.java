@@ -48,8 +48,9 @@ class StallDetectionTest {
         int rounds = Integer.parseInt(System.getProperty("stall.rounds", "10"));
         int thresholdMs = Integer.parseInt(System.getProperty("stall.thresholdMs", "3000"));
         boolean expectReproduce = Boolean.parseBoolean(System.getProperty("stall.expectReproduce", "false"));
-        Path dumpDir = tmp.resolve("dumps");
-        Files.createDirectories(dumpDir);
+        Path dumpRoot = Path.of("target", "stall-dumps");
+        Files.createDirectories(dumpRoot);
+        Path dumpDir = dumpRoot;
 
         int stalls = 0;
         for (int r = 0; r < rounds; r++) {
