@@ -258,6 +258,7 @@ public final class WheelStore implements AutoCloseable {
         if (loc.inTail() || loc.slotIndex() < 0) return;
         Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
         if (b == null) return;
+        if (!SlotCodec.isOccupied(b.read(loc.slotIndex()))) return;  // 已回收槽不覆写（防复活）
         b.write(loc.slotIndex(), encoded);
     }
 
@@ -339,13 +340,17 @@ public final class WheelStore implements AutoCloseable {
             }
             return idx;
         }
-        /** 回收槽：写 status=0 空槽 + 入 free-list（供 alloc 复用）。 */
+        /** 回收槽：写 status=0 空槽 + 入 free-list（供 alloc 复用）。双重 free 防护：已空槽不重复入栈。 */
         void free(int slot) {
+            if (!SlotCodec.isOccupied(read(slot))) return;  // 双重 free 防护：已空槽不重复入栈
             write(slot, EMPTY_SLOT);
             freeList.push(slot);
         }
         void write(int slot, byte[] data) {
             long off = (long) slot * SlotCodec.SLOT_SIZE;
+            if (off + SlotCodec.SLOT_SIZE > seg.byteSize()) {  // 越界防护：与 read() 一致
+                throw new IndexOutOfBoundsException("slot " + slot + " out of bounds for bucket " + tier + "/" + bucketKey);
+            }
             Lock rl = forceLock.readLock();
             rl.lock();
             try {
