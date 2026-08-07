@@ -17,10 +17,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: oracle-actions/setup-java@v1
+      - uses: actions/setup-java@v5
         with:
-          website: jdk.java.net
-          release: 25
+          distribution: oracle
+          java-version: '25'
+          cache: maven
       - name: Check formatting
         run: mvn spotless:check
 
@@ -30,10 +31,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: oracle-actions/setup-java@v1
+      - uses: actions/setup-java@v5
         with:
-          website: jdk.java.net
-          release: 25
+          distribution: oracle
+          java-version: '25'
+          cache: maven
       - name: Fast tests
         run: mvn test
 
@@ -43,10 +45,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: oracle-actions/setup-java@v1
+      - uses: actions/setup-java@v5
         with:
-          website: jdk.java.net
-          release: 25
+          distribution: oracle
+          java-version: '25'
+          cache: maven
       - name: Slow tests
         run: mvn test -Pslow-tests
 
@@ -56,10 +59,11 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: oracle-actions/setup-java@v1
+      - uses: actions/setup-java@v5
         with:
-          website: jdk.java.net
-          release: 25
+          distribution: oracle
+          java-version: '25'
+          cache: maven
       - name: Integration tests
         run: mvn test -Pintegration-tests
 
@@ -70,10 +74,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: oracle-actions/setup-java@v1
+      - uses: actions/setup-java@v5
         with:
-          website: jdk.java.net
-          release: 25
+          distribution: oracle
+          java-version: '25'
+          cache: maven
       - name: Package
         run: mvn package -DskipTests
       - uses: actions/upload-artifact@v4
