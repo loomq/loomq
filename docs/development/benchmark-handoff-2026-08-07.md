@@ -88,40 +88,53 @@ PHTW 的 SEC 轮（1s×60）每桶固定 **1024 个 256B 定长槽**，**append-
 
 ---
 
-## 4. 延后问题 B：引擎投递偶发停顿（更紧急，建议优先）
+## 4. 问题 B：引擎投递偶发停顿 —— 已修复（2026-08-07）
 
-### 4.1 现象
+> **状态变更**：Issue B 已定位并修复。根因**不是**调度器并发竞态（下述 §4.3 原假设被证伪），而是 SEC 轮桶容量溢出打在 finalize 持久化路径上。完整证据链见 `docs/development/issue-b-rootcause-2026-08-07.md`。
+
+### 4.1 现象（原始记录）
 
 持续闭环负载下，引擎**先投递一批后卡死**，不再派发在途 intent → 死锁。可复现（约 **10/11 次停顿**；有 1 次持续跑 ~21k QPS 证明引擎本身能跑）。
 
-### 4.2 取证（本次交付基准已含的实测）
+### 4.2 取证（原始记录）
 
 - 单窗 0 = 16,193 完成；窗 1–4 = 0（`e2e_p50=2ms, p999=37ms` 证明窗 0 确有真实投递突发）
 - producer 累计提交 **48,405** 个 intent（全部 `DURABLE createIntent` 成功返回，`submitErrors=0`），但只有 ~16k 被投递
 - 之后 producer 占满全部 `inFlight`（ULTRA=200）信号量等完成事件，永不释放 → 死锁
-- 最近一次 delivery 全量：MILLI=4913、FAST=2986、STANDARD=99 正常；**ULTRA=0（本次中招）**
 
-### 4.3 疑似位置
+### 4.3 根因（2026-08-07 已确诊，原"疑似位置"已推翻）
 
-`PrecisionScheduler` 的 **adaptive/cohort 派发链路**（`adaptiveScanLoop` / `scanAndDispatch` / cohort flush → triggerScan）。**可能与 `8a5bedd refactor(scheduler): 优化调度器持久化机制避免虚拟线程挂起` 相关**（该提交是用户此前的调度器优化，涉及 finalize/awaitCommit 移出 synchronized 块）。
+**根因 = SEC 时间轮桶容量溢出（Issue A）在 `finalizeIntent` 的 `persistStateChange` 路径上抛 `SlotOverflowException`。**
 
-引擎工作区干净（用户改动已提交为 8a5bedd），停摆在**已提交**的引擎代码里。
+机制（`StallDetectionTest` 100% 复现 + `finalizeExceptionSamples` 全部为 `SlotOverflowException: bucket overflow: SEC/...`）：
+1. 每个 intent 写 SEC 桶**两次**（create 的 SCHEDULED + finalize 的 ACKED 终态），append-only 无 compaction。
+2. 投递基准 `executeAt=now+1-5ms` 落**当前秒桶**，~40k/s×2 在 ~0.8-1.6s 填满 65536 槽。
+3. 桶满后 `persistStateChange` 在 synchronized 块内抛异常 → intent 已 ACKED 但 `onDelivered` 观察器被吞 → 基准 harness 槽位永久泄漏 → producer 死锁 → 引擎整体停摆（扫描空桶 park、全档位闲置）。
+4. `withSlotsPerBucket(65536)` 解阻塞**不足**：它的"够用"只在 `CreateIntentBenchmark`（executeAt=now+30s，落远未来秒桶）下成立；投递路径落当前秒桶必然溢出。
 
-### 4.4 建议排查路径
+原 §4.3 假设（adaptive/cohort 派发链路竞态、关联 `8a5bedd`）**不成立**——8a5bedd 的 persist-split 改动本身无并发缺陷。
 
-用 systematic-debugging：
-1. 复现：`DeliveryPathBenchmark#measureDeliveryThroughput_Ultra`（`mvn test -pl loomq-core "-Dtest=DeliveryPathBenchmark#measureDeliveryThroughput_Ultra" -Dtest.excludedGroups=""`）
-2. 聚焦 adaptive 扫描器 park/unpark 与 cohort triggerScan 的竞态（lost-wakeup / 派发遗漏）
-3. 检查 `inFlight` 信号量在停摆时是否被某条路径吞掉 release（死锁判据）
+### 4.4 修复（2026-08-07，方案 A+D）
+
+- **A. 解耦 onDelivered 与终态持久化（I6 容错）**：`PrecisionScheduler.persistStateChange` 吞掉持久化失败并记录 `persistFailures` 计数，调度流程继续，`onDelivered` 必须仍触发、槽位不泄漏。独立于容量，无论容量如何都该修。
+- **D. 基准解阻塞**：`StallDetectionTest` / `DeliveryPathBenchmark` `withSlotsPerBucket` 65536→262144（当前秒桶 ~2× 余量；桶为 mmap 惰性创建，仅触碰的秒桶耗内存）。
+- **回归测试**：`FinalizePersistFailureRegressionTest`（fast-tag，进 CI）——注入恒定失败的终态持久化，断言 `onDelivered` 仍触发 + `persistFailures` 记录。
+- **验证**：`StallDetectionTest` 连续 **10 轮零停摆** + fast 306 通过；ULTRA 投递 `qps_median=24k, e2e_p50=4ms, wake_p99=2ms`（此前 qps_median=0）。
+
+### 4.5 遗留（后续 Issue A spec 接管）
+
+容量根治未做，作为后续 Issue A spec 的候选方向（见 §3.5 与 §5）：
+- **B. 终态槽 compaction**（容量跟随活跃在途而非吞吐史）
+- **C. 溢出 spill**（满桶溢出到下一层/TailIndex）
 
 ---
 
-## 5. 待决策项（新 spec 需定）
+## 5. 决策与遗留项（2026-08-07 已定）
 
-1. **引擎投递停顿（Issue B）**：是否立即立项排查修复？（用户正在做调度器优化领域，建议优先）
-2. **终态槽 compaction（Issue A Step 2）**：是否单独立项评估彻底修？
-3. **基准投递数字不可靠**：Issue B 修复前，README 基准表投递列暂不更新（创建/精度列可用）。
-4. **消费者扫参甜点**：Issue B + A 修复前，持续吞吐甜点测不到（真正瓶颈是引擎派发/桶容量，非消费者）。
+1. **引擎投递停顿（Issue B）**：✅ **已修复**（方案 A 解耦 onDelivered 与终态持久化 + D 基准解阻塞）。见 §4.4。
+2. **容量根治（Issue A）**：**延后**。候选方向 **B. 终态槽 compaction** + **C. 溢出 spill**，作为后续 Issue A spec 评估（见 §3.5、§4.5）。当前基准用 `withSlotsPerBucket(262144)` 规避。
+3. **基准投递数字**：✅ 修复后可用（ULTRA 24k QPS 等），README 投递列可更新。
+4. **消费者扫参甜点**：桶容量已解（262144），扫参可测；但注意持续吞吐仍受桶容量约束（非消费者），甜点解读需谨慎。
 
 ---
 
