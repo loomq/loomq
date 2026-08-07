@@ -3,6 +3,7 @@ package com.loomq.benchmark;
 import com.loomq.LoomqEngine;
 import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.*;
+import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.IntentObserver;
 import java.nio.file.Path;
@@ -46,8 +47,9 @@ class DeliveryPathBenchmark {
     private void runOne(Path tmp, PrecisionTier tier, PrecisionTierCatalog catalog) throws Exception {
         var profile = catalog.profile(tier);
         BenchmarkConfig cfg = BenchmarkConfig.forTier(profile.maxConcurrency());
+        var wheel = WheelConfig.defaultConfig().withDataDir(tmp.toString()).withSlotsPerBucket(65_536);
         try (LoomqEngine engine = LoomqEngine.builder()
-                .dataDir(tmp).nodeId("bench-" + tier.name())
+                .wheelConfig(wheel).nodeId("bench-" + tier.name())
                 .catalog(catalog).deliveryHandler(SUCCESS).build()) {
             engine.start();
 
