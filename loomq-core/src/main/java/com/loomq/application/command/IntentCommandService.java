@@ -12,6 +12,7 @@ import com.loomq.domain.intent.WalMode;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.SlotCodec;
 import com.loomq.infrastructure.wheel.SlotLocation;
 import com.loomq.infrastructure.wheel.TailIndex;
 import com.loomq.infrastructure.wheel.WheelStore;
@@ -77,6 +78,13 @@ public final class IntentCommandService {
      * 移除(computeIfPresent),只删自己放入的对象,避免误删后到者的锁。</p>
      */
     private final ConcurrentHashMap<String, Object> coldCancelLocks = new ConcurrentHashMap<>();
+
+    /** 曾发生第 2 次及以上槽写入的 Intent（重排程/改期/取消追加）→ 终态不回收，保留 tombstone。 */
+    private final java.util.Set<String> multiSlotIntents = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 终态原地覆写后的待回收记录：终态槽在 awaitCommit 落盘后清空。 */
+    private final java.util.Map<String, PendingReclaim> pendingReclaims = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 待回收记录：loc 为终态槽位置；singleSlot 为 true 才清空复用。 */
+    public record PendingReclaim(SlotLocation loc, boolean singleSlot) {}
 
     public IntentCommandService(
         IntentStore intentStore,
@@ -454,12 +462,16 @@ public final class IntentCommandService {
                 }
                 scheduler.removeFromSchedule(intent);
                 intent.incrementRevision();
-                persistIntentState(intent, AckMode.DURABLE);
+                persistTerminalInPlace(intent);   // 原地覆写终态，不追加新槽
                 intentStore.update(intent);
                 locationIndex.remove(intentId);  // 终态 Intent 不保留索引(桶回收依赖)
                 // I5: 锁内取快照，锁外派发
                 callbackSnapshot = intent.copy();
             }
+
+            // 锁外：等 group-commit 落盘后再回收终态槽（VT 可正常 unmount）
+            awaitDurableCommit();
+            reclaimTerminal(intentId);
 
             // 在 synchronized 块外派发回调——回滚窗口已关闭，
             // callback 异常（如 RejectedExecutionException）不会触发状态回滚。
@@ -679,13 +691,17 @@ public final class IntentCommandService {
      * createIntent 与 persistIntentState 共用,避免副本漂移。
      */
     private SlotLocation persistToWheel(Intent intent, boolean durable) {
+        String id = intent.getIntentId();
         SlotLocation loc = wheelStore.locate(intent.getExecuteAt());
         if (loc.inTail()) {
             tailIndex.put(intent);
         } else {
             loc = wheelStore.put(intent);                   // 捕获分配的真实槽位
         }
-        locationIndex.put(intent.getIntentId(), loc);
+        if (locationIndex.get(id) != null) {
+            multiSlotIntents.add(id);          // 2nd+ 写入 → 多槽（重排程/改期/取消）
+        }
+        locationIndex.put(id, loc);
         if (durable) {
             commitBarrier.awaitCommit();
         }
@@ -711,6 +727,41 @@ public final class IntentCommandService {
      */
     public void persistStateChangePutOnly(Intent intent) {
         persistToWheel(intent, false);   // durable=false → 跳过 awaitCommit，仅 put
+    }
+
+    /**
+     * 终态原地覆写（非阻塞 mmap）：把 locationIndex 指向的最新槽覆写为终态，不追加新槽。
+     * 单槽 Intent 排队待回收（pendingReclaims），落盘后由 reclaimTerminal 清空；多槽只覆写不回收。
+     * 无索引或 tail 时回退追加（tail 超视界非回收路径）。失败由调用方按 I6 吞掉。
+     */
+    public void persistTerminalInPlace(Intent intent) {
+        String id = intent.getIntentId();
+        SlotLocation loc = locationIndex.get(id);
+        if (loc == null || loc.inTail()) {
+            persistToWheel(intent, false);     // 回退追加；awaitCommit 由调用方在锁外完成
+            return;
+        }
+        wheelStore.overwriteSlot(loc, SlotCodec.encode(intent));
+        pendingReclaims.put(id, new PendingReclaim(loc, !multiSlotIntents.contains(id)));
+    }
+
+    /**
+     * 终态槽回收（须在 awaitCommit 之后调用）：单槽清空入 free-list 复用；多槽保留 tombstone。
+     * 无论单多槽都清理 multiSlotIntents，避免集合泄漏。
+     */
+    public void reclaimTerminal(String intentId) {
+        PendingReclaim pr = pendingReclaims.remove(intentId);
+        if (pr == null) return;
+        try {
+            if (pr.singleSlot() && !pr.loc().inTail()) {
+                wheelStore.freeSlot(pr.loc());
+                logger.debug("Reclaimed terminal slot {} for intent {}", pr.loc(), intentId);
+            }
+        } catch (Exception e) {
+            logger.warn("reclaimTerminal failed for intent {}: {}", intentId, e);
+        } finally {
+            multiSlotIntents.remove(intentId);
+        }
     }
 
     /**
