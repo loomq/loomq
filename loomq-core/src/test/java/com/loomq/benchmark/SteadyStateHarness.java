@@ -7,7 +7,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-/** 闭环稳态吞吐测量器：维持固定 inFlight 在途，纳秒精度，子窗采样，预热丢弃。 */
+/** 闭环稳态吞吐测量器：维持固定 inFlight 在途，纳秒精度，重复整窗采样（免疫窗内突发性），预热丢弃。 */
 public final class SteadyStateHarness {
 
     private final Semaphore slots;
@@ -46,34 +46,30 @@ public final class SteadyStateHarness {
         slots.release();
     }
 
-    public Result run(long warmupMs, long measureWindowMs, long subWindowMs) throws InterruptedException {
+    public Result run(long warmupMs, long measureWindowMs, int windows) throws InterruptedException {
         producer.start();
         // 预热：跑满管道，丢弃
         long warmupEnd = System.nanoTime() + warmupMs * 1_000_000L;
-        while (System.nanoTime() < warmupEnd) Thread.sleep(Math.min(subWindowMs, 20));
+        while (System.nanoTime() < warmupEnd) Thread.sleep(20);
         completions.set(0);
 
-        // 测量：每 subWindowMs 采样一次完成数
-        List<Double> qps = new ArrayList<>();
-        long prevCompletions = 0;
-        long prevNs = System.nanoTime();
-        long measureEndNs = prevNs + measureWindowMs * 1_000_000L;
-        while (System.nanoTime() < measureEndNs) {
-            Thread.sleep(subWindowMs);
-            long nowCompletions = completions.get();
-            long nowNs = System.nanoTime();
-            long dC = nowCompletions - prevCompletions;
-            long dNs = nowNs - prevNs;
-            if (dNs > 0) qps.add(dC * 1_000_000_000.0 / dNs);
-            prevCompletions = nowCompletions;
-            prevNs = nowNs;
+        // 测量：每窗一个总吞吐样本（免疫窗内突发性）
+        List<Double> windowQps = new ArrayList<>();
+        for (int w = 0; w < windows; w++) {
+            completions.set(0);
+            long startNs = System.nanoTime();
+            long endNs = startNs + measureWindowMs * 1_000_000L;
+            while (System.nanoTime() < endNs) Thread.sleep(Math.min(50, measureWindowMs / 10));
+            long c = completions.get();
+            long elapsedNs = System.nanoTime() - startNs;
+            if (elapsedNs > 0) windowQps.add(c * 1_000_000_000.0 / elapsedNs);
         }
         running.set(false);
         // 释放足够 permit 让 producer 退出
         for (int i = 0; i < 1000 && producer.isAlive(); i++) { slots.release(); Thread.sleep(1); }
         producer.join(2000);
 
-        double[] sq = Stats.sorted(qps.stream().mapToDouble(Double::doubleValue).toArray());
+        double[] sq = Stats.sorted(windowQps.stream().mapToDouble(Double::doubleValue).toArray());
         double[] sl = Stats.sorted(latencies.stream().mapToLong(Long::longValue).asDoubleStream().toArray());
         return new Result(
             Stats.median(sq), Stats.iqr(sq), sq.length,

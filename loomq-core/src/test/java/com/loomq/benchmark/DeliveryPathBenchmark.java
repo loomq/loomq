@@ -74,7 +74,7 @@ class DeliveryPathBenchmark {
                 @Override public void onDeliveryFailed(Intent i, Throwable e) {}
             });
 
-            SteadyStateHarness.Result result = harness.run(cfg.warmupMs(), cfg.measureWindowMs(), cfg.subWindowMs());
+            SteadyStateHarness.Result result = harness.run(cfg.warmupMs(), cfg.measureWindowMs(), 5);
 
             MetricsCollector.LatencySnapshot wake = engine.getMetricsCollector().getWakeupLatencySnapshot(tier);
             long wakeP50 = wake.p50() / 1000;
