@@ -9,6 +9,7 @@ import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.infrastructure.wheel.BucketReclaimer;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
@@ -145,7 +146,7 @@ public class LoomqEngine implements AutoCloseable {
                 intentStore,
                 deliveryHandler,
                 builder.redeliveryDecider,
-                null,
+                builder.precisionTierCatalog,
                 metricsCollector,
                 builder.intentTraceStore != null ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore()
             );
@@ -571,6 +572,7 @@ public class LoomqEngine implements AutoCloseable {
         private IntentStore intentStore;
         private MetricsCollector metricsCollector;
         private com.loomq.tracing.IntentTraceStore intentTraceStore;
+        private PrecisionTierCatalog precisionTierCatalog;
 
         /**
          * @deprecated 改用 {@link #dataDir(Path)};PHTW 已无 WAL,字段名陈旧。委托 dataDir。
@@ -637,6 +639,12 @@ public class LoomqEngine implements AutoCloseable {
         /** Inject a custom IntentTraceStore (default: new instance per engine). */
         public Builder intentTraceStore(com.loomq.tracing.IntentTraceStore store) {
             this.intentTraceStore = store;
+            return this;
+        }
+
+        /** Inject a custom precision tier catalog (default: {@link PrecisionTierCatalog#defaultCatalog()}). */
+        public Builder catalog(PrecisionTierCatalog catalog) {
+            this.precisionTierCatalog = catalog;
             return this;
         }
 

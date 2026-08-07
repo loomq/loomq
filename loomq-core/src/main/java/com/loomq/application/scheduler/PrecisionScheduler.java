@@ -1607,6 +1607,10 @@ public class PrecisionScheduler {
         return bucketGroupManager;
     }
 
+    public PrecisionTierCatalog getPrecisionTierCatalog() {
+        return precisionTierCatalog;
+    }
+
     public CohortManager getCohortManager() {
         return cohortManager;
     }
