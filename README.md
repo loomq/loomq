@@ -149,18 +149,18 @@ flowchart LR
 | FAST | 14,706 | 25 / 25 ms | 44 / 52 ms | 10 / 25 / 25 ms |
 | STANDARD | 2,189 | 100 / 250 ms | 216 / 475 ms | 100 / 250 / 250 ms |
 
-**WSL (Ubuntu)** · Linux 6.6.87.2-microsoft-standard-WSL2 · 22 核 · openjdk 25.0.4 · commit `7acb8c5`
+**WSL (Ubuntu, 原生 ext4)** · Linux 6.6.87.2-microsoft-standard-WSL2 · 22 核 · openjdk 25.0.4 · commit `7acb8c5`
 
 | 创建吞吐 | 单发 | 批量 |
 |---------|------:|-----:|
-| **QPS** | 3,333 | 62,500 |
+| **QPS** | 10,204 | 55,556 |
 
 | 档位 | QPS | wake p50/p99 | e2e p50/p99 | 触发精度 p50/p99/p999 |
 |------|----:|-------------|-------------|----------------------|
-| MILLI | 86,207 | 0 / 0 ms | 4 / 7 ms | 0 / 1 / 1 ms |
-| ULTRA | 147,059 | 0 / 0 ms | 2 / 5 ms | 0 / 0 / 1 ms |
-| FAST | 12,755 | 25 / 25 ms | 34 / 50 ms | 10 / 25 / 25 ms |
-| STANDARD | 1,485 | 250 / 250 ms | 275 / 492 ms | 100 / 250 / 250 ms |
+| MILLI | 119,048 | 0 / 0 ms | 3 / 6 ms | 0 / 1 / 1 ms |
+| ULTRA | 192,308 | 0 / 0 ms | 2 / 3 ms | 0 / 1 / 1 ms |
+| FAST | 26,316 | 10 / 25 ms | 13 / 29 ms | 10 / 25 / 25 ms |
+| STANDARD | 2,024 | 100 / 250 ms | 138 / 481 ms | 100 / 250 / 250 ms |
 
 ---
 
