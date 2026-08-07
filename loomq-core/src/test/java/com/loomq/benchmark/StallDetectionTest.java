@@ -73,7 +73,7 @@ class StallDetectionTest {
     private boolean runOneRound(Path dataDir, Path dumpPath, int stallThresholdMs) throws Exception {
         var base = PrecisionTierCatalog.defaultCatalog();
         int inFlight = base.profile(TIER).maxConcurrency();
-        var wheel = WheelConfig.defaultConfig().withDataDir(dataDir.toString()).withSlotsPerBucket(65_536);
+        var wheel = WheelConfig.defaultConfig().withDataDir(dataDir.toString()).withSlotsPerBucket(262_144);
 
         try (LoomqEngine engine = LoomqEngine.builder()
                 .wheelConfig(wheel).nodeId("stall-t")
@@ -173,8 +173,8 @@ class StallDetectionTest {
         sb.append("\n=== engine finalize diagnostics ===\n");
         try {
             var s = engine.getScheduler();
-            sb.append("finalizeSuccessObserverNotified=").append(s.getFinalizeSuccessObserverNotified())
-              .append(" finalizeTaskExceptions=").append(s.getFinalizeTaskExceptions()).append("\n");
+            sb.append("finalizeTaskExceptions=").append(s.getFinalizeTaskExceptions())
+              .append(" persistFailures=").append(s.getPersistFailures()).append("\n");
             for (String ex : s.getFinalizeExceptionSamples()) sb.append("  finalizeException: ").append(ex).append("\n");
         } catch (Exception ignored) { }
         sb.append("\n=== engine backpressure at stall ===\n");
@@ -184,11 +184,7 @@ class StallDetectionTest {
                 sb.append(e.getKey()).append(": queue=").append(bi.queueSize())
                   .append(" availPermits=").append(bi.availablePermits())
                   .append(" activeDispatch=").append(bi.activeDispatches())
-                  .append(" borrowed=").append(bi.borrowedCount())
-                  .append(" tierInFlight=").append(engine.getScheduler().getTierInFlight(e.getKey()))
-                  .append(" scanDueCasDrop=")
-                  .append(engine.getScheduler().getBucketGroupManager()
-                      .getBucketGroup(e.getKey()).getScanDueCasDropCount()).append("\n");
+                  .append(" borrowed=").append(bi.borrowedCount()).append("\n");
             }
         } catch (Exception ignored) { }
         sb.append("\n=== full JVM thread dump at stall ===\n");

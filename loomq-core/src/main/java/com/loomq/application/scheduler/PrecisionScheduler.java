@@ -1136,23 +1136,13 @@ public class PrecisionScheduler {
 
     public BorrowStats getBorrowStats() { return borrowStats; }
 
-    /**
-     * 当前在途投递计数（含借用他档 permit 的投递）。dispatch 前 +1，finalize 任务结束 -1
-     * （见 {@link #submitFinalize} 的 finally）。用于诊断：若在途计数 > 0 而 queue/activeDispatch
-     * 均为空，说明 finalize 结算任务卡在持久化等待等环节（未被 dump 捕获的虚拟线程）。
-     */
-    public int getTierInFlight(PrecisionTier tier) {
-        AtomicInteger inFlight = tierInFlight.get(tier);
-        return inFlight != null ? inFlight.get() : 0;
-    }
-
-    /** 诊断：finalizeIntent SUCCESS 路径到达 onDelivered 观察器派发点的次数。 */
-    private final AtomicLong finalizeSuccessObserverNotified = new AtomicLong();
-    public long getFinalizeSuccessObserverNotified() { return finalizeSuccessObserverNotified.get(); }
-
     /** 诊断：submitFinalize 结算任务抛异常次数（finalize 异常被吞，onDelivered 可能不触发）。 */
     private final AtomicLong finalizeTaskExceptions = new AtomicLong();
     public long getFinalizeTaskExceptions() { return finalizeTaskExceptions.get(); }
+
+    /** 诊断：persistStateChange 持久化失败次数（I6 容错吞掉，onDelivered 仍触发）。 */
+    private final AtomicLong persistFailures = new AtomicLong();
+    public long getPersistFailures() { return persistFailures.get(); }
 
     /** 诊断：最近的 finalize 异常样本（类名:消息），有界，供取证。 */
     private final java.util.concurrent.ConcurrentLinkedQueue<String> finalizeExceptionSamples = new java.util.concurrent.ConcurrentLinkedQueue<>();
@@ -1231,12 +1221,25 @@ public class PrecisionScheduler {
      * 杜绝未来调用方遗忘递增导致 recovery 去重失效。
      * 须在 synchronized(intent) 内调用以维持 I2/I3 原子性;阻塞的持久化等待
      * 由 {@link #awaitStateChangeCommit()} 在锁外完成,避免 VT 在锁内 pin carrier。
+     *
+     * <p><b>I6(容错):持久化失败不阻塞调度流程。</b> 终态/状态 put 失败(如 SEC 桶
+     * SlotOverflowException)时,吞掉异常并记录 —— 否则异常在 synchronized 块内传播,
+     * 会跳过后续的观察器通知(如 SUCCESS 的 onDelivered),导致已投递 intent 的
+     * 通知被吞、基准在途槽位永久泄漏、引擎死锁停摆(Issue B 根因,见
+     * docs/development/issue-b-rootcause-2026-08-07.md)。崩溃一致性冲击:终态未落盘,
+     * 重启 recovery 可能按旧 revision 重投 —— 属可接受的耐久劣化,优于不可恢复死锁。
      */
     private void persistStateChange(Intent intent) {
         intent.incrementRevision();
         StateChangeSink s = stateChangeSink;
         if (s != null) {
-            s.persist(intent);   // 仅非阻塞 put；阻塞等待由 awaitStateChangeCommit 在锁外完成
+            try {
+                s.persist(intent);   // 仅非阻塞 put；阻塞等待由 awaitStateChangeCommit 在锁外完成
+            } catch (Exception e) {
+                persistFailures.incrementAndGet();
+                logger.error("persistStateChange failed for intent {} (revision {}): {}",
+                    intent.getIntentId(), intent.getRevision(), e.getMessage(), e);
+            }
         }
     }
 
@@ -1413,7 +1416,6 @@ public class PrecisionScheduler {
                             final Intent snapshot = intent.copy();
                             deferredNotify = o -> o.onDelivered(snapshot, finalResult);
                         }
-                        finalizeSuccessObserverNotified.incrementAndGet();
                         break;
 
                     case RETRY: {
