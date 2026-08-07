@@ -73,7 +73,7 @@ class StallDetectionTest {
     private boolean runOneRound(Path dataDir, Path dumpPath, int stallThresholdMs) throws Exception {
         var base = PrecisionTierCatalog.defaultCatalog();
         int inFlight = base.profile(TIER).maxConcurrency();
-        var wheel = WheelConfig.defaultConfig().withDataDir(dataDir.toString()).withSlotsPerBucket(262_144);
+        var wheel = WheelConfig.defaultConfig().withDataDir(dataDir.toString());
 
         try (LoomqEngine engine = LoomqEngine.builder()
                 .wheelConfig(wheel).nodeId("stall-t")
