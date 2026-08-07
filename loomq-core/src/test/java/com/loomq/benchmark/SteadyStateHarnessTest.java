@@ -1,6 +1,7 @@
 package com.loomq.benchmark;
 
 import static org.junit.jupiter.api.Assertions.*;
+
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;

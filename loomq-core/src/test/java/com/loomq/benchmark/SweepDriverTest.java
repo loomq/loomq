@@ -1,6 +1,7 @@
 package com.loomq.benchmark;
 
 import static org.junit.jupiter.api.Assertions.*;
+
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
 import java.util.List;
