@@ -181,7 +181,9 @@ public class LoomqEngine implements AutoCloseable {
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
             scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
                 @Override public void persist(Intent intent) { commandService.persistStateChangePutOnly(intent); }
+                @Override public void persistTerminalInPlace(Intent intent) { commandService.persistTerminalInPlace(intent); }
                 @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
+                @Override public void reclaimTerminal(String intentId) { commandService.reclaimTerminal(intentId); }
             });
 
             // Spec B: 终态 Intent 从 locationIndex 移除(桶回收依赖索引判断活跃桶)。

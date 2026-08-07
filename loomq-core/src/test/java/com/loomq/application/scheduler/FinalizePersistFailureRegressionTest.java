@@ -49,7 +49,11 @@ class FinalizePersistFailureRegressionTest {
             @Override public void persist(Intent intent) {
                 throw new IllegalStateException("bucket overflow: SEC/x (slotsPerBucket=65536)");
             }
+            @Override public void persistTerminalInPlace(Intent intent) {
+                throw new IllegalStateException("bucket overflow: SEC/x (slotsPerBucket=65536)");
+            }
             @Override public void awaitCommit() { }
+            @Override public void reclaimTerminal(String intentId) { }
         });
 
         scheduler.addObserver(new IntentObserver() {
