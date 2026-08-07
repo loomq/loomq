@@ -28,11 +28,6 @@ public final class ReadOnlyIntentStoreView implements IntentStore {
     }
 
     @Override
-    public Intent findByIdInternal(String intentId) {
-        return delegate.findByIdInternal(intentId);
-    }
-
-    @Override
     public Map<String, Intent> getAllIntents() {
         return delegate.getAllIntents();
     }

@@ -1,21 +1,9 @@
 {
   "slo": {
-    "ULTRA":    { "p95_wakeup_us": 15000,  "p99_wakeup_us": 25000,  "p95_e2e_ms": 50,   "p99_e2e_ms": 100  },
-    "FAST":     { "p95_wakeup_us": 30000,  "p99_wakeup_us": 50000,  "p95_e2e_ms": 100,  "p99_e2e_ms": 200  },
-    "HIGH":     { "p95_wakeup_us": 50000,  "p99_wakeup_us": 80000,  "p95_e2e_ms": 200,  "p99_e2e_ms": 400  },
-    "STANDARD": { "p95_wakeup_us": 200000, "p99_wakeup_us": 400000, "p95_e2e_ms": 800,  "p99_e2e_ms": 1500 },
-    "ECONOMY":  { "p95_wakeup_us": 400000, "p99_wakeup_us": 800000, "p95_e2e_ms": 1500, "p99_e2e_ms": 3000 }
-  },
-  "timeouts": {
-    "internal_sec": 120,
-    "http_sec": 120,
-    "grpc_sec": 120,
-    "scheduler_sec": 300
-  },
-  "stress": {
-    "default_threads": [500, 1000, 2000, 3000],
-    "default_duration_sec": 30,
-    "default_cooldown_ms": 5000
+    "ULTRA":    { "p95_wakeup_ms": 15,  "p99_wakeup_ms": 25,  "p95_e2e_ms": 50,  "p99_e2e_ms": 100 },
+    "FAST":     { "p95_wakeup_ms": 50,  "p99_wakeup_ms": 60,  "p95_e2e_ms": 100, "p99_e2e_ms": 200 },
+    "STANDARD": { "p95_wakeup_ms": 500, "p99_wakeup_ms": 600, "p95_e2e_ms": 800, "p99_e2e_ms": 1500 },
+    "MILLI":    { "p95_wakeup_ms": 1,   "p99_wakeup_ms": 5,   "p95_e2e_ms": 5,   "p99_e2e_ms": 20 }
   },
   "rotation": {
     "keep_recent": 10

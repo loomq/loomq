@@ -133,6 +133,16 @@ public class RedeliveryPolicy {
         this.jitter = jitter;
     }
 
+    /**
+     * 创建当前 RedeliveryPolicy 的独立副本（I5 边界不变量）。
+     *
+     * @return 独立副本
+     */
+    public RedeliveryPolicy copy() {
+        return new RedeliveryPolicy(maxAttempts, backoff, initialDelayMs,
+            maxDelayMs, multiplier, jitter);
+    }
+
     @Override
     public String toString() {
         return String.format("RedeliveryPolicy{maxAttempts=%d, backoff=%s, initialDelay=%dms}",

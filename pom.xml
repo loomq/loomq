@@ -13,12 +13,7 @@
     <description>Parent POM for LoomQ delayed task queue</description>
 
     <modules>
-        <module>loomq-bom</module>
         <module>loomq-core</module>
-        <module>loomq-raft</module>
-        <module>loomq-channel</module>
-        <module>loomq-server</module>
-        <module>loomq-cli</module>
     </modules>
 
     <properties>
@@ -38,11 +33,32 @@
     <dependencyManagement>
         <dependencies>
             <dependency>
-                <groupId>com.loomq</groupId>
-                <artifactId>loomq-bom</artifactId>
-                <version>${project.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
+                <groupId>org.slf4j</groupId>
+                <artifactId>slf4j-api</artifactId>
+                <version>2.0.12</version>
+            </dependency>
+            <dependency>
+                <groupId>ch.qos.logback</groupId>
+                <artifactId>logback-classic</artifactId>
+                <version>1.5.3</version>
+            </dependency>
+            <dependency>
+                <groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter</artifactId>
+                <version>5.10.2</version>
+                <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.mockito</groupId>
+                <artifactId>mockito-core</artifactId>
+                <version>5.11.0</version>
+                <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.mockito</groupId>
+                <artifactId>mockito-junit-jupiter</artifactId>
+                <version>5.11.0</version>
+                <scope>test</scope>
             </dependency>
         </dependencies>
     </dependencyManagement>
@@ -92,36 +108,15 @@
                         <format>
                             <includes>
                                 <include>.editorconfig</include>
-                                <include>.env.example</include>
                                 <include>.gitattributes</include>
                                 <include>.github/**/*.yml</include>
-                                <include>CHANGELOG.md</include>
                                 <include>CLAUDE.md</include>
-                                <include>CONTRIBUTING.md</include>
-                                <include>Dockerfile</include>
-                                <include>Dockerfile.benchmark</include>
                                 <include>Makefile</include>
-                                <include>README.md</include>
-                                <include>README.zh.md</include>
-                                <include>SECURITY.md</include>
                                 <include>docs/development/ARCHITECTURE.md</include>
-                                <include>docs/development/API.md</include>
-                                <include>docs/development/TECH_DEBT_CLEANUP.md</include>
-                                <include>docs/development/openapi.yaml</include>
-                                <include>docs/engineering/release-checklist.md</include>
-                                <include>docs/operations/CONFIGURATION.md</include>
-                                <include>docs/operations/DEPLOYMENT.md</include>
-                                <include>loomq-server/src/main/resources/**/*.yml</include>
-                                <include>loomq-server/src/main/resources/**/*.yaml</include>
-                                <include>monitoring/**/*.yml</include>
-                                <include>monitoring/**/*.yaml</include>
-                                <include>scripts/**/*.ps1</include>
-                                <include>scripts/**/*.sh</include>
+                                <include>docs/architecture/**/*.md</include>
                                 <include>benchmark/scripts/**/*.ps1</include>
                                 <include>benchmark/scripts/**/*.sh</include>
                                 <include>benchmark/README.md</include>
-                                <include>docs/architecture/**/*.md</include>
-                                <include>docs/operations/**/*.md</include>
                             </includes>
                             <trimTrailingWhitespace/>
                             <endWithNewline/>

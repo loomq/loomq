@@ -1,306 +1,87 @@
-name: Java CI
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "0 2 * * *"   # daily 2am UTC
 
 concurrency:
-  group: java-ci-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ============================================================
-  #  PR / Push / Schedule: format gate
-  # ============================================================
   format-check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
         with:
+          distribution: oracle
           java-version: '25'
-          distribution: 'oracle'
           cache: maven
+      - name: Check formatting
+        run: mvn spotless:check
 
-      - name: Spotless Check
-        run: mvn -B -ntp com.diffplug.spotless:spotless-maven-plugin:3.0.0:check
-
-  # ============================================================
-  #  PR / Push: fast unit tests (parallel matrix, ~10s each)
-  # ============================================================
   fast-tests:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
-    needs: format-check
-    strategy:
-      fail-fast: true
-      matrix:
-        module: [loomq-core, loomq-raft, loomq-channel/loomq-channel-http, loomq-channel/loomq-channel-grpc, loomq-server, loomq-cli]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
-        with:
-          java-version: '25'
-          distribution: 'oracle'
-          cache: maven
-
-      - name: Fast Tests (${{ matrix.module }})
-        run: mvn -B -ntp -Pfast-tests test -pl ${{ matrix.module }} -am
-
-      - name: Upload Test Reports on Failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports-fast-${{ strategy.job-index }}
-          path: '**/target/surefire-reports/'
-
-  # ============================================================
-  #  PR / Push: slow tests (PrecisionSchedulerTest, ~110s)
-  # ============================================================
-  slow-tests:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
-    needs: format-check
-    runs-on: ubuntu-latest
-    timeout-minutes: 9
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
-        with:
-          java-version: '25'
-          distribution: 'oracle'
-          cache: maven
-
-      - name: Slow Tests
-        run: mvn -B -ntp -Pslow-tests test -pl loomq-core -am
-
-      - name: Upload Test Reports on Failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports-slow
-          path: loomq-core/target/surefire-reports/
-
-  # ============================================================
-  #  PR / Push: integration tests (~minutes on GitHub runners)
-  # ============================================================
-  integration-tests:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
     needs: format-check
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
         with:
+          distribution: oracle
           java-version: '25'
-          distribution: 'oracle'
           cache: maven
+      - name: Fast tests
+        run: mvn test
 
-      - name: Integration Tests
-        # PrecisionTierIntegrationTest excluded: pre-existing issue (missing HTTP server, tracked separately)
-        run: mvn -B -ntp -Pintegration-tests test -Dtest='!com.loomq.scheduler.PrecisionTierIntegrationTest' -Dsurefire.failIfNoSpecifiedTests=false -Dsurefire.forkedProcessTimeoutInSeconds=600
-
-      - name: Upload Test Reports on Failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports-integration
-          path: '**/target/surefire-reports/'
-
-  # ============================================================
-  #  PR only: quick benchmark smoke test (~30s)
-  # ============================================================
-  benchmark-quick:
-    if: ${{ github.event_name == 'pull_request' }}
+  slow-tests:
     needs: format-check
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
         with:
+          distribution: oracle
           java-version: '25'
-          distribution: 'oracle'
           cache: maven
+      - name: Slow tests
+        run: mvn test -Pslow-tests
 
-      - name: Quick Benchmark Smoke Test
-        run: |
-          mvn -B -ntp test -pl loomq-server -am \
-            -Dtest="com.loomq.scheduler.SchedulerTriggerBenchmarkWithMockServer#testQuickTierComparison" \
-            -Dtest.excludedGroups="slow,integration" \
-            -Dsurefire.failIfNoSpecifiedTests=false 2>&1 | tee benchmark-quick.log
-
-      - name: Show Benchmark Results
-        if: always()
-        run: |
-          echo "=== Benchmark Smoke Test Results ==="
-          grep -E "RESULT_ROW|RESULT\||Tests run:" benchmark-quick.log || echo "(no structured output)"
-
-      - name: Upload Benchmark Log
-        if: always()
-        uses: actions/upload-artifact@v4
+  integration-tests:
+    needs: format-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
         with:
-          name: benchmark-quick-log
-          path: benchmark-quick.log
+          distribution: oracle
+          java-version: '25'
+          cache: maven
+      - name: Integration tests
+        run: mvn test -Pintegration-tests
 
-  # ============================================================
-  #  PR / Push: package fat JAR
-  # ============================================================
   package:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
-    needs: format-check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [fast-tests, slow-tests, integration-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
         with:
+          distribution: oracle
           java-version: '25'
-          distribution: 'oracle'
           cache: maven
-
-      - name: Package (Skip Tests)
-        run: mvn -B -ntp -DskipTests package
-
-  # ============================================================
-  #  Schedule / Manual: full test suite
-  # ============================================================
-  full-regression:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    needs: format-check
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
+      - name: Package
+        run: mvn package -DskipTests
+      - uses: actions/upload-artifact@v4
         with:
-          java-version: '25'
-          distribution: 'oracle'
-          cache: maven
-
-      - name: Full Regression
-        run: mvn -B -ntp -Pfull-tests test -Dsurefire.forkedProcessTimeoutInSeconds=3600
-
-      - name: Upload Test Reports on Failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: surefire-reports-full
-          path: '**/target/surefire-reports/'
-
-  # ============================================================
-  #  Schedule / Manual: full benchmark + regression detection
-  # ============================================================
-  benchmark-full:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: [format-check, full-regression]
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up JDK 25
-        uses: actions/setup-java@v4
-        with:
-          java-version: '25'
-          distribution: 'oracle'
-          cache: maven
-
-      - name: Run Full Benchmark (100k intents)
-        run: |
-          echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
-          echo "commit=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> $GITHUB_ENV
-          mvn -B -ntp test -pl loomq-server -am \
-            -Dtest="com.loomq.scheduler.SchedulerTriggerBenchmarkWithMockServer#test100kTierThroughput" \
-            -DfailIfNoTests=false 2>&1 | tee benchmark-full.log
-
-      - name: Generate CSV History Entry
-        run: |
-          echo "timestamp,commit,branch,tier,qps,p50_ms,p95_ms,p99_ms,completion_pct,backpressure_events" > benchmark-result.csv
-          grep "RESULT_ROW|" benchmark-full.log | while IFS='|' read -r _ fields; do
-            tier=$(echo "$fields" | grep -oP 'tier=\K[^|]+')
-            qps=$(echo "$fields" | grep -oP 'qps=\K[^|]+')
-            latency=$(echo "$fields" | grep -oP 'avg_latency_ms=\K[^|]+')
-            concurrency=$(echo "$fields" | grep -oP 'concurrency=\K[^|]+')
-            backpressure=$(echo "$fields" | grep -oP 'backpressure=\K[^|]+')
-            echo "${{ env.timestamp }},${{ env.commit }},${{ env.branch }},${tier:-N/A},${qps:-0},N/A,${latency:-0},N/A,N/A,${backpressure:-0}" >> benchmark-result.csv
-          done
-          echo "=== Generated CSV ==="
-          cat benchmark-result.csv
-
-      - name: Check for Performance Regression
-        run: |
-          echo "=== Performance Regression Check ==="
-          PREV_ARTIFACT=$(gh run list -b main -w "Java CI" -s success -L 5 --json databaseId --jq '.[].databaseId' | head -1)
-          if [ -n "$PREV_ARTIFACT" ]; then
-            gh run download "$PREV_ARTIFACT" -n benchmark-result-csv -D prev-benchmark/ 2>/dev/null || echo "(no previous artifact)"
-            if [ -f prev-benchmark/benchmark-result.csv ]; then
-              PREV_QPS=$(grep "ULTRA" prev-benchmark/benchmark-result.csv | head -1 | cut -d',' -f5)
-              CURR_QPS=$(grep "ULTRA" benchmark-result.csv | head -1 | cut -d',' -f5)
-              if [ -n "$PREV_QPS" ] && [ -n "$CURR_QPS" ]; then
-                REGRESSION=$(echo "scale=2; ($PREV_QPS - $CURR_QPS) / $PREV_QPS * 100" | bc 2>/dev/null || echo "0")
-                echo "Previous ULTRA QPS: $PREV_QPS | Current: $CURR_QPS | Delta: ${REGRESSION}%"
-                if (( $(echo "$REGRESSION > 15" | bc -l 2>/dev/null || echo 0) )); then
-                  echo "::warning::Performance regression: ULTRA QPS dropped ${REGRESSION}% ($PREV_QPS → $CURR_QPS)"
-                fi
-              fi
-            fi
-          else
-            echo "No previous run — baseline established"
-          fi
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Upload Benchmark CSV
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-result-csv
-          path: benchmark-result.csv
-
-      - name: Upload Benchmark Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-full-log
-          path: benchmark-full.log
+          name: loomq-core
+          path: loomq-core/target/*.jar

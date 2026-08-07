@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LoomQ is a durable time kernel for distributed systems. It schedules, persists, and delivers future events called **Intent**s. Built on Java 25 Virtual Threads. Core modules: `loomq-bom` (version management), `loomq-core` (embeddable, HTTP-free kernel), `loomq-server` (standalone Netty HTTP server), `loomq-raft` (Raft consensus), `loomq-channel` (pluggable delivery channels: HTTP + gRPC), `loomq-cli` (interactive temporal explorer).
+LoomQ is a durable time kernel for distributed systems. It schedules, persists, and delivers future events called **Intent**s. Built on Java 25 Virtual Threads. Single module: `loomq-core` (embeddable, HTTP-free kernel).
 
 ## Build & Run Commands
 
@@ -20,33 +20,20 @@ make check-format              # verify formatting (same as CI gate)
 
 # Test (Maven Surefire profiles with JUnit 5 tags)
 mvn test                       # default: excludes benchmark/slow/integration
-mvn test -Pfast-tests          # same as default, used in CI matrix per module
+mvn test -Pfast-tests          # same as default
 mvn test -Pslow-tests          # @Tag("slow") only
-mvn test -Pintegration-tests   # @Tag("integration") only
 mvn test -Pfull-tests          # everything including slow/benchmark
 mvn test -Dtest=ClassName      # single test class
 mvn test -Dtest=ClassName#methodName  # single test method
 
-# Module-scoped test (CI pattern — builds deps with -am)
-mvn test -pl loomq-core -am
-mvn test -pl loomq-server -am
-
-# Run benchmark suite (Excel + MD reports)
-benchmark\benchmark.bat                  # Windows full suite
-benchmark\benchmark.bat --quick          # quick validation
-benchmark\benchmark.bat --stress         # full + stress sweep
+# Run benchmark suite (MD reports)
+benchmark\scripts\benchmark.ps1          # Windows full suite
+benchmark\scripts\benchmark.ps1 -Quick   # quick validation
 ./benchmark/scripts/benchmark.sh         # Linux/macOS
+./benchmark/scripts/benchmark.sh --quick # quick validation
 
 # Pre-push gate (same checks CI runs)
 make check                     # check-format + test
-
-# Run
-java -jar loomq-server/target/loomq-server-0.9.2.jar
-make run-jar                   # Makefile shortcut
-
-# Docker
-make docker-build && make docker-run          # single container
-make docker-compose-up                        # cluster + monitoring stack
 ```
 
 ### JUnit 5 Tag System
@@ -56,73 +43,53 @@ Tests are categorized with `@Tag` annotations. Maven Surefire uses `groups`/`exc
 | Tag | Maven Profile | What |
 |-----|--------------|------|
 | *(none)* | default / `fast-tests` | Fast unit tests, always run |
-| `slow` | `slow-tests` | PrecisionSchedulerTest, RaftNodeTest, BackPressureTest, SegmentedWalTest |
-| `integration` | `integration-tests` | Tests requiring full server startup, HTTP, or multi-node |
-| `benchmark` | (included in `full-tests`) | Performance benchmarks with mock server |
-
-## Modules
-
-| Module | Purpose |
-|--------|---------|
-| `loomq-bom` | Bill of Materials — centralized version management |
-| `loomq-core` | Embeddable kernel, zero HTTP/JSON deps |
-| `loomq-server` | Standalone Netty HTTP server (`LoomqServerApplication` entry point) |
-| `loomq-raft` | Raft consensus (leader election, log replication, snapshot catch-up) |
-| `loomq-channel` | Aggregator POM for delivery channels |
-| `loomq-channel-http` | HTTP webhook delivery + batch delivery |
-| `loomq-channel-grpc` | gRPC streaming delivery (AUTO_ACK / MANUAL_ACK) |
-| `loomq-cli` | Interactive temporal explorer shell (10+ commands) |
+| `slow` | `slow-tests` | PrecisionSchedulerTest, LoomqEnginePhtwRecoveryTest |
+| `integration` | `integration-tests` | Engine-level tests (mutation isolation, lock-free dispatch, recovery) |
+| `benchmark` | (included in `full-tests`) | Performance benchmarks |
 
 ## Architecture
 
 ```
-loomq-server (Netty HTTP + JSON + security)
-    ├── IntentHandler        — REST API routing (RadixTree) + error recovery advisor
-    ├── NettyHttpServer      — epoll + pooled allocator + semaphore backpressure
-    ├── SecurityConfig       — token-based authentication
-    └── loomq-channel        — pluggable delivery channels
-        ├── loomq-channel-http  — HTTP webhook delivery + batch delivery
-        └── loomq-channel-grpc  — gRPC streaming delivery (AUTO_ACK / MANUAL_ACK)
-
 loomq-core (embeddable kernel, zero HTTP/JSON deps)
     ├── LoomqEngine           — builder-pattern entry point
     ├── PrecisionScheduler    — time-wheel buckets, per-tier scan + batch consumers
     │   ├── CohortManager     — CSA-style batched wakeup (replaces per-intent VT sleep)
     │   ├── BucketGroupManager — per-tier time-bucket storage
-    │   └── ResizableSemaphore — extends Semaphore, runtime-resizable permits
-    ├── IntentStore           — pluggable storage (ConcurrentIntentStore / RocksDBIntentStore)
-    ├── SimpleWalWriter       — memory-mapped WAL with FFM API (~100ns/record)
-    ├── RecoveryPipeline      — snapshot + WAL replay on restart
-    └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, WalAccessor, RedeliveryDecider
+    │   └── ResizableSemaphore — extends Semaphore, cross-tier borrowing tracking
+    ├── IntentStore           — in-memory hot-state store (ConcurrentIntentStore)
+    ├── WheelStore            — persistent hierarchical timing wheel (4-tier mmap: sec/min/hour/day)
+    ├── TailIndex             — durable run-file for intents beyond the day-wheel horizon (>30 days)
+    ├── GroupCommitBarrier    — rendezvous msync daemon; DURABLE writers awaitCommit()
+    ├── PromotionDaemon       — cold→hot cohort promotion (mirrors CohortManager; wakes at executeAt - PROMOTION_LEAD_MS, default 60s)
+    ├── IntentLocationIndex   — intentId→SlotLocation index for cold cancel/reschedule
+    ├── WheelRecovery         — scan-based recovery on restart (replaces snapshot+WAL replay)
+    └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, RedeliveryDecider
 ```
 
 **Intent lifecycle:** CREATED → SCHEDULED → DUE → DISPATCHING → DELIVERED → ACKED (branches: CANCELLED, EXPIRED, DEAD_LETTERED)
 
-**Five precision tiers:** ULTRA(10ms, 200 slots), FAST(50ms, 150 slots), HIGH(100ms, 50 slots), STANDARD(500ms, 50 slots), ECONOMY(1000ms, 50 slots).
+**Four precision tiers:** ULTRA(10ms, 200 slots), FAST(50ms, 150 slots), STANDARD(500ms, 50 slots), MILLI(1ms) —— 事件驱动扫描,毫秒级触发(cohort 旁路直插桶).
 
 ## Key Design Decisions
 
 - **"Intent" is the public model** — older docs/code may use legacy terminology; always use "Intent" in new code.
-- **Core has zero HTTP/JSON dependencies** — `loomq-core` depends only on `slf4j-api` at compile scope. All transport, serialization, and config-parsing concerns live in `loomq-server`.
-- **DeliveryHandler SPI** — the scheduler in core delegates delivery through this interface; `loomq-channel-http` provides `NettyHttpDeliveryHandler` and `BatchedHttpDeliveryHandler`, `loomq-channel-grpc` provides `GrpcStreamDeliveryHandler`. Embedders supply their own.
+- **Core has zero HTTP/JSON dependencies** — `loomq-core` depends only on `slf4j-api` at compile scope.
+- **DeliveryHandler SPI** — the scheduler in core delegates delivery through this interface. Embedders supply their own.
 - **Virtual threads everywhere** — `Executors.newVirtualThreadPerTaskExecutor()` for batch consumers; no traditional thread pool tuning.
 - **Cohort-based wakeup (CSA-inspired)** — intents with delay > precision window are grouped by cohort key; one daemon thread wakes thousands, replacing per-intent VT sleep.
 - **Arrow cross-tier borrowing** — when a tier's semaphore is full, consumers borrow slots from lower-priority tiers via `tryAcquire(100ms)`. AdapTBF bounds lending to 50% of a tier's slots to prevent starvation.
-- **ResizableSemaphore extends Semaphore** — zero-overhead acquire/tryAcquire (inherited); only release() is overridden for gradual shrink via permit discarding. Tracks `borrowedCount` per tier.
-- **IntentStore is pluggable** — `ConcurrentIntentStore` handles in-memory mode, `RocksDBIntentStore` handles durable local storage; use `upsert()` for current-state writes.
-- **Cluster/replication is Beta** — `ClusterManager`, `ShardRouter`, `FailoverController`, and Raft consensus are implemented, but we should still treat the path as beta-hardening and protect the snapshot/failover regressions.
-
-## REST API
-
-`POST /v1/intents`, `GET /v1/intents/{id}`, `PATCH /v1/intents/{id}`, `POST /v1/intents/{id}/cancel`, `POST /v1/intents/{id}/fire-now`, `GET /health`, `GET /health/live`, `GET /health/ready`, `GET /metrics`
-
-## Configuration
-
-Priority (highest→lowest): JVM system properties (`-Dloomq.xxx`) → external `./config/application.yml` → classpath `application.yml` → `@DefaultValue` annotations. Config interfaces use `org.aeonbits.owner` in `com.loomq.config`.
+- **ResizableSemaphore extends Semaphore** — zero-overhead acquire/tryAcquire (inherited); no overridden release() (resize was removed as dead code). Tracks `currentMax` and `borrowedCount` per tier.跨档借用的 permit 释放统一走 `releasePermit` 配对 `decrementBorrowed`,杜绝借用计数泄漏。
+- **Persistent Hierarchical Timing Wheel (PHTW)** — durability lives in a 4-tier mmap wheel (sec/min/hour/day) plus `TailIndex` (run-file for intents beyond the day-wheel horizon, >30 days). `WheelStore` is append-only; recovery dedups by max revision per intentId. `BucketReclaimer` 按窗口过期回收桶文件;无 compaction(旧槽残留由 recovery 去重)。桶满(1024 槽)抛 `SlotOverflowException`。
+- **Group-commit durability** — `GroupCommitBarrier` runs a rendezvous msync daemon; `DURABLE` writers `awaitCommit()` until a force covering their write completes. `ASYNC` returns after mmap (crash window); state-change ops (update/cancel/fireNow) hardcode `DURABLE`. 重试重排程亦 DURABLE 落盘(经 `StateChangeSink` 钩子)。慢盘超时走单飞行内联 force(平台线程,避免 VT pin)。
+- **Cold→hot promotion** — `PromotionDaemon` registers intents due beyond `WheelConfig.hotBoundaryMs()` (default 60min, create/recovery hot threshold) as cohorts, mirroring `CohortManager`; on wake (at `executeAt - WheelConfig.promotionLeadMs()`, default 60s) it loads the slot into memory and hands off to the scheduler. `IntentLocationIndex` (intentId→`SlotLocation`) enables **cold cancel**(冷改期/冷 fireNow 未实现——`updateIntent`/`fireNow` 仅作用于热内存态)。promote↔cancelCold 用双向清理收口 TOCTOU。
+- **IntentStore is hot-state only** — `ConcurrentIntentStore` holds the in-memory hot window (≤`WheelConfig.hotBoundaryMs()`, default 60min); the wheel is the durable authority. Use `upsert()` for current-state writes.
+- **Recovery overdue 语义** — `WheelRecovery` 对停机窗口期间到期的 Intent 不再静默丢弃:按 `ExpiredAction` 置 EXPIRED/DEAD_LETTERED 终态并持久化终态 revision,下次重启被 terminal 跳过(不补投,避免对下游产生过时事件)。
+- **枚举序即持久化序** — `PrecisionTier` 新增档必须追加末尾,禁止插入重排(`SlotCodec` 按 ordinal 持久化)。v0.9.x 精简(6→4)为一次性 ordinal 断裂,断裂前 wheel 数据目录必须清空。
+- **事件驱动扫描 + 信号驱动消费** — `PrecisionScheduler.adaptiveScanLoop` 按 tier 事件驱动触发扫描(空闲时休眠,事件到来即唤醒),替代固定轮询;`MILLI` 档走 cohort 旁路直插桶,consumer 由信号唤醒而非批量睡眠,使 1ms 级触发可用而空闲 CPU 不劣化。
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`): Oracle JDK 25. Jobs: `format-check` → `fast-tests` (matrix per module), `slow-tests`, `integration-tests`, `benchmark-quick` (PR only). On push to main: `package` (fat JAR). Scheduled/manual: `full-regression` + `benchmark-full` with regression detection. Use `make check` locally to simulate the CI gate.
+GitHub Actions (`.github/workflows/ci.yml`): Oracle JDK 25. Jobs: `format-check` → `fast-tests`, `slow-tests`, `integration-tests`. On push to main: `package`. Use `make check` locally to simulate the CI gate.
 
 ## Language
 

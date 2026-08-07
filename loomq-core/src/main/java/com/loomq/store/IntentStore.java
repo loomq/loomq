@@ -42,7 +42,7 @@ public interface IntentStore extends AutoCloseable {
     /**
      * 写入或更新 Intent。
      *
-     * 适用于”应用当前态”的场景，例如快照恢复、WAL 回放、Raft 提交应用。
+     * 适用于”应用当前态”的场景，例如快照恢复、WAL 回放。
      */
     default void upsert(Intent intent) {
         Intent existing = findById(intent.getIntentId());
