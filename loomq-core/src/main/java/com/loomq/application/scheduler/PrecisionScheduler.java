@@ -1136,6 +1136,30 @@ public class PrecisionScheduler {
 
     public BorrowStats getBorrowStats() { return borrowStats; }
 
+    /**
+     * 当前在途投递计数（含借用他档 permit 的投递）。dispatch 前 +1，finalize 任务结束 -1
+     * （见 {@link #submitFinalize} 的 finally）。用于诊断：若在途计数 > 0 而 queue/activeDispatch
+     * 均为空，说明 finalize 结算任务卡在持久化等待等环节（未被 dump 捕获的虚拟线程）。
+     */
+    public int getTierInFlight(PrecisionTier tier) {
+        AtomicInteger inFlight = tierInFlight.get(tier);
+        return inFlight != null ? inFlight.get() : 0;
+    }
+
+    /** 诊断：finalizeIntent SUCCESS 路径到达 onDelivered 观察器派发点的次数。 */
+    private final AtomicLong finalizeSuccessObserverNotified = new AtomicLong();
+    public long getFinalizeSuccessObserverNotified() { return finalizeSuccessObserverNotified.get(); }
+
+    /** 诊断：submitFinalize 结算任务抛异常次数（finalize 异常被吞，onDelivered 可能不触发）。 */
+    private final AtomicLong finalizeTaskExceptions = new AtomicLong();
+    public long getFinalizeTaskExceptions() { return finalizeTaskExceptions.get(); }
+
+    /** 诊断：最近的 finalize 异常样本（类名:消息），有界，供取证。 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> finalizeExceptionSamples = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    public java.util.List<String> getFinalizeExceptionSamples() {
+        return new ArrayList<>(finalizeExceptionSamples);
+    }
+
     /** 设置 Intent 生命周期观察器列表（由 LoomqEngine 调用） */
     public void setObservers(List<IntentObserver> observers) {
         this.observers.clear();
@@ -1179,6 +1203,11 @@ public class PrecisionScheduler {
                 try {
                     task.run();
                 } catch (Exception e) {
+                    finalizeTaskExceptions.incrementAndGet();
+                    if (finalizeExceptionSamples.size() < 20) {
+                        finalizeExceptionSamples.add(e.getClass().getSimpleName() + ": "
+                            + (e.getMessage() != null ? e.getMessage() : "(null)"));
+                    }
                     logger.error("Error in delivery callback for intent {}", intent.getIntentId(), e);
                 } finally {
                     tierInFlight.get(tier).decrementAndGet();
@@ -1384,6 +1413,7 @@ public class PrecisionScheduler {
                             final Intent snapshot = intent.copy();
                             deferredNotify = o -> o.onDelivered(snapshot, finalResult);
                         }
+                        finalizeSuccessObserverNotified.incrementAndGet();
                         break;
 
                     case RETRY: {

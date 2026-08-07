@@ -83,8 +83,10 @@ class StallDetectionTest {
 
             Semaphore slots = new Semaphore(inFlight);
             AtomicLong completions = new AtomicLong();
+            AtomicLong submitted = new AtomicLong();
             AtomicLong lastCompleteNs = new AtomicLong(System.nanoTime());
             AtomicBoolean running = new AtomicBoolean(true);
+            java.util.concurrent.ConcurrentHashMap<String, Boolean> outstanding = new java.util.concurrent.ConcurrentHashMap<>();
 
             Runnable submitOne = () -> {
                 long delayMs = 1 + ThreadLocalRandom.current().nextInt(5); // 1..5ms
@@ -92,18 +94,24 @@ class StallDetectionTest {
                 intent.setExecuteAt(Instant.now().plusMillis(delayMs));
                 intent.setPrecisionTier(TIER);
                 engine.createIntent(intent, AckMode.DURABLE);
+                submitted.incrementAndGet();   // createIntent DURABLE 返回 = 已提交
+                outstanding.put(intent.getIntentId(), Boolean.TRUE);
             };
 
+            AtomicLong expired = new AtomicLong();
+            AtomicLong deadLettered = new AtomicLong();
+            AtomicLong deliveryFailed = new AtomicLong();
             engine.registerObserver(new IntentObserver() {
                 @Override public void onDelivered(Intent i, DeliveryHandler.DeliveryResult r) {
                     completions.incrementAndGet();
                     lastCompleteNs.set(System.nanoTime());
                     slots.release();
+                    outstanding.remove(i.getIntentId());
                 }
                 @Override public void onScheduled(Intent i) {}
-                @Override public void onDeadLettered(Intent i) {}
-                @Override public void onExpired(Intent i) {}
-                @Override public void onDeliveryFailed(Intent i, Throwable e) {}
+                @Override public void onDeadLettered(Intent i) { deadLettered.incrementAndGet(); }
+                @Override public void onExpired(Intent i) { expired.incrementAndGet(); }
+                @Override public void onDeliveryFailed(Intent i, Throwable e) { deliveryFailed.incrementAndGet(); }
             });
 
             Thread producer = Thread.ofVirtual().name("stall-producer").start(() -> {
@@ -120,10 +128,15 @@ class StallDetectionTest {
                 long idleNs = System.nanoTime() - lastCompleteNs.get();
                 if (idleNs > TimeUnit.MILLISECONDS.toNanos(stallThresholdMs)) {
                     stalled = true;
-                    dumpThreads(dumpPath, engine);
+                    dumpThreads(dumpPath, engine, submitted.get(), completions.get(), outstanding);
                     System.out.println("STALL_DETECTED|round=dump=" + dumpPath + "|idleMs="
                         + TimeUnit.NANOSECONDS.toMillis(idleNs)
-                        + "|completions=" + completions.get());
+                        + "|submitted=" + submitted.get()
+                        + "|delivered=" + completions.get()
+                        + "|expired=" + expired.get()
+                        + "|deadLettered=" + deadLettered.get()
+                        + "|deliveryFailed=" + deliveryFailed.get()
+                        + "|outstanding=" + outstanding.size());
                     break;
                 }
             }
@@ -136,16 +149,46 @@ class StallDetectionTest {
     }
 
     /** 抓全 JVM 线程转储 + 引擎背压状态到 dumpPath。 */
-    private void dumpThreads(Path dumpPath, LoomqEngine engine) throws Exception {
+    private void dumpThreads(Path dumpPath, LoomqEngine engine, long submitted, long delivered,
+                             java.util.concurrent.ConcurrentHashMap<String, Boolean> outstanding) throws Exception {
         StringBuilder sb = new StringBuilder();
-        sb.append("=== engine backpressure at stall ===\n");
+        sb.append("=== harness counters at stall ===\n");
+        sb.append("submitted(createIntent 返回)=").append(submitted)
+          .append(" delivered(onDelivered)=").append(delivered)
+          .append(" outstanding=").append(submitted - delivered).append("\n");
+        sb.append("=== outstanding intent states (engine store) ===\n");
+        int shown = 0;
+        for (String id : outstanding.keySet()) {
+            if (shown >= 20) { sb.append("... 省略 ").append(outstanding.size() - shown).append(" 个\n"); break; }
+            try {
+                var opt = engine.getIntent(id);
+                var it = opt.orElse(null);
+                if (it == null) { sb.append(id).append(": NOT_IN_STORE\n"); }
+                else { sb.append(id).append(": status=").append(it.getStatus())
+                    .append(" rev=").append(it.getRevision())
+                    .append(" executeAt=").append(it.getExecuteAt()).append("\n"); }
+            } catch (Exception ex) { sb.append(id).append(": ERR ").append(ex).append("\n"); }
+            shown++;
+        }
+        sb.append("\n=== engine finalize diagnostics ===\n");
+        try {
+            var s = engine.getScheduler();
+            sb.append("finalizeSuccessObserverNotified=").append(s.getFinalizeSuccessObserverNotified())
+              .append(" finalizeTaskExceptions=").append(s.getFinalizeTaskExceptions()).append("\n");
+            for (String ex : s.getFinalizeExceptionSamples()) sb.append("  finalizeException: ").append(ex).append("\n");
+        } catch (Exception ignored) { }
+        sb.append("\n=== engine backpressure at stall ===\n");
         try {
             for (var e : engine.getScheduler().getBackpressureStatus().entrySet()) {
                 var bi = e.getValue();
                 sb.append(e.getKey()).append(": queue=").append(bi.queueSize())
                   .append(" availPermits=").append(bi.availablePermits())
                   .append(" activeDispatch=").append(bi.activeDispatches())
-                  .append(" borrowed=").append(bi.borrowedCount()).append("\n");
+                  .append(" borrowed=").append(bi.borrowedCount())
+                  .append(" tierInFlight=").append(engine.getScheduler().getTierInFlight(e.getKey()))
+                  .append(" scanDueCasDrop=")
+                  .append(engine.getScheduler().getBucketGroupManager()
+                      .getBucketGroup(e.getKey()).getScanDueCasDropCount()).append("\n");
             }
         } catch (Exception ignored) { }
         sb.append("\n=== full JVM thread dump at stall ===\n");

@@ -81,6 +81,10 @@ public class BucketGroup {
     private volatile BucketAddListener bucketAddListener;
     private final int maxBuckets;
 
+    /** 诊断：scanDue 认领时因 revision 不匹配被静默丢弃的 intent 数（疑似造成引擎停摆的落点）。 */
+    private final AtomicLong scanDueCasDropCount = new AtomicLong();
+    public long getScanDueCasDropCount() { return scanDueCasDropCount.get(); }
+
     public Long earliestBucketKey() {
         return buckets.isEmpty() ? null : buckets.firstKey();
     }
@@ -261,6 +265,7 @@ public class BucketGroup {
                     // 原子认领:只有索引条目仍是我们放入的那条时才能移除。
                     // 若 fireNow/重排程已替换条目(revision 不同),CAS 失败,跳过不投递。
                     if (!intentIndex.remove(intentId, new ClaimEntry(bucketKey, revAtAdd))) {
+                        scanDueCasDropCount.incrementAndGet();
                         logger.debug("scanDue CAS failed for intent {}: already re-claimed by newer revision", intentId);
                         continue;  // 已被 fireNow/重排程替换 - 不投递
                     }
