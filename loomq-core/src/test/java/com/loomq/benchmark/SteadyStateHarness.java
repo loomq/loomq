@@ -1,0 +1,89 @@
+package com.loomq.benchmark;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** 闭环稳态吞吐测量器：维持固定 inFlight 在途，纳秒精度，子窗采样，预热丢弃。 */
+public final class SteadyStateHarness {
+
+    private final Semaphore slots;
+    private final AtomicLong completions = new AtomicLong();
+    private final ConcurrentLinkedQueue<Long> latencies = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean running = new AtomicBoolean(true);
+    private final Thread producer;
+    private final Runnable submitOne;
+
+    public SteadyStateHarness(int inFlight, Runnable submitOne) {
+        this.slots = new Semaphore(inFlight);
+        this.submitOne = submitOne;
+        // 延迟到 run() 再 start：避免构造期即产出，调用方回调引用尚未初始化的 harness 实例。
+        this.producer = Thread.ofVirtual().name("bench-producer").unstarted(this::produceLoop);
+    }
+
+    private void produceLoop() {
+        while (running.get()) {
+            try {
+                slots.acquire();
+            } catch (InterruptedException e) {
+                return;
+            }
+            try {
+                submitOne.run();
+            } catch (RuntimeException e) {
+                // 单条提交失败不拖垮测量；continue 等下一槽
+            }
+        }
+    }
+
+    /** 由调用方在工作项完成时调用（observer / future 回调）。 */
+    public void onComplete(long latencyUs) {
+        completions.incrementAndGet();
+        latencies.add(latencyUs);
+        slots.release();
+    }
+
+    public Result run(long warmupMs, long measureWindowMs, long subWindowMs) throws InterruptedException {
+        producer.start();
+        // 预热：跑满管道，丢弃
+        long warmupEnd = System.nanoTime() + warmupMs * 1_000_000L;
+        while (System.nanoTime() < warmupEnd) Thread.sleep(Math.min(subWindowMs, 20));
+        completions.set(0);
+
+        // 测量：每 subWindowMs 采样一次完成数
+        List<Double> qps = new ArrayList<>();
+        long prevCompletions = 0;
+        long prevNs = System.nanoTime();
+        long measureEndNs = prevNs + measureWindowMs * 1_000_000L;
+        while (System.nanoTime() < measureEndNs) {
+            Thread.sleep(subWindowMs);
+            long nowCompletions = completions.get();
+            long nowNs = System.nanoTime();
+            long dC = nowCompletions - prevCompletions;
+            long dNs = nowNs - prevNs;
+            if (dNs > 0) qps.add(dC * 1_000_000_000.0 / dNs);
+            prevCompletions = nowCompletions;
+            prevNs = nowNs;
+        }
+        running.set(false);
+        // 释放足够 permit 让 producer 退出
+        for (int i = 0; i < 1000 && producer.isAlive(); i++) { slots.release(); Thread.sleep(1); }
+        producer.join(2000);
+
+        double[] sq = Stats.sorted(qps.stream().mapToDouble(Double::doubleValue).toArray());
+        double[] sl = Stats.sorted(latencies.stream().mapToLong(Long::longValue).asDoubleStream().toArray());
+        return new Result(
+            Stats.median(sq), Stats.iqr(sq), sq.length,
+            (long) (sl.length == 0 ? 0 : Stats.median(sl)),
+            (long) (sl.length == 0 ? 0 : Stats.p99(sl)),
+            (long) (sl.length == 0 ? 0 : Stats.p999(sl)));
+    }
+
+    public record Result(
+        double qpsMedian, double qpsIqr, int qpsSamples,
+        long e2eP50Us, long e2eP99Us, long e2eP999Us
+    ) {}
+}
