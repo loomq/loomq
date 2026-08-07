@@ -29,6 +29,7 @@ param(
     [string]$Scenario = "all",
     [switch]$NoCompile,
     [switch]$Compare,
+    [string]$SweepConsumers = "",
     [string]$JavaHome = "D:\Development\JDKs\jdk-25.0.4"
 )
 
@@ -98,7 +99,7 @@ Write-Host ">>> 运行基准测试 (场景: $Scenario, 测试: $TestSelect)"
 $LogFile = Join-Path $LogsDir "benchmark-$Timestamp.log"
 Push-Location $ProjectRoot
 try {
-    & mvn test -pl loomq-core "-Dtest=$TestSelect" "-Dtest.excludedGroups=" *> $LogFile
+    & mvn test -pl loomq-core "-Dtest=$TestSelect" "-Dtest.excludedGroups=" "-Dsweep.consumers=$SweepConsumers" *> $LogFile
 } finally {
     Pop-Location
 }
@@ -134,18 +135,18 @@ $report += "**Java**: $JavaVer | **OS**: $OsName | **CPU**: $CpuCores cores"
 $report += ""
 $report += "## 创建吞吐"
 $report += ""
-$report += "| 模式 | 数量 | 耗时(ms) | QPS |"
-$report += "|------|------|----------|-----|"
+$report += "| 模式 | QPS(median) | QPS(IQR) | samples |"
+$report += "|------|-------------|----------|---------|"
 foreach ($line in Get-Content $ResultFile -Encoding UTF8) {
     if ($line -match '^RESULT\|create\|') {
-        $report += "| $(Get-Kv $line batch) | $(Get-Kv $line count) | $(Get-Kv $line ms) | $(Get-Kv $line qps) |"
+        $report += "| $(Get-Kv $line batch) | $(Get-Kv $line qps_median) | $(Get-Kv $line qps_iqr) | $(Get-Kv $line samples) |"
     }
 }
 $report += ""
 $report += "## 投递吞吐"
 $report += ""
-$report += "| 档位 | QPS | create_ms | delivery_ms | wake p50/p95/p99 | e2e p50/p95/p99 | overhead p99 | SLO(wake p99) | SLO(e2e p99) |"
-$report += "|------|-----|-----------|-------------|------------------|------------------|--------------|----------------|---------------|"
+$report += "| 档位 | QPS(median) | QPS(IQR) | wake p50/p99 | e2e p50/p99 | overhead p99 | SLO(wake p99) | SLO(e2e p99) |"
+$report += "|------|-------------|----------|--------------|-------------|--------------|----------------|---------------|"
 foreach ($line in Get-Content $ResultFile -Encoding UTF8) {
     if ($line -match '^RESULT\|delivery\|') {
         $tier = Get-Kv $line "tier"
@@ -156,7 +157,7 @@ foreach ($line in Get-Content $ResultFile -Encoding UTF8) {
         $wpass = "PASS"; $epass = "PASS"
         if ($wt -and $w9 -and [int]$w9 -gt [int]$wt) { $wpass = "FAIL" }
         if ($et -and $e9 -and [int]$e9 -gt [int]$et) { $epass = "FAIL" }
-        $report += "| $tier | $(Get-Kv $line qps_mean) | $(Get-Kv $line create_mean_ms) | $(Get-Kv $line delivery_mean_ms) | $(Get-Kv $line wake_p50_ms)/$(Get-Kv $line wake_p95_ms)/$w9 | $(Get-Kv $line e2e_p50_ms)/$(Get-Kv $line e2e_p95_ms)/$e9 | $(Get-Kv $line overhead_p99_ms) | $wpass | $epass |"
+        $report += "| $tier | $(Get-Kv $line qps_median) | $(Get-Kv $line qps_iqr) | $(Get-Kv $line wake_p50_ms)/$w9 | $(Get-Kv $line e2e_p50_ms)/$e9 | $(Get-Kv $line overhead_p99_ms) | $wpass | $epass |"
     }
 }
 $report += ""
@@ -167,6 +168,16 @@ $report += "|------|----------|----------|----------|----------|----------|-----
 foreach ($line in Get-Content $ResultFile -Encoding UTF8) {
     if ($line -match '^RESULT\|tier_config\|') {
         $report += "| $(Get-Kv $line tier) | $(Get-Kv $line scanner) | $(Get-Kv $line consumers) | $(Get-Kv $line queue_capacity) | $(Get-Kv $line max_concurrency) | $(Get-Kv $line window_ms) | $(Get-Kv $line batch_size) |"
+    }
+}
+$report += ""
+$report += "## 消费者数扫参"
+$report += ""
+$report += "| 档位 | consumers | QPS(median) | QPS(IQR) | e2e p99 |"
+$report += "|------|-----------|-------------|----------|---------|"
+foreach ($line in Get-Content $ResultFile -Encoding UTF8) {
+    if ($line -match '^RESULT\|delivery\|' -and $line -match 'consumers=') {
+        $report += "| $(Get-Kv $line tier) | $(Get-Kv $line consumers) | $(Get-Kv $line qps_median) | $(Get-Kv $line qps_iqr) | $(Get-Kv $line e2e_p99_ms) |"
     }
 }
 $report += ""
