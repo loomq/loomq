@@ -80,11 +80,19 @@ PHTW 的 SEC 轮（1s×60）每桶固定 **1024 个 256B 定长槽**，**append-
 - 基准引擎用 `WheelConfig.defaultConfig().withSlotsPerBucket(65_536)`（16MB/桶，基准可接受；ULTRA inFlight=200 远低于此）
 - 解阻塞后创建吞吐 ~40k/s 正常
 
-### 3.5 待评估：彻底修（Step 2，未做）
+### 3.5 彻底修：单槽 compaction（已实现）
 
-**思路**：终态槽回收（compaction），让桶容量 ∝ 活跃在途数而非吞吐史。投递/取消/过期的终态槽被回收，桶里只留 pending 槽。好处：突破单桶上限 + 消内存浪费（不用 16MB 大桶）。代价：持久层改动，涉及 mmap 桶内回收 + 高水位/恢复语义 + 与 `BucketReclaimer`（现在只回收过期桶文件，不回收桶内槽）协调；有崩溃一致性风险。**需独立 spec + plan。**
+采用方向 B（终态槽回收 compaction）的**单槽 compaction** 实现，突破 SEC 桶容量上限并消除大桶内存浪费。提交范围：`ab289a6`（wheel free-list）→ `2509419`（double-free 守卫 + 测试）→ `9222547`/`3936c84`（commandService 终态回收 + 热取消）→ `f0f8d8b`/`4929945`（scheduler 终态原地覆写 + engine 接线）→ `b1b0b42`（验证：回退 1024 桶，零溢出）。
 
-其他方向（见 `.claude/plans/2026-08-07-wheel-bucket-throughput-ceiling.md`）：B. 溢出 spill 到下一层/tail；C. 接受限制文档化；D. 基准退回突发。
+**机制**：
+- 终态（ACKED/DEAD_LETTER/EXPIRED/CANCELED）经 `persistTerminalInPlace` **原地覆写** `locationIndex` 指向的最新槽（不追加）；落盘后 `reclaimTerminal` 清空该槽并加入 `Bucket` 的 free-list 复用。
+- **从未重排程**（无 RETRY/改期）的 Intent 从 create 到终态只占一个槽 → 回收安全，崩溃一致性自动成立（终态槽在 → skip / 空槽 → skip）。
+- **重排程过的多槽 Intent** 只覆写、不回收，保留终态槽作 tombstone，抑制跨桶 stale sibling（与现状 append + max-revision 去重一致）。
+- **顺带收益**：`slotsPerBucket` 回退默认 **1024**，基准 / `StallDetectionTest` 不再用 262144 大桶规避。
+
+**验证**：`StallDetectionTest` 连续 **10 轮零停摆** @默认 1024 桶；`DeliveryPathBenchmark` 各档 `qps_median>0`；fast 测试 **311 通过**。
+
+> 其余方向（见 `.claude/plans/2026-08-07-wheel-bucket-throughput-ceiling.md`）：**C. 溢出 spill**（满桶溢出到下一层/tail）**仍未做**，是唯一遗留的未来方向；D. 接受限制文档化、基准退回突发 已不再需要。
 
 ---
 
@@ -121,20 +129,19 @@ PHTW 的 SEC 轮（1s×60）每桶固定 **1024 个 256B 定长槽**，**append-
 - **回归测试**：`FinalizePersistFailureRegressionTest`（fast-tag，进 CI）——注入恒定失败的终态持久化，断言 `onDelivered` 仍触发 + `persistFailures` 记录。
 - **验证**：`StallDetectionTest` 连续 **10 轮零停摆** + fast 306 通过；ULTRA 投递 `qps_median=24k, e2e_p50=4ms, wake_p99=2ms`（此前 qps_median=0）。
 
-### 4.5 遗留（后续 Issue A spec 接管）
+### 4.5 遗留（仅剩溢出 spill 方向）
 
-容量根治未做，作为后续 Issue A spec 的候选方向（见 §3.5 与 §5）：
-- **B. 终态槽 compaction**（容量跟随活跃在途而非吞吐史）
-- **C. 溢出 spill**（满桶溢出到下一层/TailIndex）
+容量根治（方向 B 单槽 compaction）**已完成**（见 §3.5）。唯一遗留的未来方向：
+- **C. 溢出 spill**（满桶溢出到下一层/TailIndex）—— 未做，作为后续候选（见 §3.5 与 §5）。
 
 ---
 
 ## 5. 决策与遗留项（2026-08-07 已定）
 
 1. **引擎投递停顿（Issue B）**：✅ **已修复**（方案 A 解耦 onDelivered 与终态持久化 + D 基准解阻塞）。见 §4.4。
-2. **容量根治（Issue A）**：**延后**。候选方向 **B. 终态槽 compaction** + **C. 溢出 spill**，作为后续 Issue A spec 评估（见 §3.5、§4.5）。当前基准用 `withSlotsPerBucket(262144)` 规避。
+2. **容量根治（Issue A）**：✅ **已修复**（方向 B 单槽 compaction）。见 §3.5。`slotsPerBucket` 回退默认 1024，基准不再用 262144 规避。唯一遗留未来方向：**C. 溢出 spill**。
 3. **基准投递数字**：✅ 修复后可用（ULTRA 24k QPS 等），README 投递列可更新。
-4. **消费者扫参甜点**：桶容量已解（262144），扫参可测；但注意持续吞吐仍受桶容量约束（非消费者），甜点解读需谨慎。
+4. **消费者扫参甜点**：桶容量已解（默认 1024 桶 + compaction），扫参可测；但注意持续吞吐仍受活跃在途 ≤ 桶容量约束（非消费者），甜点解读需谨慎。
 
 ---
 
