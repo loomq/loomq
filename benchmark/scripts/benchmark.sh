@@ -46,6 +46,17 @@ for arg in "$@"; do
     esac
 done
 
+# ---- pin JDK (25.0.4) ----
+LOOMQ_JAVA_HOME="${LOOMQ_JAVA_HOME:-/usr/lib/jvm/temurin-25.0.4}"
+if [ -x "$LOOMQ_JAVA_HOME/bin/java" ]; then
+    JAVA_HOME="$LOOMQ_JAVA_HOME"
+    export JAVA_HOME
+    export PATH="$JAVA_HOME/bin:$PATH"
+    echo ">>> 使用 JDK: $JAVA_HOME"
+else
+    echo "WARN: JDK 路径未找到: $LOOMQ_JAVA_HOME —— 退回使用 PATH 上的 java/mvn" >&2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RESULTS_DIR="$PROJECT_ROOT/benchmark/results"
