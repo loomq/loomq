@@ -21,12 +21,12 @@ import org.junit.jupiter.api.Test;
 class BucketGroupTest {
 
     private BucketGroup standardGroup;
-    private BucketGroup economyGroup;
+    private BucketGroup fastGroup;
 
     @BeforeEach
     void setUp() {
         standardGroup = new BucketGroup(PrecisionTier.STANDARD);
-        economyGroup = new BucketGroup(PrecisionTier.ECONOMY);
+        fastGroup = new BucketGroup(PrecisionTier.FAST);
     }
 
     @Test
@@ -35,8 +35,8 @@ class BucketGroupTest {
         assertEquals(PrecisionTier.STANDARD, standardGroup.getTier());
         assertEquals(500, standardGroup.getPrecisionWindowMs());
 
-        assertEquals(PrecisionTier.ECONOMY, economyGroup.getTier());
-        assertEquals(1000, economyGroup.getPrecisionWindowMs());
+        assertEquals(PrecisionTier.FAST, fastGroup.getTier());
+        assertEquals(50, fastGroup.getPrecisionWindowMs());
 
         assertEquals(0, standardGroup.getBucketCount());
         assertEquals(0, standardGroup.getPendingCount());

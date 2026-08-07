@@ -71,12 +71,8 @@ class SignalDrivenConsumerTest {
             WalMode.DURABLE, 10, false, true, 200_000));
         profiles.put(PrecisionTier.FAST, new PrecisionTierProfile(50, 150, 1, 10, 1, 150 * 16,
             WalMode.DURABLE, 50, false, true, 200_000));
-        profiles.put(PrecisionTier.HIGH, new PrecisionTierProfile(100, 50, 5, 50, 1, 50 * 16,
-            WalMode.DURABLE, 100, false, true, 200_000));
         profiles.put(PrecisionTier.STANDARD, new PrecisionTierProfile(500, 50, 20, 100, 1, 50 * 16,
             WalMode.DURABLE, 500, false, true, 200_000));
-        profiles.put(PrecisionTier.ECONOMY, new PrecisionTierProfile(1000, 50, 25, 300, 1, 50 * 16,
-            WalMode.DURABLE, 1000, false, true, 200_000));
         profiles.put(PrecisionTier.MILLI, new PrecisionTierProfile(1, 100, 1, 1, 1, 100 * 16,
             WalMode.DURABLE, 1, true, true, 200_000));
         return PrecisionTierCatalog.of(profiles, PrecisionTier.STANDARD);

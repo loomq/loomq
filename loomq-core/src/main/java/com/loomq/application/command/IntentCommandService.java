@@ -662,12 +662,10 @@ public final class IntentCommandService {
         }
         // 2. Intent-level walMode override
         if (intent.getWalMode() != null) {
-            // H1: BATCH_DEFERRED 在 group-commit 架构下等价 ASYNC(周期 fsync 已覆盖)
-            return intent.getWalMode() == WalMode.BATCH_DEFERRED ? WalMode.ASYNC : intent.getWalMode();
+            return intent.getWalMode();
         }
-        // 3. Fall back to tier default; tier 默认若为 BATCH_DEFERRED 亦归一为 ASYNC
-        WalMode tierDefault = PrecisionTierCatalog.defaultCatalog().walMode(intent.getPrecisionTier());
-        return tierDefault == WalMode.BATCH_DEFERRED ? WalMode.ASYNC : tierDefault;
+        // 3. Fall back to tier default
+        return PrecisionTierCatalog.defaultCatalog().walMode(intent.getPrecisionTier());
     }
 
     /** 包级测试入口(同包测试断言 resolveWalMode 行为)。不作为公共 API。 */

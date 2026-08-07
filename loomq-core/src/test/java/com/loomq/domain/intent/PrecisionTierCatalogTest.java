@@ -15,7 +15,7 @@ class PrecisionTierCatalogTest {
 
     private static final Map<PrecisionTier, PrecisionTierProfile> SAMPLE_PROFILES = Map.of(
         PrecisionTier.ULTRA, new PrecisionTierProfile(10, 200, 1, 5, 16),
-        PrecisionTier.HIGH, new PrecisionTierProfile(100, 50, 5, 50, 4),
+        PrecisionTier.MILLI, new PrecisionTierProfile(1, 100, 1, 1, 8),
         PrecisionTier.STANDARD, new PrecisionTierProfile(500, 50, 20, 100, 3)
     );
 
@@ -110,9 +110,10 @@ class PrecisionTierCatalogTest {
     }
 
     @Test
-    void defaultCatalogShouldHaveAllSixTiers() {
+    void defaultCatalogShouldHaveAllFourTiers() {
+        // v0.9.x 精简：HIGH→FAST、ECONOMY→STANDARD，余 ULTRA/FAST/STANDARD/MILLI
         PrecisionTierCatalog catalog = PrecisionTierCatalog.defaultCatalog();
-        assertEquals(6, catalog.tierCount());
+        assertEquals(4, catalog.tierCount());
     }
 
     @Test

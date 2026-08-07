@@ -29,7 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>每个档位执行 1 次预热（200 intents）+ 5 次测量（500 intents/次）。
  * 输出 RESULT|delivery|... 标记，兼容 benchmark 脚本解析。
  * 性能断言：DURABLE delivery overhead p99 < 档位精度窗口 + 100ms（按档位校准；
- * 开销受 wake 粒度≈窗口/2 约束，粗档天然更大，统一阈值会误报 ECONOMY 等粗档）。
+ * 开销受 wake 粒度≈窗口/2 约束，粗档天然更大，统一阈值会误报 STANDARD 等粗档）。
  *
  * <p>关键指标 <b>Delivery overhead</b> = E2E p99 - wakeup p99，隔离了 finalizeIntent 中
  * awaitCommit 的代价（I2 修复引入的开销）。
@@ -70,11 +70,6 @@ class DeliveryPathBenchmark {
     }
 
     @Test
-    void measureDeliveryThroughput_High(@TempDir Path tmp) throws Exception {
-        measureDelivery(tmp, PrecisionTier.HIGH);
-    }
-
-    @Test
     void measureDeliveryThroughput_Milli(@TempDir Path tmp) throws Exception {
         measureDelivery(tmp, PrecisionTier.MILLI);
     }
@@ -84,16 +79,11 @@ class DeliveryPathBenchmark {
         measureDelivery(tmp, PrecisionTier.STANDARD);
     }
 
-    @Test
-    void measureDeliveryThroughput_Economy(@TempDir Path tmp) throws Exception {
-        measureDelivery(tmp, PrecisionTier.ECONOMY);
-    }
-
     private void measureDelivery(Path tmp, PrecisionTier tier) throws Exception {
         var profile = PrecisionTierCatalog.defaultCatalog().profile(tier);
         int consumers = profile.consumerCount();
         // 开销阈值按档位精度窗口设置：开销受 wake 粒度（≈窗口/2）约束，粗档天然更大。
-        // ECONOMY(1000ms) 开销≈500ms，远高于 ULTRA(10ms) 的≈4ms；统一 500ms 会误报粗档。
+        // STANDARD(500ms) 开销≈250ms，远高于 ULTRA(10ms) 的≈4ms；统一 500ms 会误报粗档。
         long overheadThresholdMs = profile.precisionWindowMs() + 100;
 
         try (LoomqEngine engine = LoomqEngine.builder()

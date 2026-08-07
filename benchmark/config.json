@@ -2,9 +2,7 @@
   "slo": {
     "ULTRA":    { "p95_wakeup_ms": 15,  "p99_wakeup_ms": 25,  "p95_e2e_ms": 50,  "p99_e2e_ms": 100 },
     "FAST":     { "p95_wakeup_ms": 50,  "p99_wakeup_ms": 60,  "p95_e2e_ms": 100, "p99_e2e_ms": 200 },
-    "HIGH":     { "p95_wakeup_ms": 100, "p99_wakeup_ms": 120, "p95_e2e_ms": 200, "p99_e2e_ms": 400 },
     "STANDARD": { "p95_wakeup_ms": 500, "p99_wakeup_ms": 600, "p95_e2e_ms": 800, "p99_e2e_ms": 1500 },
-    "ECONOMY":  { "p95_wakeup_ms": 1000, "p99_wakeup_ms": 1200, "p95_e2e_ms": 1500, "p99_e2e_ms": 3000 },
     "MILLI":    { "p95_wakeup_ms": 1,   "p99_wakeup_ms": 5,   "p95_e2e_ms": 5,   "p99_e2e_ms": 20 }
   },
   "rotation": {

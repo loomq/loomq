@@ -121,7 +121,7 @@ class CohortManagerTest {
 
             // Register multiple intents with the same executeAt to create one cohort
             for (int i = 0; i < 5; i++) {
-                Intent intent = readyIntent("batch-" + i, 5, PrecisionTier.HIGH);
+                Intent intent = readyIntent("batch-" + i, 5, PrecisionTier.STANDARD);
                 cm.register(intent);
             }
 

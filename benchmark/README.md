@@ -45,8 +45,8 @@ benchmark/
 | 类 | 测试 | 输出 RESULT 标记 |
 |----|------|------------------|
 | `CreateIntentBenchmark` | createIntent / createIntents 批量 DURABLE 吞吐 | `RESULT\|create\|` |
-| `DeliveryPathBenchmark` | 6 档（ULTRA/FAST/HIGH/STANDARD/ECONOMY/MILLI）schedule→deliver→ACKED 吞吐与延迟 + 档位配置盘点 | `RESULT\|delivery\|` / `RESULT\|tier_config\|` |
-| `PrecisionLatencyBenchmark` | 全 6 档（MILLI/ULTRA/FAST/HIGH/STANDARD/ECONOMY）触发精度 p50/p99/p999 + 空闲 CPU | `RESULT\|precision\|` |
+| `DeliveryPathBenchmark` | 4 档（ULTRA/FAST/STANDARD/MILLI）schedule→deliver→ACKED 吞吐与延迟 + 档位配置盘点 | `RESULT\|delivery\|` / `RESULT\|tier_config\|` |
+| `PrecisionLatencyBenchmark` | 全 4 档（MILLI/ULTRA/FAST/STANDARD）触发精度 p50/p99/p999 + 空闲 CPU | `RESULT\|precision\|` |
 
 MILLI 档为 1ms 事件驱动直插桶，吞吐语义与批量档不同（单发、信号驱动），但同一套投递测量逻辑适用。
 
@@ -92,7 +92,7 @@ MD 报告包含五部分：
 | 创建吞吐 | 单发/批量 QPS、耗时 |
 | 投递吞吐 | 每档 QPS、create/delivery 耗时、wake/E2E p50/p95/p99、overhead p99、SLO 通过/失败 |
 | 档位资源盘点 | 每档扫描模式、消费者数、队列容量、最大并发、窗口、批量大小（精简决策的收益侧） |
-| 触发精度 | 每档（全 6 档）p50/p99/p999 |
+| 触发精度 | 每档（全 4 档）p50/p99/p999 |
 
 投递的 SLO 通过/失败对照 `config.json` 中该档的 `p99_wakeup_ms` 与 `p99_e2e_ms`。
 
@@ -119,7 +119,7 @@ MD 报告包含五部分：
 }
 ```
 
-**wake SLO 校准规则**：fixed-rate 档（FAST/HIGH/STANDARD/ECONOMY）的 wake 延迟
+**wake SLO 校准规则**：fixed-rate 档（FAST/STANDARD）的 wake 延迟
 结构上呈 uniform[0, window]（桶下取整 + 固定轮询拾取），任何低于 window 的
 wake SLO 都会在某个分位上必然失败。因此 fixed-rate 档按
 `p95_wakeup = 1.0 × window`、`p99_wakeup = 1.2 × window` 校准——其判别目标是

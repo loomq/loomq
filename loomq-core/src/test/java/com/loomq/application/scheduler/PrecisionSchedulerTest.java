@@ -243,7 +243,7 @@ class PrecisionSchedulerTest {
     void isTierUnderBackpressureShouldReturnFalseWhenNotUnderPressure() {
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         scheduler = new PrecisionScheduler(intentStore, handler, null);
-        assertFalse(scheduler.isTierUnderBackpressure(PrecisionTier.ECONOMY));
+        assertFalse(scheduler.isTierUnderBackpressure(PrecisionTier.STANDARD));
     }
 
     @Test

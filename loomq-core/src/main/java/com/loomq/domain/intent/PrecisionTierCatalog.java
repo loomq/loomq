@@ -89,6 +89,12 @@ public final class PrecisionTierCatalog {
     public boolean isAdaptive(PrecisionTier tier) { return profile(tier).adaptiveScan(); }
     public int maxBuckets(PrecisionTier tier) { return profile(tier).maxBuckets(); }
 
+    /**
+     * 按 ordinal 位置解码精度档位(仅存活档 0..3)。越界回退默认档。
+     * 【边界】此处不应用 PrecisionTier.LEGACY_REMAPS:新格式 ordinal 2 是 STANDARD,旧 HIGH
+     * 也是 ordinal 2(碰撞),重映射会窜改合法新数据。remap 仅对 fromString 的 runtime/config
+     * 输入生效;旧 wheel 数据按 v0.9.x ordinal 断裂契约清库,不做兼容读取。
+     */
     public PrecisionTier tierByOrdinal(int ordinal) {
         if (ordinal < 0 || ordinal >= supportedTiers.size()) {
             return defaultTier;
@@ -109,17 +115,14 @@ public final class PrecisionTierCatalog {
     }
 
     private static PrecisionTierCatalog createDefault() {
+        // 四档（v0.9.x 精简：HIGH→FAST(50ms)、ECONOMY→STANDARD(500ms)，画像沿用被保留档）
         EnumMap<PrecisionTier, PrecisionTierProfile> profiles = new EnumMap<>(PrecisionTier.class);
         profiles.put(PrecisionTier.ULTRA, new PrecisionTierProfile(10, 200, 1, 5, 16, 200 * 16,
             WalMode.DURABLE, 10, false, true));
         profiles.put(PrecisionTier.FAST, new PrecisionTierProfile(50, 150, 1, 10, 12, 150 * 16,
             WalMode.DURABLE, 50));
-        profiles.put(PrecisionTier.HIGH, new PrecisionTierProfile(100, 50, 5, 50, 4, 50 * 16,
-            WalMode.BATCH_DEFERRED, 100));
         profiles.put(PrecisionTier.STANDARD, new PrecisionTierProfile(500, 50, 20, 100, 3, 50 * 16,
             WalMode.DURABLE, 500));
-        profiles.put(PrecisionTier.ECONOMY, new PrecisionTierProfile(1000, 50, 25, 300, 2, 50 * 16,
-            WalMode.DURABLE, 1000));
         profiles.put(PrecisionTier.MILLI, new PrecisionTierProfile(
             1,          // precisionWindowMs
             100,        // maxConcurrency

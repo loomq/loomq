@@ -34,10 +34,10 @@ class TierAdvisorTest {
         }
 
         @Test
-        @DisplayName("maxTardinessMs=250ms → HIGH (100ms window ≤ 125ms safety)")
-        void highFor250ms() {
+        @DisplayName("maxTardinessMs=250ms → FAST (50ms window ≤ 125ms safety)")
+        void fastFor250ms() {
             var rec = TierAdvisor.recommend(250, Reliability.AT_LEAST_ONCE);
-            assertEquals(PrecisionTier.HIGH, rec.tier());
+            assertEquals(PrecisionTier.FAST, rec.tier());
         }
 
         @Test
@@ -48,10 +48,10 @@ class TierAdvisorTest {
         }
 
         @Test
-        @DisplayName("maxTardinessMs=3000ms → ECONOMY (1000ms window ≤ 1500ms safety)")
-        void economyFor3000ms() {
+        @DisplayName("maxTardinessMs=3000ms → STANDARD (500ms window ≤ 1500ms safety)")
+        void standardFor3000ms() {
             var rec = TierAdvisor.recommend(3000, Reliability.AT_LEAST_ONCE);
-            assertEquals(PrecisionTier.ECONOMY, rec.tier());
+            assertEquals(PrecisionTier.STANDARD, rec.tier());
         }
 
         @Test

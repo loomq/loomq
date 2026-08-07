@@ -2,7 +2,7 @@
 # LoomQ 性能基准测试 (Linux/macOS)
 #
 # 用法:
-#   ./benchmark.sh                       # 全量 (Create + Delivery 6 档 + Precision)
+#   ./benchmark.sh                       # 全量 (Create + Delivery 4 档 + Precision)
 #   ./benchmark.sh --quick               # 快速 (跳过耗时最长的 Precision)
 #   ./benchmark.sh --scenario=create     # 仅 CreateIntentBenchmark
 #   ./benchmark.sh --scenario=delivery   # 仅 DeliveryPathBenchmark

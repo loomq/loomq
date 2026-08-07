@@ -23,9 +23,9 @@ class BackpressureBehaviorTest {
 
     private PrecisionTierCatalog tinyQueueCatalog() {
         EnumMap<PrecisionTier, PrecisionTierProfile> profiles = new EnumMap<>(PrecisionTier.class);
-        profiles.put(PrecisionTier.ECONOMY, new PrecisionTierProfile(
+        profiles.put(PrecisionTier.STANDARD, new PrecisionTierProfile(
             1000, 1, 1, 100, 1, 2, WalMode.DURABLE, 200));
-        return PrecisionTierCatalog.of(profiles, PrecisionTier.ECONOMY);
+        return PrecisionTierCatalog.of(profiles, PrecisionTier.STANDARD);
     }
 
     @Test
@@ -40,25 +40,25 @@ class BackpressureBehaviorTest {
         PrecisionScheduler scheduler = new PrecisionScheduler(
             store, blockingHandler, null, catalog, mc, new IntentTraceStore());
 
-        long beforeOfferFailed = mc.getDispatchQueueOfferFailed(PrecisionTier.ECONOMY);
+        long beforeOfferFailed = mc.getDispatchQueueOfferFailed(PrecisionTier.STANDARD);
         long beforeBackpressure = mc.getBackpressureEventsByTier()
-            .getOrDefault(PrecisionTier.ECONOMY, 0L);
+            .getOrDefault(PrecisionTier.STANDARD, 0L);
 
         scheduler.start();
         try {
             for (int i = 0; i < 5; i++) {
                 Intent intent = new Intent("intent_bp_" + i);
                 intent.setExecuteAt(Instant.now().minusMillis(100));
-                intent.setPrecisionTier(PrecisionTier.ECONOMY);
+                intent.setPrecisionTier(PrecisionTier.STANDARD);
                 intent.transitionTo(IntentStatus.SCHEDULED);
                 scheduler.schedule(intent);
             }
 
             Thread.sleep(1000);
 
-            long afterOfferFailed = mc.getDispatchQueueOfferFailed(PrecisionTier.ECONOMY);
+            long afterOfferFailed = mc.getDispatchQueueOfferFailed(PrecisionTier.STANDARD);
             long afterBackpressure = mc.getBackpressureEventsByTier()
-                .getOrDefault(PrecisionTier.ECONOMY, 0L);
+                .getOrDefault(PrecisionTier.STANDARD, 0L);
 
             assertTrue(afterOfferFailed > beforeOfferFailed,
                 "dispatch queue offer-failed metric must increment when queue is full");
@@ -85,7 +85,7 @@ class BackpressureBehaviorTest {
         try {
             Intent intent = new Intent("intent_bp_status");
             intent.setExecuteAt(Instant.now().minusMillis(100));
-            intent.setPrecisionTier(PrecisionTier.ECONOMY);
+            intent.setPrecisionTier(PrecisionTier.STANDARD);
             intent.transitionTo(IntentStatus.SCHEDULED);
             scheduler.schedule(intent);
 

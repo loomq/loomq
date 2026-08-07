@@ -118,7 +118,7 @@ stateDiagram-v2
 
 **取消语义**：cancel 是 best-effort 操作。对于已进入 DISPATCHING 状态的 Intent，异步投递可能已完成、事件可能已到达下游，cancel 无法撤销。下游业务方必须自行保证处理逻辑的幂等性。
 
-### 3.2 五档精度
+### 3.2 四档精度
 
 预置于 `PrecisionTierCatalog.createDefault()`，默认档位 **STANDARD**。每档拥有独立的扫描线程、有界派发队列、批量消费者组和信号量。
 
@@ -126,9 +126,8 @@ stateDiagram-v2
 |------|---------:|---------:|---------:|---------:|---------:|---------:|---------:|--------------|
 | ULTRA | 10 ms | 10 ms | 200 | 1（单发） | 5 ms | 16 | 3200 | DURABLE |
 | FAST | 50 ms | 50 ms | 150 | 1（单发） | 10 ms | 12 | 2400 | DURABLE |
-| HIGH | 100 ms | 100 ms | 50 | 5 | 50 ms | 4 | 800 | BATCH_DEFERRED |
 | STANDARD | 500 ms | 500 ms | 50 | 20 | 100 ms | 3 | 800 | DURABLE |
-| ECONOMY | 1000 ms | 1000 ms | 50 | 25 | 300 ms | 2 | 800 | DURABLE |
+| MILLI | 1 ms | 1 ms | 100 | 1（单发） | 1 ms | 8 | 1600 | DURABLE |
 
 `batchSize=1` 的档位（ULTRA/FAST）走单 Intent 消费循环；其余走 `drainTo` 批量消费循环，调用 `DeliveryHandler.deliverBatchAsync()`。
 
@@ -172,7 +171,7 @@ stateDiagram-v2
 
 ### 4.5 过期检查（分频）
 
-`intentExpiryIndex`（`ConcurrentSkipListMap<epochMs, Set<intentId>>`）替代全量扫描。按档位分频执行：ULTRA/FAST 每周期、HIGH 每 3 周期、STANDARD 每 5 周期、ECONOMY 每 10 周期。命中 `deadline` 且非终态的 Intent 按 `expiredAction` 转 EXPIRED 或 DEAD_LETTERED。
+`intentExpiryIndex`（`ConcurrentSkipListMap<epochMs, Set<intentId>>`）替代全量扫描。按档位分频执行：MILLI/ULTRA/FAST 每周期、STANDARD 每 5 cycle（最大过期延迟 2500ms）。命中 `deadline` 且非终态的 Intent 按 `expiredAction` 转 EXPIRED 或 DEAD_LETTERED。
 
 ## 5. 持久化子系统（PHTW）
 
@@ -207,7 +206,6 @@ stateDiagram-v2
 |------|----------|----------|
 | `DURABLE`（默认） | `awaitCommit()` 等到覆盖本次写入的 group-commit msync 完成 | 无 |
 | `ASYNC` | 字节进 mmap 即返回，由 daemon 周期落盘 | ≤ `groupCommitIntervalMs` |
-| `BATCH_DEFERRED` | 归一化为 ASYNC | 同 ASYNC |
 | `AckMode.REPLICATED` | 预留，当前映射 DURABLE | 无 |
 
 **状态变更操作（update / cancel / fireNow）硬编码 DURABLE**——即使 Intent 以 ASYNC 创建，其取消/改期也必然落盘后才返回。

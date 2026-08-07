@@ -840,17 +840,13 @@ public class PrecisionScheduler {
      * 判断当前 scan cycle 是否需要执行过期检查（分频策略）
      *
      * MILLI/ULTRA/FAST: 每 cycle（延迟敏感）
-     * HIGH: 每 3 cycle（最大过期延迟 400ms）
-     * STANDARD: 每 5 cycle（最大过期延迟 3000ms）
-     * ECONOMY: 每 10 cycle（最大过期延迟 11000ms）
+     * STANDARD: 每 5 cycle（最大过期延迟 2500ms）
      */
     private boolean shouldCheckExpired(PrecisionTier tier) {
         long count = expiredCheckCounters.get(tier).incrementAndGet();
         int interval = switch (tier) {
             case MILLI, ULTRA, FAST -> 1;
-            case HIGH -> 3;
             case STANDARD -> 5;
-            case ECONOMY -> 10;
         };
         return count % interval == 0;
     }
@@ -870,7 +866,7 @@ public class PrecisionScheduler {
             // Single-intent mode (MILLI, ULTRA, FAST)
             runSingleIntentConsumer(tier, queue);
         } else {
-            // Batch mode (HIGH, STANDARD, ECONOMY)
+            // Batch mode (STANDARD)
             runBatchDrainConsumer(tier, queue, batchSize, batchWindowMs);
         }
     }

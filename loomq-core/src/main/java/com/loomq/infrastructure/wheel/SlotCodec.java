@@ -153,7 +153,7 @@ public final class SlotCodec {
                 case 0x04 -> deadline = b.getLong();
                 case 0x05 -> expiredAction = ExpiredAction.values()[b.get()];
                 case 0x06 -> tier = PrecisionTierCatalog.defaultCatalog().tierByOrdinal(b.get() & 0xFF);
-                case 0x07 -> walMode = WalMode.values()[b.get()];
+                case 0x07 -> walMode = decodeWalMode(b.get() & 0xFF);
                 case 0x08 -> shardKey = getStr(b, len);
                 case 0x09 -> shardId = getStr(b, len);
                 case 0x0B -> attempts = b.getInt();
@@ -172,6 +172,19 @@ public final class SlotCodec {
             deadline == 0 ? null : Instant.ofEpochMilli(deadline),
             expiredAction, tier, walMode, shardKey, shardId,
             null, null, idempotencyKey, tags, attempts, lastDeliveryId, revision);
+    }
+
+    /**
+     * v0.9.x 精简:WalMode 仅剩 ASYNC(0)/DURABLE(1)。越界 ordinal(如断裂前的旧 DURABLE=2)
+     * 返回 null,由调用方回退 tier 默认档;与 PrecisionTierCatalog.tierByOrdinal 的守卫同旨
+     * (都避免 ArrayIndexOutOfBoundsException),但返回 null 而非 defaultTier——WalMode 无
+     * "默认值"概念,回退交给 resolveWalMode。注意:断裂前的旧 BATCH_DEFERRED ordinal=1 在本
+     * 枚举中落在界内,会读成 DURABLE,属清库契约内的一次性碰撞,不返回 null。
+     */
+    static WalMode decodeWalMode(int ordinal) {
+        return ordinal >= 0 && ordinal < WalMode.values().length
+            ? WalMode.values()[ordinal]
+            : null;
     }
 
     private static void putStr(ByteBuffer b, byte type, String v) {

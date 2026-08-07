@@ -288,7 +288,7 @@ class IntentStateTransitionTest {
             null,
             "intent-acked", IntentStatus.ACKED,
             Instant.now(), Instant.now(), Instant.now(), null,
-            ExpiredAction.DISCARD, PrecisionTier.HIGH, null,
+            ExpiredAction.DISCARD, PrecisionTier.FAST, null,
             "s", "s1",
             null, null, null, Map.of(), 1, null, 2L
         );
