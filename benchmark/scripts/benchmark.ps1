@@ -28,7 +28,8 @@ param(
     [switch]$Quick,
     [string]$Scenario = "all",
     [switch]$NoCompile,
-    [switch]$Compare
+    [switch]$Compare,
+    [string]$JavaHome = "D:\Development\JDKs\jdk-25.0.4"
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,6 +43,15 @@ $ReportsDir = Join-Path $ResultsDir "reports"
 $LogsDir = Join-Path $ResultsDir "logs"
 $ConfigPath = Join-Path $ProjectRoot "benchmark\config.json"
 New-Item -ItemType Directory -Force -Path $ReportsDir, $LogsDir | Out-Null
+
+# ---- pin JDK (25.0.4) ----
+if (Test-Path "$JavaHome\bin\java.exe") {
+    $env:JAVA_HOME = $JavaHome
+    $env:Path = "$JavaHome\bin;" + $env:Path
+    Write-Host ">>> 使用 JDK: $JavaHome"
+} else {
+    Write-Warning "JDK 路径未找到: $JavaHome —— 退回使用 PATH 上的 java/mvn。"
+}
 
 $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $DateIso = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
