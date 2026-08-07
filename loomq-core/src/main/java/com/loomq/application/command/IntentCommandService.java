@@ -485,7 +485,9 @@ public final class IntentCommandService {
             return true;
         } catch (RuntimeException e) {
             logger.error("Failed to cancel intent: id={}", intentId, e);
-            // 回滚：transitionTo 已成功但持久化失败，恢复原状态并重新加入调度
+            // 回滚：清理待回收记录（不 free 槽——intent 回滚为活态，槽仍是其 tombstone）
+            pendingReclaims.remove(intentId);
+            multiSlotIntents.remove(intentId);
             if (oldStatus != null && intent.getStatus() != oldStatus) {
                 intent.rollbackStatus(oldStatus, oldUpdatedAt, oldRevision);
                 scheduler.restore(intent);
