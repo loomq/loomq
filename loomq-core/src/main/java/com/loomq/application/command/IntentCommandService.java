@@ -748,14 +748,15 @@ public final class IntentCommandService {
     }
 
     /**
-     * 终态槽回收（须在 awaitCommit 之后调用）：单槽清空入 free-list 复用；多槽保留 tombstone。
-     * 无论单多槽都清理 multiSlotIntents，避免集合泄漏。
+     * 终态槽回收（须在 awaitCommit 之后调用）：先清 locationIndex（终态不索引，杜绝 freed 槽被
+     * stale 别名误复用），单槽清空入 free-list 复用；多槽保留 tombstone。无论单多槽都清理
+     * multiSlotIntents，避免集合泄漏。
      */
     public void reclaimTerminal(String intentId) {
         PendingReclaim pr = pendingReclaims.remove(intentId);
-        if (pr == null) return;
         try {
-            if (pr.singleSlot() && !pr.loc().inTail()) {
+            locationIndex.remove(intentId);            // 先清索引，再回收槽（对齐热取消顺序）
+            if (pr != null && pr.singleSlot() && !pr.loc().inTail()) {
                 wheelStore.freeSlot(pr.loc());
                 logger.debug("Reclaimed terminal slot {} for intent {}", pr.loc(), intentId);
             }
