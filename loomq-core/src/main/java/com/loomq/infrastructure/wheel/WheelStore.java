@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
@@ -45,6 +46,8 @@ public final class WheelStore implements AutoCloseable {
     // tier → (bucketKey → Bucket)
     private final Map<WheelTier, ConcurrentHashMap<Long, Bucket>> wheels = new EnumMap<>(WheelTier.class);
     private final Arena arena = Arena.ofShared();
+    /** 空槽模板:status=0。free 时整槽清零,readSlot/isOccupied 据此判空。 */
+    private static final byte[] EMPTY_SLOT = new byte[SlotCodec.SLOT_SIZE];
 
     public WheelStore(WheelConfig config, LongSupplier clock) {
         this.config = config;
@@ -67,7 +70,7 @@ public final class WheelStore implements AutoCloseable {
                          try {
                              long key = Long.parseLong(p.getFileName().toString().replace(".bin", ""));
                              Bucket b = openBucket(tier, key);
-                             b.recoverHighWaterMark();
+                             b.rebuildFreeList();
                              wheels.get(tier).put(key, b);
                          } catch (Exception e) { log.warn("skip bucket {}", p, e); }
                      });
@@ -250,6 +253,22 @@ public final class WheelStore implements AutoCloseable {
         }
     }
 
+    /** 原地覆写已有槽（终态原地写，不分配新槽）。tail / 缺桶 / 缺槽则 no-op。 */
+    public void overwriteSlot(SlotLocation loc, byte[] encoded) {
+        if (loc.inTail() || loc.slotIndex() < 0) return;
+        Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
+        if (b == null) return;
+        b.write(loc.slotIndex(), encoded);
+    }
+
+    /** 回收槽：清空 + 入 free-list。tail / 缺桶 / 缺槽则 no-op。 */
+    public void freeSlot(SlotLocation loc) {
+        if (loc.inTail() || loc.slotIndex() < 0) return;
+        Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
+        if (b == null) return;
+        b.free(loc.slotIndex());
+    }
+
     /** 暴露 WheelTier 的 windowMs(供 BucketReclaimer 计算过期)。 */
     public long tierWindowMs(WheelTier tier) { return tier.windowMs; }
 
@@ -295,6 +314,8 @@ public final class WheelStore implements AutoCloseable {
     private final class Bucket {
         final WheelTier tier; final long bucketKey; final Path path; final FileChannel channel;
         final MemorySegment seg; final AtomicInteger next = new AtomicInteger(0);
+        /** 回收槽 free-list：alloc 先复用，空则 next 单调分配。纯内存可重建（重启全桶扫描）。 */
+        final ConcurrentLinkedDeque<Integer> freeList = new ConcurrentLinkedDeque<>();
         private final AtomicLong writeCount = new AtomicLong();
         private volatile long flushedWriteCount = 0;
         private volatile boolean closed = false;
@@ -307,6 +328,8 @@ public final class WheelStore implements AutoCloseable {
         private final ReadWriteLock forceLock = new ReentrantReadWriteLock();
         Bucket(WheelTier t, long k, Path p, FileChannel ch, MemorySegment m) { tier=t; bucketKey=k; path=p; channel=ch; seg=m; }
         int alloc() {
+            Integer freed = freeList.poll();
+            if (freed != null) return freed;
             int idx = next.getAndIncrement();
             if (idx >= slotsPerBucket) {
                 // Wave3: 用可识别的 SlotOverflowException 替代裸 IllegalStateException,
@@ -315,6 +338,11 @@ public final class WheelStore implements AutoCloseable {
                     + " (slotsPerBucket=" + slotsPerBucket + "); consider widening the time window or adding overflow chain");
             }
             return idx;
+        }
+        /** 回收槽：写 status=0 空槽 + 入 free-list（供 alloc 复用）。 */
+        void free(int slot) {
+            write(slot, EMPTY_SLOT);
+            freeList.push(slot);
         }
         void write(int slot, byte[] data) {
             long off = (long) slot * SlotCodec.SLOT_SIZE;
@@ -335,15 +363,18 @@ public final class WheelStore implements AutoCloseable {
             MemorySegment.copy(seg, off, MemorySegment.ofArray(buf), 0, SlotCodec.SLOT_SIZE);
             return buf;
         }
-        /** 启动恢复:扫描槽位找到第一个空槽(高水位),设为 next,防重启覆写。 */
-        void recoverHighWaterMark() {
-            int high = 0;
+        /** 启动恢复：全桶扫描，占用槽取高水位，空槽入 free-list；next = maxOccupied + 1。 */
+        void rebuildFreeList() {
+            int maxOccupied = -1;
+            freeList.clear();
             for (int i = 0; i < slotsPerBucket; i++) {
-                byte[] slot = read(i);
-                if (!SlotCodec.isOccupied(slot)) { high = i; break; }
-                high = i + 1;
+                if (SlotCodec.isOccupied(read(i))) {
+                    maxOccupied = i;
+                } else {
+                    freeList.offer(i);
+                }
             }
-            next.set(high);
+            next.set(maxOccupied + 1);
         }
         boolean hasUnflushed() { return writeCount.get() > flushedWriteCount; }
 
