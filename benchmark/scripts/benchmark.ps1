@@ -99,7 +99,9 @@ Write-Host ">>> 运行基准测试 (场景: $Scenario, 测试: $TestSelect)"
 $LogFile = Join-Path $LogsDir "benchmark-$Timestamp.log"
 Push-Location $ProjectRoot
 try {
-    & mvn test -pl loomq-core "-Dtest=$TestSelect" "-Dtest.excludedGroups=" "-Dsweep.consumers=$SweepConsumers" *> $LogFile
+    $mvnArgs = @("test", "-pl", "loomq-core", "-Dtest=$TestSelect", "-Dtest.excludedGroups=")
+    if ($SweepConsumers) { $mvnArgs += "-Dsweep.consumers=$SweepConsumers" }
+    & mvn @mvnArgs *> $LogFile
 } finally {
     Pop-Location
 }

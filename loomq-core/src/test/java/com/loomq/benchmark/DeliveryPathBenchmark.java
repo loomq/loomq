@@ -34,7 +34,7 @@ class DeliveryPathBenchmark {
     private void measureDelivery(Path tmp, PrecisionTier tier) throws Exception {
         var base = PrecisionTierCatalog.defaultCatalog();
         String sweepProp = System.getProperty("sweep.consumers");
-        if (sweepProp != null) {
+        if (sweepProp != null && !sweepProp.isBlank()) {
             for (var catalog : SweepDriver.catalogs(base, tier, SweepParam.CONSUMERS,
                     SweepDriver.parseValues(sweepProp))) {
                 runOne(tmp, tier, catalog);
