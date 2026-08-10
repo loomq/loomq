@@ -34,10 +34,10 @@ class TierAdvisorTest {
         }
 
         @Test
-        @DisplayName("maxTardinessMs=250ms → HIGH (100ms window ≤ 125ms safety)")
-        void highFor250ms() {
+        @DisplayName("maxTardinessMs=250ms → FAST (50ms window ≤ 125ms safety)")
+        void fastFor250ms() {
             var rec = TierAdvisor.recommend(250, Reliability.AT_LEAST_ONCE);
-            assertEquals(PrecisionTier.HIGH, rec.tier());
+            assertEquals(PrecisionTier.FAST, rec.tier());
         }
 
         @Test
@@ -48,18 +48,33 @@ class TierAdvisorTest {
         }
 
         @Test
-        @DisplayName("maxTardinessMs=3000ms → ECONOMY (1000ms window ≤ 1500ms safety)")
-        void economyFor3000ms() {
+        @DisplayName("maxTardinessMs=3000ms → STANDARD (500ms window ≤ 1500ms safety)")
+        void standardFor3000ms() {
             var rec = TierAdvisor.recommend(3000, Reliability.AT_LEAST_ONCE);
-            assertEquals(PrecisionTier.ECONOMY, rec.tier());
+            assertEquals(PrecisionTier.STANDARD, rec.tier());
         }
 
         @Test
-        @DisplayName("maxTardinessMs=5ms 太紧，应 fallback 到 ULTRA 并说明原因")
-        void fallbackToUltra() {
-            var rec = TierAdvisor.recommend(5, Reliability.AT_LEAST_ONCE);
-            assertEquals(PrecisionTier.ULTRA, rec.tier());
+        @DisplayName("maxTardinessMs=1ms 太紧（safetyWindow=0），应 fallback 到最紧档 MILLI 并说明原因")
+        void fallbackToTightest() {
+            var rec = TierAdvisor.recommend(1, Reliability.AT_LEAST_ONCE);
+            assertEquals(PrecisionTier.MILLI, rec.tier());
             assertTrue(rec.rationale().contains("does not meet"));
+        }
+
+        @Test
+        @DisplayName("maxTardinessMs=2ms → MILLI（safetyWindow=1ms，MILLI(1ms) 经循环满足，非 fallback）")
+        void milliForTwoMs() {
+            var rec = TierAdvisor.recommend(2, Reliability.AT_LEAST_ONCE);
+            assertEquals(PrecisionTier.MILLI, rec.tier());
+        }
+
+        @Test
+        @DisplayName("maxTardinessMs=5ms → MILLI（1ms≤2ms safety 裕量，满足 2× 边界）")
+        void milliForFiveMs() {
+            // 注：safetyWindow=5/2=2ms，MILLI(1ms) 满足，故回落为 MILLI 而非 ULTRA。
+            var rec = TierAdvisor.recommend(5, Reliability.AT_LEAST_ONCE);
+            assertEquals(PrecisionTier.MILLI, rec.tier());
         }
 
         @Test

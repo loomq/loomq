@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
@@ -36,12 +37,12 @@ class ChronoscopeSnapshotTest {
                 scheduler.start();
 
                 ChronoscopeSnapshot snapshot = ChronoscopeSnapshot.from(
-                    scheduler, scheduler.getBucketGroupManager(), scheduler.getCohortManager());
+                    scheduler, scheduler.getBucketGroupManager(), scheduler.getCohortManager(), new MetricsCollector());
 
                 assertNotNull(snapshot);
                 assertNotNull(snapshot.tiers());
                 assertNotNull(snapshot.timestamp());
-                assertEquals(5, snapshot.tiers().size());
+                assertEquals(PrecisionTier.values().length, snapshot.tiers().size());
 
                 for (PrecisionTier tier : PrecisionTier.values()) {
                     ChronoscopeSnapshot.TierSnapshot tierSnapshot = snapshot.tiers().get(tier);
@@ -78,7 +79,7 @@ class ChronoscopeSnapshotTest {
                 try { Thread.sleep(50); } catch (InterruptedException ignored) {}
 
                 ChronoscopeSnapshot snapshot = ChronoscopeSnapshot.from(
-                    scheduler, scheduler.getBucketGroupManager(), scheduler.getCohortManager());
+                    scheduler, scheduler.getBucketGroupManager(), scheduler.getCohortManager(), new MetricsCollector());
 
                 assertNotNull(snapshot);
                 Map<PrecisionTier, Integer> pendingCounts = scheduler.getBucketGroupManager().getPendingCounts();
@@ -159,7 +160,7 @@ class ChronoscopeSnapshotTest {
                 scheduler.start();
 
                 ChronoscopeSnapshot snapshot = ChronoscopeSnapshot.from(
-                    scheduler, scheduler.getBucketGroupManager(), scheduler.getCohortManager());
+                    scheduler, scheduler.getBucketGroupManager(), scheduler.getCohortManager(), new MetricsCollector());
 
                 for (PrecisionTier tier : PrecisionTier.values()) {
                     ChronoscopeSnapshot.TierSnapshot tierSnapshot = snapshot.tiers().get(tier);

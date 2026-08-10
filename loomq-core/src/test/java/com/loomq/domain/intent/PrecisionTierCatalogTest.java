@@ -1,6 +1,7 @@
 package com.loomq.domain.intent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -14,7 +15,7 @@ class PrecisionTierCatalogTest {
 
     private static final Map<PrecisionTier, PrecisionTierProfile> SAMPLE_PROFILES = Map.of(
         PrecisionTier.ULTRA, new PrecisionTierProfile(10, 200, 1, 5, 16),
-        PrecisionTier.HIGH, new PrecisionTierProfile(100, 50, 5, 50, 4),
+        PrecisionTier.MILLI, new PrecisionTierProfile(1, 100, 1, 1, 8),
         PrecisionTier.STANDARD, new PrecisionTierProfile(500, 50, 20, 100, 3)
     );
 
@@ -109,9 +110,20 @@ class PrecisionTierCatalogTest {
     }
 
     @Test
-    void defaultCatalogShouldHaveAllFiveTiers() {
+    void defaultCatalogShouldHaveAllFourTiers() {
+        // v0.9.x 精简：HIGH→FAST、ECONOMY→STANDARD，余 ULTRA/FAST/STANDARD/MILLI
         PrecisionTierCatalog catalog = PrecisionTierCatalog.defaultCatalog();
-        assertEquals(5, catalog.tierCount());
+        assertEquals(4, catalog.tierCount());
+    }
+
+    @Test
+    void milliProfileRegisters() {
+        PrecisionTierCatalog c = PrecisionTierCatalog.defaultCatalog();
+        assertTrue(c.isDirectBucket(PrecisionTier.MILLI));
+        assertTrue(c.isAdaptive(PrecisionTier.MILLI));
+        assertEquals(200_000, c.maxBuckets(PrecisionTier.MILLI));
+        assertFalse(c.isDirectBucket(PrecisionTier.STANDARD));
+        assertEquals(1, c.precisionWindowMs(PrecisionTier.MILLI));
     }
 
     @Test

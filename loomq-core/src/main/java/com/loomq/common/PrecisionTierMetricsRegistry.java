@@ -34,6 +34,11 @@ final class PrecisionTierMetricsRegistry {
     // 队列深度 gauge
     private final Map<PrecisionTier, AtomicLong> dispatchQueueSizeByTier = new EnumMap<>(PrecisionTier.class);
 
+    // MILLI directBucket 高水位降级（Phase 2 起使用）+ adaptive 扫描器 park/早醒
+    private final Map<PrecisionTier, AtomicLong> milliFallbackByTier = new EnumMap<>(PrecisionTier.class);
+    private final Map<PrecisionTier, AtomicLong> scannerParkByTier = new EnumMap<>(PrecisionTier.class);
+    private final Map<PrecisionTier, AtomicLong> scannerWakeEarlyByTier = new EnumMap<>(PrecisionTier.class);
+
     // due→dispatch lag histogram
     private final Map<PrecisionTier, ConcurrentHashMap<Integer, AtomicLong>> dispatchQueueLagByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> dispatchQueueLagSampleCountByTier = new EnumMap<>(PrecisionTier.class);
@@ -54,6 +59,9 @@ final class PrecisionTierMetricsRegistry {
             dispatchQueueRetryByTier.put(tier, new AtomicLong(0));
             dispatchQueueAbandonedByTier.put(tier, new AtomicLong(0));
             dispatchQueueSizeByTier.put(tier, new AtomicLong(0));
+            milliFallbackByTier.put(tier, new AtomicLong(0));
+            scannerParkByTier.put(tier, new AtomicLong(0));
+            scannerWakeEarlyByTier.put(tier, new AtomicLong(0));
             dispatchQueueLagByTier.put(tier, new ConcurrentHashMap<>());
             dispatchQueueLagSampleCountByTier.put(tier, new AtomicLong(0));
 
@@ -103,6 +111,11 @@ final class PrecisionTierMetricsRegistry {
     void incrementBackpressureEvent(PrecisionTier tier) {
         resolveCounter(backpressureEventsByTier, tier).incrementAndGet();
     }
+
+    void incrementMilliFallback(PrecisionTier tier) { resolveCounter(milliFallbackByTier, tier).incrementAndGet(); }
+    long getMilliFallback(PrecisionTier tier) { return resolveCounter(milliFallbackByTier, tier).get(); }
+    void recordScannerPark(PrecisionTier tier) { resolveCounter(scannerParkByTier, tier).incrementAndGet(); }
+    void recordScannerWakeEarly(PrecisionTier tier) { resolveCounter(scannerWakeEarlyByTier, tier).incrementAndGet(); }
 
     void incrementDispatchQueueOfferFailed(PrecisionTier tier) {
         resolveCounter(dispatchQueueOfferFailedByTier, tier).incrementAndGet();

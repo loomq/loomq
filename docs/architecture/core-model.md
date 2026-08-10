@@ -15,7 +15,7 @@ It focuses on one thing: making future events happen reliably, with persistence,
 | `Schedule` | The initial placement of an `Intent` into the time kernel. |
 | `Reschedule` | Updating the execution time of an existing `Intent`. |
 | `Expire` | Transitioning an `Intent` past its allowed time window. |
-| `Recover` | Rebuilding pending work after restart from WAL/snapshot state. |
+| `Recover` | Rebuilding pending work after restart by scanning the persistent timing wheel (PHTW). |
 | `Retry` | Re-queuing an `Intent` after a failed delivery attempt. |
 
 ## Model Shape
@@ -33,7 +33,7 @@ flowchart LR
     Schedule --> Scheduler["PrecisionScheduler"]
     Reschedule --> Scheduler
     Expire --> Scheduler
-    Recover --> Recovery["RecoveryPipeline"]
+    Recover --> Recovery["WheelRecovery"]
     Retry --> Delivery["DeliveryHandler / RedeliveryDecider"]
     Deadline --> Delivery
 ```
@@ -87,41 +87,41 @@ LoomQ 的持久性保证取决于创建 Intent 时选择的 `AckMode`。理解�
 
 ### AckMode 对照表
 
-| AckMode | WAL 写入 | API 返回时机 | 崩溃窗口 | 适用场景 |
+| AckMode | 持久化写入 | API 返回时机 | 崩溃窗口 | 适用场景 |
 |:--------|:---------|:------------|:---------|:---------|
-| `ASYNC` | mmap 写入，不等 fsync | 写入内存后立即返回 | **有 — API 返回成功不等于数据已持久化，进程崩溃后 Intent 可能丢失** | 低延迟、明确接受 at-most-once 语义 |
-| `DURABLE`（默认） | fsync 后返回 | 等待 WAL fsync 完成 | 无 — WAL 已落盘 | 大多数业务场景 |
-| `REPLICATED` | fsync + 副本确认 | 等待主节点 fsync + 副本 ack | 无 — 多副本保障 | 金融、交易等零丢失场景 |
+| `ASYNC` | 写入 WheelStore/TailIndex 的 mmap，不等 msync | 写入内存后立即返回 | **有 — API 返回成功不等于数据已持久化，进程崩溃后 Intent 可能丢失** | 低延迟、明确接受 at-most-once 语义 |
+| `DURABLE`（默认） | 阻塞至 group-commit msync 完成 | 等待 group-commit msync 落盘 | 无 — PHTW 已落盘 | 大多数业务场景 |
+| `REPLICATED` | 预留：多副本确认 | 等待多副本 ack | 无 — 多副本保障 | 金融、交易等零丢失场景（未来集群） |
 
 ### 崩溃窗口详解（ASYNC 模式）
 
-`createIntent()` 在 `ASYNC` 模式下的执行流程：
+`createIntent()` 在 `ASYNC` 模式下的执行流程（PHTW 持久化栈）：
 
 ```
-1. intentStore.save(intent)        ← 内存写入
-2. scheduler.schedule(intent)      ← 调度入队
-3. return seq                      ← API 返回 201
-4. walWriter.writeAsync(payload)   ← 异步 WAL 写入（后台）
-   ↕ 崩溃窗口：如果进程在此期间退出，Intent 丢失
-5. WAL mmap flush                  ← 数据落盘
+1. wheelStore.put(intent) 或 tailIndex.put(intent)   ← 写入 mmap 槽位 / tail run 文件
+2. locationIndex.put(intentId, loc)                  ← 更新 intentId→槽位索引
+3. scheduler.schedule(intent) 或 promotionDaemon.register(...)  ← 调度入队（热 ≤60min）/ 注册冷提升 cohort
+4. return seq                                        ← API 返回 201
+   ↕ 崩溃窗口：mmap 写入尚未被 group-commit daemon msync 落盘
+5. group-commit daemon 周期性 msync(forceDirty)      ← 数据落盘
 ```
 
-步骤 3 到步骤 5 之间存在**崩溃窗口**：API 已返回成功，但数据尚未持久化。如果进程在此窗口内崩溃，重启后该 Intent 不会被恢复。
+步骤 4 到步骤 5 之间存在**崩溃窗口**：API 已返回成功，但 mmap 写入尚未被 group-commit daemon 刷盘。如果进程在此窗口内崩溃，重启后该 Intent 不会被恢复。
 
-**这不是 bug，而是设计选择**：`ASYNC` 模式优先吞吐（<1ms 延迟），接受极小概率的数据丢失。
+**这不是 bug，而是设计选择**：`ASYNC` 模式优先吞吐（<1ms 延迟），接受极小概率的数据丢失。`DURABLE` 模式则在写入后阻塞于 `commitBarrier.awaitCommit()`，等待覆盖本次写入的 group-commit msync 完成才返回，故无崩溃窗口。
 
 ### 对比：状态变更操作的持久性
 
 与 `createIntent` 不同，**状态变更操作始终使用 `DURABLE` 模式**：
 
-| 操作 | WAL 模式 | 说明 |
+| 操作 | 持久化模式 | 说明 |
 |:-----|:---------|:-----|
 | `createIntent` | 由 `ackLevel` 参数决定 | 可选 ASYNC/DURABLE/REPLICATED |
 | `updateIntent` | 始终 DURABLE | 硬编码 `AckMode.DURABLE` |
 | `cancelIntent` | 始终 DURABLE | 硬编码 `AckMode.DURABLE` |
 | `fireNow` | 始终 DURABLE | 硬编码 `AckMode.DURABLE` |
 
-这意味着：即使 Intent 以 `ASYNC` 模式创建，后续的取消、更新、立即触发等操作都保证 WAL 落盘后才返回。
+这意味着：即使 Intent 以 `ASYNC` 模式创建，后续的取消、更新、立即触发等操作都保证 PHTW 落盘（group-commit msync）后才返回。
 
 ### 选择建议
 
@@ -145,7 +145,7 @@ LoomQ 的持久性保证取决于创建 Intent 时选择的 `AckMode`。理解�
      REPLICATED           DURABLE      ASYNC           DURABLE
 ```
 
-> **注意**：`REPLICATED` 模式需要 Raft 集群支持。单节点部署下，`REPLICATED` 等同于 `DURABLE`。
+> **注意**：`REPLICATED` 模式为未来集群/多副本能力预留（当前实现映射为 `DURABLE`）。单节点部署下，`REPLICATED` 等同于 `DURABLE`。
 
 ## Public Hooks
 

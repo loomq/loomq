@@ -19,17 +19,11 @@ public class MetricsCollector {
     // 运行时指标
     private final RuntimeMetricsRegistry runtimeMetrics;
 
-    private static final MetricsCollector INSTANCE = new MetricsCollector();
-
-    private MetricsCollector() {
+    public MetricsCollector() {
         this.operationalMetrics = new OperationalMetricsRegistry();
         this.tierMetrics = new PrecisionTierMetricsRegistry(com.loomq.domain.intent.PrecisionTierCatalog.defaultCatalog());
         this.latencyMetrics = new LatencyMetricsRegistry();
         this.runtimeMetrics = new RuntimeMetricsRegistry();
-    }
-
-    public static MetricsCollector getInstance() {
-        return INSTANCE;
     }
 
     public void setWalDataDir(String walDataDir) {
@@ -80,6 +74,10 @@ public class MetricsCollector {
 
     public void incrementIntentsDeadLetter() {
         operationalMetrics.incrementIntentsDeadLetter();
+    }
+
+    public void incrementRecoveryOverdue() {
+        operationalMetrics.incrementRecoveryOverdue();
     }
 
     public void updateBucketMetrics(long bucketIntentCount, long readyQueueSize) {
@@ -134,6 +132,11 @@ public class MetricsCollector {
     public void incrementBackpressureEvent(PrecisionTier tier) {
         tierMetrics.incrementBackpressureEvent(tier);
     }
+
+    /** 记录 directBucket 高水位降级（Phase 2 起使用；按实际档归因，非 defaultTier）。 */
+    public void incrementMilliFallback(PrecisionTier tier) { tierMetrics.incrementMilliFallback(tier); }
+    public void recordScannerPark(PrecisionTier tier) { tierMetrics.recordScannerPark(tier); }
+    public void recordScannerWakeEarly(PrecisionTier tier) { tierMetrics.recordScannerWakeEarly(tier); }
 
     /**
      * 记录 dispatch 队列 offer 失败（队满）
@@ -436,7 +439,7 @@ public class MetricsCollector {
         return runtimeMetrics.getSchedulerMaxPendingIntents();
     }
 
-    // ========== 系统状态更新 (从 LoomQMetrics 迁移) ==========
+    // ========== 系统状态更新 ==========
 
     public void updatePendingIntents(long count) {
         runtimeMetrics.updatePendingIntents(count);
@@ -454,7 +457,7 @@ public class MetricsCollector {
         return runtimeMetrics.getIntentStatusCounts();
     }
 
-    // ========== Intent 生命周期计数器 getter (供 LoomQMetrics.snapshot() 使用) ==========
+    // ========== Intent 生命周期计数器 getter ==========
 
     public long getIntentsCreatedTotal() {
         return operationalMetrics.getIntentsCreatedTotal();
@@ -474,6 +477,10 @@ public class MetricsCollector {
 
     public long getIntentsDeadLetterTotal() {
         return operationalMetrics.getIntentsDeadLetterTotal();
+    }
+
+    public long getRecoveryOverdueTotal() {
+        return operationalMetrics.getRecoveryOverdueTotal();
     }
 
     public void resetRuntimeIntentMetrics() {

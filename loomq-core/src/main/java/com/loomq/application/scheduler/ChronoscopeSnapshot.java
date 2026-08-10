@@ -57,7 +57,8 @@ public record ChronoscopeSnapshot(
 
     public static ChronoscopeSnapshot from(PrecisionScheduler scheduler,
                                             BucketGroupManager bucketGroupManager,
-                                            CohortManager cohortManager) {
+                                            CohortManager cohortManager,
+                                            MetricsCollector metrics) {
         Map<PrecisionTier, PrecisionScheduler.BackpressureInfo> backpressure = scheduler.getBackpressureStatus();
         Map<PrecisionTier, TierSnapshot> tierSnapshots = new java.util.EnumMap<>(PrecisionTier.class);
 
@@ -72,7 +73,7 @@ public record ChronoscopeSnapshot(
             );
 
             MetricsCollector.LatencySnapshot wakeupLatency =
-                MetricsCollector.getInstance().getWakeupLatencySnapshot(tier);
+                metrics.getWakeupLatencySnapshot(tier);
             WakeLatencySnapshot latency = new WakeLatencySnapshot(
                 wakeupLatency.p50(), wakeupLatency.p95(), wakeupLatency.p99());
 

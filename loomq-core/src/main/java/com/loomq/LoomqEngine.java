@@ -1,22 +1,26 @@
 package com.loomq;
 
 import com.loomq.application.command.IntentCommandService;
+import com.loomq.application.recovery.WheelRecovery;
+import com.loomq.application.recovery.WheelRecoveryReport;
 import com.loomq.application.scheduler.BucketGroupManager;
 import com.loomq.application.scheduler.PrecisionScheduler;
-import com.loomq.application.swap.ColdIntentSwapper;
 import com.loomq.common.MetricsCollector;
-import com.loomq.config.WalConfig;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
-import com.loomq.infrastructure.wal.SimpleWalWriter;
-import com.loomq.recovery.RecoveryPipeline;
-import com.loomq.snapshot.SnapshotManager.SnapshotInfo;
+import com.loomq.infrastructure.wheel.BucketReclaimer;
+import com.loomq.infrastructure.wheel.GroupCommitBarrier;
+import com.loomq.infrastructure.wheel.IntentLocationIndex;
+import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.SlotLocation;
+import com.loomq.infrastructure.wheel.TailIndex;
+import com.loomq.infrastructure.wheel.WheelConfig;
+import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.IntentObserver;
 import com.loomq.spi.RedeliveryDecider;
-import com.loomq.spi.WalAccessor;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
@@ -44,98 +48,164 @@ import org.slf4j.LoggerFactory;
  * 纯 Java 实现，零外部依赖（仅 SLF4J API）。
  * 提供 Intent 队列的核心能力，通过 DeliveryHandler 投递 Intent。
  *
+ * <p>持久化由持久化分层时间轮(PHTW)栈承担:{@link WheelStore}(四轮 mmap 槽位)+
+ * {@link TailIndex}(超 day 视界 run 文件)+ {@link GroupCommitBarrier}(group-commit msync)+
+ * {@link IntentLocationIndex}(intentId→槽位)+ {@link PromotionDaemon}(冷→热提升 cohort)+
+ * {@link WheelRecovery}(重启扫描重建)。</p>
+ *
  * @author loomq
  */
 public class LoomqEngine implements AutoCloseable {
 
     private static final Logger logger = LoggerFactory.getLogger(LoomqEngine.class);
 
+    /**
+     * 默认投递处理器:未配置 deliveryHandler 时使用,直接判为 DEAD_LETTER。
+     * 使引擎开箱即用(嵌入式场景下调用方可能仅用于调度/持久化,不关心投递)。
+     */
+    private static final DeliveryHandler DEFAULT_DELIVERY_HANDLER = intent ->
+        CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.DEAD_LETTER);
+
     // ========== 核心组件 ==========
     private final IntentStore intentStore;
-    private final SimpleWalWriter walWriter;
+    private final WheelStore wheelStore;
+    private final TailIndex tailIndex;
+    private final GroupCommitBarrier commitBarrier;
+    private final IntentLocationIndex locationIndex;
+    private final PromotionDaemon promotionDaemon;
+    private final WheelRecovery wheelRecovery;
     private final MetricsCollector metricsCollector;
     private final PrecisionScheduler scheduler;
-    private final RecoveryPipeline recoveryPipeline;
     private final IntentCommandService commandService;
-    private final ColdIntentSwapper coldSwapper;
+    private final BucketReclaimer bucketReclaimer;
 
     // ========== 观察器 ==========
     private final List<IntentObserver> observers = new CopyOnWriteArrayList<>();
 
     // ========== 回调机制 ==========
     private final Executor callbackExecutor;
-    private final Executor walWriteExecutor;
     private final java.util.concurrent.ExecutorService operationExecutor;
 
     // ========== 状态 ==========
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final AtomicBoolean started = new AtomicBoolean(false);
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
     // ========== 配置 ==========
-    private final Path walDir;
+    private final Path dataDir;
     private final String nodeId;
-    private final WalConfig walConfig;
     private final PrecisionTier defaultTier;
+    private final boolean deliveryHandlerConfigured;
 
     private LoomqEngine(Builder builder) {
         this.nodeId = builder.nodeId != null ? builder.nodeId : "default-node";
-        this.walDir = builder.walDir != null ? builder.walDir : Path.of("./data");
-        this.walConfig = builder.walConfig != null ? builder.walConfig : defaultWalConfig();
         this.defaultTier = builder.defaultTier;
+        this.deliveryHandlerConfigured = builder.deliveryHandler != null;
         this.callbackExecutor = builder.callbackExecutor != null
             ? builder.callbackExecutor
             : Executors.newVirtualThreadPerTaskExecutor();
-        this.walWriteExecutor = Executors.newVirtualThreadPerTaskExecutor();
         this.operationExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
         try {
-            // 确保数据目录存在
-            Files.createDirectories(walDir);
+            WheelConfig wheelConfig;
+            if (builder.wheelConfig != null) {
+                wheelConfig = builder.wheelConfig;
+                if (builder.dataDir != null) {
+                    logger.warn("Both wheelConfig and dataDir/walDir set on Builder; wheelConfig wins (its dataDir={})",
+                        wheelConfig.dataDir());
+                }
+            } else {
+                Path dir = builder.dataDir != null ? builder.dataDir : Path.of("./data");
+                wheelConfig = WheelConfig.defaultConfig().withDataDir(dir.toString());
+            }
+            this.dataDir = Path.of(wheelConfig.dataDir());
+            Files.createDirectories(dataDir);
 
             // 初始化组件
             this.intentStore = builder.intentStore != null
                 ? builder.intentStore
                 : new ConcurrentIntentStore();
-            this.walWriter = new SimpleWalWriter(walConfig, "shard-0");
-            this.metricsCollector = MetricsCollector.getInstance();
-            this.recoveryPipeline = new RecoveryPipeline(walDir);
+            this.wheelStore = new WheelStore(wheelConfig, System::currentTimeMillis);
+            this.tailIndex = new TailIndex(dataDir, System::currentTimeMillis);
+            // Spec B: 恢复时若 tail run 文件超过阈值则 compaction(无并发写入)
+            tailIndex.compactIfNeeded(wheelConfig.compactionThresholdBytes());
+            this.commitBarrier = new GroupCommitBarrier(
+                wheelStore, tailIndex,
+                wheelConfig.groupCommitIntervalMs(),
+                wheelConfig.awaitCommitTimeoutMs());
+            this.locationIndex = new IntentLocationIndex();
+            this.metricsCollector = builder.metricsCollector != null ? builder.metricsCollector : new MetricsCollector();
 
-            // 初始化调度器
+            // 初始化调度器(未配置 deliveryHandler 时使用默认 DEAD_LETTER 处理器)
+            DeliveryHandler deliveryHandler = builder.deliveryHandler != null
+                ? builder.deliveryHandler
+                : DEFAULT_DELIVERY_HANDLER;
             this.scheduler = new PrecisionScheduler(
                 intentStore,
-                builder.deliveryHandler,
-                builder.redeliveryDecider
+                deliveryHandler,
+                builder.redeliveryDecider,
+                null,
+                metricsCollector,
+                builder.intentTraceStore != null ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore()
             );
 
-            // 初始化冷热交换器（依赖 scheduler）
-            this.coldSwapper = new ColdIntentSwapper(intentStore, scheduler, walWriter);
+            // 初始化冷→热提升 daemon:到点把冷 Intent 从磁盘载入内存并调度
+            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, (intent, loc) -> {
+                if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
+                    intentStore.upsert(intent);          // 幂等:已在内存则跳过
+                    scheduler.schedule(intent);
+                    // P1-2: promote↔cancelCold TOCTOU 收口(promote 侧)。promote 读槽→落地
+                    // 期间若发生冷取消,索引已迁移到 CANCELED 槽或被移除。复核不匹配则回滚
+                    // 热载,杜绝 ghost 投递。与 cancelCold 末尾的 store 复查形成双向清理,
+                    // 确定性关闭竞态窗口(两可见动作 upsert 与 index.put 有全序,后到者必见先到者)。
+                    SlotLocation after = locationIndex.get(intent.getIntentId());
+                    if (after == null || !after.equals(loc)) {
+                        scheduler.removeFromSchedule(intent);
+                        intentStore.delete(intent.getIntentId());
+                        logger.warn("Promotion rolled back for intent {} (raced with cold cancel)", intent.getIntentId());
+                    }
+                }
+            }, wheelConfig.promotionLeadMs());
+
+            this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex, wheelConfig.hotBoundaryMs(), metricsCollector);
 
             this.commandService = new IntentCommandService(
-                intentStore,
-                scheduler,
-                walWriter,
-                metricsCollector,
-                callbackExecutor,
-                walWriteExecutor,
-                running,
-                sequenceNumber,
-                builder.callbackHandler,
-                defaultTier,
-                coldSwapper
-            );
+                intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
+                locationIndex, promotionDaemon,
+                metricsCollector, callbackExecutor, running, sequenceNumber,
+                builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs(),
+                wheelConfig.hotBoundaryMs());
+
+            // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
+            scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
+                @Override public void persist(Intent intent) { commandService.persistStateChangePutOnly(intent); }
+                @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
+            });
+
+            // Spec B: 终态 Intent 从 locationIndex 移除(桶回收依赖索引判断活跃桶)。
+            // 调度器的 finalizeIntent/handleExpired/handleDeliveryFailure 经 observer 回调清理,
+            // cancelIntent(热路径)和 cancelCold 在 IntentCommandService 内直接清理。
+            scheduler.addObserver(new IntentObserver() {
+                @Override public void onScheduled(Intent intent) { /* no-op */ }
+                @Override public void onDelivered(Intent i, com.loomq.spi.DeliveryHandler.DeliveryResult r) {
+                    locationIndex.remove(i.getIntentId());
+                }
+                @Override public void onDeadLettered(Intent i) {
+                    locationIndex.remove(i.getIntentId());
+                }
+                @Override public void onExpired(Intent i) {
+                    locationIndex.remove(i.getIntentId());
+                }
+                @Override public void onDeliveryFailed(Intent i, Throwable e) { /* no-op */ }
+            });
+
+            this.bucketReclaimer = new BucketReclaimer(wheelStore, locationIndex, wheelConfig.bucketRetentionMs());
 
             logger.info(
-                "LoomqEngine created: nodeId={}, walDir={}, walEngine={}, flushStrategy={}, syncOnWrite={}, segmentSizeMb={}, flushThresholdKb={}, stripeCount={}",
-                nodeId,
-                walDir,
-                walConfig.engine(),
-                walConfig.flushStrategy(),
-                walConfig.syncOnWrite(),
-                walConfig.segmentSizeMb(),
-                walConfig.memorySegmentFlushThresholdKb(),
-                walConfig.memorySegmentStripeCount()
-            );
+                "LoomqEngine created: nodeId={}, dataDir={}, horizonDays={}, slotsPerBucket={}, groupCommitIntervalMs={}, hotBoundaryMs={}, promotionLeadMs={}",
+                nodeId, dataDir, wheelConfig.horizonDays(), wheelConfig.slotsPerBucket(),
+                wheelConfig.groupCommitIntervalMs(), wheelConfig.hotBoundaryMs(), wheelConfig.promotionLeadMs());
 
         } catch (IOException e) {
             throw new RuntimeException("Failed to initialize LoomqEngine", e);
@@ -146,39 +216,58 @@ public class LoomqEngine implements AutoCloseable {
      * 启动引擎
      */
     public void start() {
-        if (!running.compareAndSet(false, true)) {
+        if (closed.get()) {
+            throw new IllegalStateException("Engine has been closed and cannot be restarted");
+        }
+        if (!started.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is already running");
         }
+        try {
+            logger.info("╔════════════════════════════════════════════════════════╗");
+            logger.info("║       LoomQ Core Engine Starting...                    ║");
+            logger.info("║       Mode: Embedded                                   ║");
+            logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
+            logger.info("╚════════════════════════════════════════════════════════╝");
 
-        logger.info("╔════════════════════════════════════════════════════════╗");
-        logger.info("║       LoomQ Core Engine Starting...                    ║");
-        logger.info("║       Mode: Embedded (Zero HTTP dependencies)          ║");
-        logger.info("╚════════════════════════════════════════════════════════╝");
+            if (!deliveryHandlerConfigured) {
+                logger.warn("No DeliveryHandler configured; intents will be silently dead-lettered. "
+                    + "Supply one via Builder.deliveryHandler(...) to enable delivery.");
+            }
 
-        // 先恢复快照和 WAL 增量，再启动运行时
-        RecoveryPipeline.RecoveryReport recoveryReport = recoveryPipeline.recover(intentStore, scheduler, walWriter);
-        if (recoveryReport.restoredTotal() > 0) {
-            logger.info("Recovered {} intents from snapshot/WAL (snapshot={}, wal={})",
-                recoveryReport.restoredTotal(),
-                recoveryReport.restoredFromSnapshot(),
-                recoveryReport.restoredFromWal());
+            // 1. 恢复:扫所有槽 -> 重建索引 + 热载入内存 + 冷注册 promotion cohort
+            WheelRecoveryReport recoveryReport =
+                wheelRecovery.recover(intentStore, scheduler, locationIndex, promotionDaemon);
+            if (recoveryReport.hotRestored() > 0 || recoveryReport.coldRegistered() > 0) {
+                logger.info("WheelRecovery: hotRestored={}, coldRegistered={}",
+                    recoveryReport.hotRestored(), recoveryReport.coldRegistered());
+            }
+
+            // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
+            commitBarrier.start();
+
+            // 3. 启动 promotion daemon(冷->热提升 cohort)
+            promotionDaemon.start();
+
+            // 4. 启动调度器
+            scheduler.setObservers(observers);
+            scheduler.start();
+
+            // 5. 启动桶回收 daemon(删除过期无活跃引用的桶文件)
+            bucketReclaimer.start();
+
+            // P2-1: running 闸门在所有 daemon 就绪后开放。此前 ensureRunning() 拒绝
+            // 所有写操作，杜绝恢复期间 DURABLE 写入命中 awaitCommit 超时兖底慢路径。
+            running.set(true);
+            logger.info("Engine started successfully");
+        } catch (Exception e) {
+            // Best-effort 清理已部分启动的 daemon（各 daemon 有自身防重入守卫，双关闭安全）
+            try { commitBarrier.close(); } catch (Exception ignored) {}
+            try { promotionDaemon.close(); } catch (Exception ignored) {}
+            try { scheduler.stop(); } catch (Exception ignored) {}
+            try { bucketReclaimer.close(); } catch (Exception ignored) {}
+            started.set(false);  // 允许重试
+            throw e;
         }
-
-        // 启动 WAL
-        walWriter.start();
-
-        // 启动调度器
-        scheduler.setObservers(observers);
-        scheduler.start();
-
-        // 启动冷热交换器（长延迟 Intent 内存换出/换入）
-        coldSwapper.start();
-
-        // 启动定期快照（快照完成后自动截断旧 WAL 段，冷 Intent 的 WAL 段受保护不被截断）
-        recoveryPipeline.startSnapshots(intentStore, walWriter::getWritePosition, () -> walWriter,
-            coldSwapper::getMinRequiredWalPosition);
-
-        logger.info("Engine started successfully");
     }
 
     /**
@@ -186,42 +275,79 @@ public class LoomqEngine implements AutoCloseable {
      */
     @Override
     public void close() throws Exception {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
+        if (!closed.compareAndSet(false, true)) return;  // 并发首次关闭守卫（唯一门控）
 
         running.set(false);
+        started.set(false);
         logger.info("Shutting down LoomqEngine...");
 
-        // 停止恢复/快照管线
-        recoveryPipeline.close();
+        // 停止桶回收 daemon(在 wheelStore 关闭前停止)
+        bucketReclaimer.close();
 
-        // 停止调度器
+        // 停止提升 daemon
+        promotionDaemon.close();
+
+        // 停止调度器(内部排空在途投递)
         scheduler.stop();
 
-        // 停止冷热交换器
-        coldSwapper.close();
+        // P1-7: 先关操作执行器,等在途 createIntent 排空,避免后续 wheelStore/tail 关闭后
+        // 仍有 createIntent 写已关闭的 MemorySegment 抛 ISE。
+        operationExecutor.shutdown();
+        try {
+            if (!operationExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                operationExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            operationExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
 
         // 停止存储后台清理线程
         intentStore.shutdown();
 
-        // 关闭 WAL
-        walWriter.close();
+        // 关闭 group-commit daemon
+        commitBarrier.close();
 
-        // 关闭 WAL 写入执行器
-        if (walWriteExecutor instanceof AutoCloseable ac) {
-            ac.close();
-        }
+        // 关闭时间轮(强制脏桶落盘)
+        wheelStore.close();
+
+        // 关闭 tail run 文件
+        tailIndex.close();
 
         // 关闭回调执行器
         if (callbackExecutor instanceof AutoCloseable) {
             ((AutoCloseable) callbackExecutor).close();
         }
 
-        // 关闭操作执行器
-        operationExecutor.close();
-
         logger.info("Engine shutdown complete");
+    }
+
+    /**
+     * 模拟进程崩溃（测试专用）：停止所有后台线程但不调用 wheelStore.close()/tailIndex.close()。
+     *
+     * <p>验证范围：终态写入不依赖 close() 的最终 forceDirty——若终态从未写盘，重开引擎时
+     * recovery 会把它当作 SCHEDULED 处理（overdue 补终态），测试即失败。</p>
+     *
+     * <p>已知局限：进程退出后 OS 仍会把脏 mmap 页写回 page cache，且 stopWithoutFlush 后
+     * daemon 可能完成一次在途 force。因此本测试<b>不能</b>区分 awaitCommit 的 msync 与
+     * page-cache writeback；它证明的是终态记录已进入 wheel（可被 recovery 读取并跳过），
+     * 而非内核级持久化。内核级验证需 OS crash 注入，超出 JVM 测试范围。</p>
+     */
+    void simulateCrash() {
+        if (!started.get()) return;
+        if (!closed.compareAndSet(false, true)) return;
+        running.set(false);
+        started.set(false);
+        logger.info("Simulating crash (no flush)...");
+
+        bucketReclaimer.close();
+        promotionDaemon.close();
+        scheduler.stop();
+        operationExecutor.shutdownNow();
+        intentStore.shutdown();
+        commitBarrier.stopWithoutFlush();
+        // 故意不调用 wheelStore.close() / tailIndex.close() / commitBarrier.close()
+        // -- 测试正是要证明 awaitCommit 的 msync 已足够
     }
 
     /**
@@ -229,7 +355,7 @@ public class LoomqEngine implements AutoCloseable {
      *
      * @param intent  Intent 对象
      * @param ackMode 确认模式
-     * @return CompletableFuture<Long> WAL 序列号
+     * @return CompletableFuture<Long> 序列号
      */
     public CompletableFuture<Long> createIntent(Intent intent, AckMode ackMode) {
         return CompletableFuture.supplyAsync(() -> commandService.createIntent(intent, ackMode), operationExecutor);
@@ -240,7 +366,7 @@ public class LoomqEngine implements AutoCloseable {
      *
      * @param intents Intent 列表
      * @param ackMode 确认模式
-     * @return CompletableFuture<List<Long>> WAL 序列号列表
+     * @return CompletableFuture<List<Long>> 序列号列表
      */
     public CompletableFuture<List<Long>> createIntents(List<Intent> intents, AckMode ackMode) {
         return CompletableFuture.supplyAsync(() -> commandService.createIntents(intents, ackMode), operationExecutor);
@@ -248,6 +374,10 @@ public class LoomqEngine implements AutoCloseable {
 
     /**
      * 查询 Intent
+     *
+     * <p><b>可见性窗口：</b>[create, terminal + 24h]。终态 Intent 在驱逐周期（默认 24h）
+     * 后从内存 store 移除，此时 getIntent 返回 empty。磁盘仍保留权威记录，
+     * 重启后由 recovery 跳过（终态不重新加载入内存）。</p>
      *
      * @param intentId Intent ID
      * @return Optional<Intent>
@@ -312,10 +442,12 @@ public class LoomqEngine implements AutoCloseable {
 
     /**
      * 注册 Intent 生命周期观察器。
-     * 可在引擎运行中随时注册/移除，线程安全。
+     * 可在引擎运行中随时注册/移除,线程安全——直接路由到调度器的 CopyOnWriteArrayList,
+     * 修复原"启动后注册的 observer 永远收不到事件"的问题(start 时 setObservers 拷贝快照)。
      */
     public void registerObserver(IntentObserver observer) {
         observers.add(observer);
+        scheduler.addObserver(observer);
     }
 
     /**
@@ -323,6 +455,7 @@ public class LoomqEngine implements AutoCloseable {
      */
     public void removeObserver(IntentObserver observer) {
         observers.remove(observer);
+        scheduler.removeObserver(observer);
     }
 
     /**
@@ -341,6 +474,11 @@ public class LoomqEngine implements AutoCloseable {
         return scheduler;
     }
 
+    /** 获取引擎级 MetricsCollector 实例。 */
+    public MetricsCollector getMetricsCollector() {
+        return metricsCollector;
+    }
+
     /**
      * 获取 Intent 存储只读视图。
      *
@@ -352,32 +490,29 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取原始 Intent 存储（内部/Raft 使用，可读写）。
-     *
-     * 外部调用方应使用 {@link #getIntentStore()} 只读视图。
+     * 获取原始 Intent 存储（包级可见，内部使用）。
      */
-    public IntentStore getIntentStoreInternal() {
+    IntentStore getIntentStoreInternal() {
         return intentStore;
     }
 
     /**
-     * 获取 WAL 访问器（供服务层读取/截断 WAL）
-     *
-     * @return WalAccessor
-     */
-    public WalAccessor getWalAccessor() {
-        return walWriter;
-    }
-
-    /**
-     * 获取命令服务（供 WriteCoordinator 使用）
+     * 获取命令服务。
      */
     public IntentCommandService getCommandService() {
         return commandService;
     }
 
     /**
-     * 获取运行状态标志（供 WriteCoordinator 使用）
+     * 获取 intent 位置索引(包级可见,供同包测试断言冷取消后的索引状态)。
+     * 不作为公共 API:生产调用方应通过 commandService 间接操作。
+     */
+    IntentLocationIndex getLocationIndex() {
+        return locationIndex;
+    }
+
+    /**
+     * 获取运行状态标志。
      */
     public AtomicBoolean getRunning() {
         return running;
@@ -410,72 +545,12 @@ public class LoomqEngine implements AutoCloseable {
         );
     }
 
-    /**
-     * 获取 WAL 健康状态
-     */
-    public WalHealthStatus getWalHealth() {
-        return new WalHealthStatus(
-            walWriter.getWalHealth(),
-            walWriter.getUnflushedBytes(),
-            walWriter.getLastFsyncMsAgo(),
-            walWriter.getWritePosition(),
-            walWriter.getFlushedPosition()
-        );
-    }
-
-    /**
-     * WAL 健康状态
-     */
-    public record WalHealthStatus(
-        String status,
-        long unflushedBytes,
-        long lastFsyncMsAgo,
-        long writePosition,
-        long flushedPosition
-    ) {}
-
-    /**
-     * 立即生成一次快照。
-     */
-    public SnapshotInfo createSnapshot() {
-        ensureRunning();
-        return recoveryPipeline.checkpoint(intentStore, walWriter::getWritePosition);
-    }
-
-    /**
-     * 获取冷热交换统计。
-     */
-    public ColdSwapStats getColdSwapStats() {
-        return new ColdSwapStats(
-            coldSwapper.coldIntentCount(),
-            coldSwapper.getTotalSwappedOut(),
-            coldSwapper.getTotalSwappedIn(),
-            coldSwapper.getSwapInErrors(),
-            coldSwapper.getColdThreshold()
-        );
-    }
-
-    /**
-     * 冷热交换统计。
-     */
-    public record ColdSwapStats(
-        int coldIntentCount,
-        long totalSwappedOut,
-        long totalSwappedIn,
-        long swapInErrors,
-        java.time.Duration coldThreshold
-    ) {}
-
     // ========== 内部方法 ==========
 
     private void ensureRunning() {
         if (!running.get()) {
             throw new IllegalStateException("Engine is not running");
         }
-    }
-
-    private WalConfig defaultWalConfig() {
-        return WalConfig.defaultConfig().withDataDir(walDir.toString());
     }
 
     // ========== Builder ==========
@@ -485,28 +560,41 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     public static class Builder {
-        private Path walDir;
+        private Path dataDir;
         private String nodeId;
-        private WalConfig walConfig;
+        private WheelConfig wheelConfig;
         private Executor callbackExecutor;
         private CallbackHandler callbackHandler;
         private DeliveryHandler deliveryHandler;
         private RedeliveryDecider redeliveryDecider;
         private PrecisionTier defaultTier;
         private IntentStore intentStore;
+        private MetricsCollector metricsCollector;
+        private com.loomq.tracing.IntentTraceStore intentTraceStore;
 
+        /**
+         * @deprecated 改用 {@link #dataDir(Path)};PHTW 已无 WAL,字段名陈旧。委托 dataDir。
+         */
+        @Deprecated
         public Builder walDir(Path walDir) {
-            this.walDir = walDir;
+            this.dataDir = walDir;
+            return this;
+        }
+
+        /** 数据目录(PHTW wheel + tail 根目录)。与 {@link #wheelConfig(WheelConfig)} 互斥,后者优先。 */
+        public Builder dataDir(Path dataDir) {
+            this.dataDir = dataDir;
+            return this;
+        }
+
+        /** 完整 PHTW 配置;设了则覆盖 dataDir(用 wheelConfig.dataDir())。 */
+        public Builder wheelConfig(WheelConfig wheelConfig) {
+            this.wheelConfig = wheelConfig;
             return this;
         }
 
         public Builder nodeId(String nodeId) {
             this.nodeId = nodeId;
-            return this;
-        }
-
-        public Builder walConfig(WalConfig walConfig) {
-            this.walConfig = walConfig;
             return this;
         }
 
@@ -537,6 +625,18 @@ public class LoomqEngine implements AutoCloseable {
 
         public Builder intentStore(IntentStore store) {
             this.intentStore = store;
+            return this;
+        }
+
+        /** Inject a custom MetricsCollector (default: new instance per engine). */
+        public Builder metricsCollector(MetricsCollector metrics) {
+            this.metricsCollector = metrics;
+            return this;
+        }
+
+        /** Inject a custom IntentTraceStore (default: new instance per engine). */
+        public Builder intentTraceStore(com.loomq.tracing.IntentTraceStore store) {
+            this.intentTraceStore = store;
             return this;
         }
 

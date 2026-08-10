@@ -2,6 +2,7 @@ package com.loomq.store;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import java.time.Instant;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
@@ -148,6 +149,7 @@ public class ConcurrentIntentStore implements IntentStore {
     }
 
     private void cleanupExpiredRecords() {
+        // 清理过期幂等记录（24h 窗口）
         AtomicLong cleaned = new AtomicLong();
         idempotencyRecords.entrySet().removeIf(entry -> {
             if (entry.getValue().isExpired()) {
@@ -157,9 +159,30 @@ public class ConcurrentIntentStore implements IntentStore {
             return false;
         });
 
-        if (cleaned.get() > 0) {
-            logger.info("Cleaned {} expired idempotency records", cleaned.get());
+        // 驱逐终态 Intent（updatedAt 超过幂等窗口 = 24h）
+        // P1-1 确保终态已落盘 -> 驱逐后磁盘仍有权威记录
+        long cutoffMs = System.currentTimeMillis()
+            - IdempotencyRecord.DEFAULT_WINDOW.toMillis();
+        Instant cutoff = Instant.ofEpochMilli(cutoffMs);
+        AtomicLong evicted = new AtomicLong();
+
+        intents.forEach((id, stored) -> {
+            if (stored.intent().getStatus().isTerminal()
+                    && stored.intent().getUpdatedAt().isBefore(cutoff)) {
+                delete(id);
+                evicted.incrementAndGet();
+            }
+        });
+
+        if (cleaned.get() > 0 || evicted.get() > 0) {
+            logger.info("Cleanup: {} expired idempotency records, {} evicted terminal intents",
+                cleaned.get(), evicted.get());
         }
+    }
+
+    /** Test-only: trigger cleanup synchronously (bypasses scheduled executor). */
+    void testCleanupExpiredRecords() {
+        cleanupExpiredRecords();
     }
 
     @Override

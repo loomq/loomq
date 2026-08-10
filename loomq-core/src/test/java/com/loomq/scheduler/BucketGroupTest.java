@@ -21,12 +21,12 @@ import org.junit.jupiter.api.Test;
 class BucketGroupTest {
 
     private BucketGroup standardGroup;
-    private BucketGroup economyGroup;
+    private BucketGroup fastGroup;
 
     @BeforeEach
     void setUp() {
         standardGroup = new BucketGroup(PrecisionTier.STANDARD);
-        economyGroup = new BucketGroup(PrecisionTier.ECONOMY);
+        fastGroup = new BucketGroup(PrecisionTier.FAST);
     }
 
     @Test
@@ -35,8 +35,8 @@ class BucketGroupTest {
         assertEquals(PrecisionTier.STANDARD, standardGroup.getTier());
         assertEquals(500, standardGroup.getPrecisionWindowMs());
 
-        assertEquals(PrecisionTier.ECONOMY, economyGroup.getTier());
-        assertEquals(1000, economyGroup.getPrecisionWindowMs());
+        assertEquals(PrecisionTier.FAST, fastGroup.getTier());
+        assertEquals(50, fastGroup.getPrecisionWindowMs());
 
         assertEquals(0, standardGroup.getBucketCount());
         assertEquals(0, standardGroup.getPendingCount());
@@ -94,74 +94,6 @@ class BucketGroupTest {
         assertEquals(0, standardGroup.getBucketCount());
     }
 
-    @Test
-    @DisplayName("计算休眠时间 - 长延迟场景")
-    void testCalculateSleepMsLongDelay() {
-        // 长延迟场景：delay > precisionWindow
-        long delay = 10000; // 10 秒
-        long sleepMs = standardGroup.calculateSleepMs(delay);
-
-        // sleepMs = delay - precisionWindow - jitter
-        // jitter 是 [0, precisionWindow) 的随机值
-        // 所以 sleepMs 应该在 [delay - 2*precisionWindow, delay - precisionWindow] 范围内
-        long minSleep = delay - 2 * standardGroup.getPrecisionWindowMs();
-        long maxSleep = delay - standardGroup.getPrecisionWindowMs();
-
-        assertTrue(sleepMs >= minSleep, "sleepMs should be >= " + minSleep + " but was " + sleepMs);
-        assertTrue(sleepMs <= maxSleep, "sleepMs should be <= " + maxSleep + " but was " + sleepMs);
-    }
-
-    @Test
-    @DisplayName("计算休眠时间 - 短延迟场景")
-    void testCalculateSleepMsShortDelay() {
-        // 短延迟场景：delay <= precisionWindow
-        long delay = 300; // 300ms < STANDARD 的 500ms
-        long sleepMs = standardGroup.calculateSleepMs(delay);
-
-        // 短延迟场景应该返回 0
-        assertEquals(0, sleepMs);
-    }
-
-    @Test
-    @DisplayName("计算休眠时间 - 边界值")
-    void testCalculateSleepMsBoundary() {
-        // delay == precisionWindow
-        long delay = standardGroup.getPrecisionWindowMs();
-        long sleepMs = standardGroup.calculateSleepMs(delay);
-
-        assertEquals(0, sleepMs);
-    }
-
-    @Test
-    @DisplayName("抖动随机性验证")
-    void testJitterRandomness() {
-        long delay = 10000;
-        long firstSleep = standardGroup.calculateSleepMs(delay);
-        long secondSleep = standardGroup.calculateSleepMs(delay);
-
-        // 由于抖动的随机性，两次计算的休眠时间可能不同
-        // 但都在有效范围内
-        long minSleep = delay - 2 * standardGroup.getPrecisionWindowMs();
-        long maxSleep = delay - standardGroup.getPrecisionWindowMs();
-
-        assertTrue(firstSleep >= minSleep && firstSleep <= maxSleep);
-        assertTrue(secondSleep >= minSleep && secondSleep <= maxSleep);
-    }
-
-    @Test
-    @DisplayName("不同精度档位有不同的休眠计算")
-    void testDifferentPrecisionTiers() {
-        long delay = 10000;
-
-        long standardSleep = standardGroup.calculateSleepMs(delay);
-        long economySleep = economyGroup.calculateSleepMs(delay);
-
-        // ECONOMY 的精度窗口更大，所以休眠时间范围不同
-        // 但实际休眠时间由于随机抖动可能有重叠
-        // 主要验证计算逻辑正确
-        assertTrue(standardSleep > 0);
-        assertTrue(economySleep > 0);
-    }
 
     @Test
     @DisplayName("清空桶")

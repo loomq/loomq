@@ -26,6 +26,11 @@ replay_pid*
 # IDE
 .idea/workspace.xml
 
+# Eclipse
+.project
+.settings/
+.classpath
+
 # Maven
 target/
 dependency-reduced-pom.xml
@@ -60,3 +65,11 @@ __pycache__/
 
 # VS Code
 .vscode/
+
+# AI assistant
+.workbuddy/
+
+# Temp output
+test-output.txt
+# AI agent local config
+.agents/

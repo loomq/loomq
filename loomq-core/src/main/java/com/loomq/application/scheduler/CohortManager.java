@@ -42,6 +42,7 @@ public final class CohortManager {
     private final BucketGroupManager bucketGroupManager;
     private final PrecisionTierCatalog catalog;
     private final Consumer<Collection<Intent>> scanTrigger;
+    private final MetricsCollector metrics;
 
     private final Thread wakeThread;
     private final AtomicBoolean running;
@@ -52,10 +53,11 @@ public final class CohortManager {
     private final AtomicLong wakeEventCount = new AtomicLong(0);
 
     CohortManager(BucketGroupManager bucketGroupManager, PrecisionTierCatalog catalog,
-                  Consumer<Collection<Intent>> scanTrigger) {
+                  Consumer<Collection<Intent>> scanTrigger, MetricsCollector metrics) {
         this.bucketGroupManager = bucketGroupManager;
         this.catalog = catalog;
         this.scanTrigger = scanTrigger;
+        this.metrics = metrics;
         this.cohorts = new ConcurrentSkipListMap<>();
         this.intentIdToCohortKey = new ConcurrentHashMap<>();
         this.running = new AtomicBoolean(false);
@@ -221,7 +223,7 @@ public final class CohortManager {
                         scanTrigger.accept(validIntents);
                     }
                     long flushDurationUs = (System.nanoTime() - flushStartNanos) / 1_000;
-                    MetricsCollector.getInstance().recordCohortFlushDuration(flushDurationUs);
+                    metrics.recordCohortFlushDuration(flushDurationUs);
                     if (logger.isDebugEnabled()) {
                         logger.debug("Cohort flushed: bucketKey={}, count={}, duration={}us",
                             bucketKey, validIntents.size(), flushDurationUs);

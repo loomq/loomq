@@ -8,6 +8,8 @@ import com.loomq.domain.intent.Intent;
  * 内核通过此接口回调宿主应用，通知 Intent 状态变更。
  * 内核不负责 HTTP 投递，只负责触发回调。
  *
+ * <p><b>I5 快照语义</b>：Intent 参数为事件发生时刻的防御性快照。修改快照不影响内核状态。</p>
+ *
  * @author loomq
  * @since v0.7.0
  */

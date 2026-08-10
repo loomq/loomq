@@ -1,23 +1,26 @@
 # LoomQ Benchmark Suite
 
-性能基准测试套件，覆盖内部吞吐、HTTP/gRPC 创建路径、调度器触发、压力测试四个维度。
+性能基准测试套件，覆盖 `loomq-core` 的创建吞吐、投递吞吐、触发精度三个维度。
+
+基准以 JUnit 测试形式位于 `loomq-core`（`@Tag("benchmark")`），由薄 runner 脚本驱动并汇总为 Markdown 报告。
 
 ## 快速开始
 
 ```bash
 # Windows
-benchmark\benchmark.bat
+benchmark\scripts\benchmark.ps1
 
 # Linux/macOS
 ./benchmark/scripts/benchmark.sh
 
-# 快速验证
-benchmark\benchmark.bat -Quick
+# 快速验证（跳过耗时最长的 Precision 基准）
+benchmark\scripts\benchmark.ps1 -Quick
+./benchmark/scripts/benchmark.sh --quick
 ```
 
 输出：
-- **Excel 报告**: `benchmark/results/reports/benchmark-report-{timestamp}.xlsx`
 - **MD 报告**: `benchmark/results/reports/benchmark-report-{timestamp}.md`
+- **原始日志**: `benchmark/results/logs/benchmark-{timestamp}.log`
 
 ---
 
@@ -26,62 +29,37 @@ benchmark\benchmark.bat -Quick
 ```
 benchmark/
 ├── README.md
-├── benchmark.bat                    # Windows 入口
-├── benchmark.sh                     # Linux/macOS 入口
-├── config.json                      # SLO 阈值配置
+├── config.json                  # SLO 阈值配置
 ├── scripts/
-│   ├── benchmark.ps1                # 主脚本（Windows）
-│   ├── benchmark.sh                 # 主脚本（Linux/macOS）
-│   └── lib/
-│       ├── ui.ps1 / ui.sh           # 终端 UI
-│       ├── util.ps1 / util.sh       # 工具函数
-│       ├── server.ps1 / server.sh   # 服务器生命周期
-│       ├── report.ps1 / report.sh   # Excel + MD 报告生成
-│       └── gen_excel.py             # Python Excel 生成器
-└── results/
-    ├── reports/                     # Excel + MD 报告
-    ├── logs/                        # 场景日志
-    ├── runtime/                     # 临时服务器数据
-    └── m2repo/                      # 隔离 Maven 仓库
+│   ├── benchmark.ps1            # Windows 薄 runner
+│   └── benchmark.sh             # Linux/macOS 薄 runner
+└── results/                     # 运行产物（gitignore）
+    ├── reports/                 # Markdown 报告
+    └── logs/                    # 原始日志 + RESULT 标记
 ```
+
+---
+
+## 基准测试类
+
+| 类 | 测试 | 输出 RESULT 标记 |
+|----|------|------------------|
+| `CreateIntentBenchmark` | createIntent / createIntents 批量 DURABLE 吞吐 | `RESULT\|create\|` |
+| `DeliveryPathBenchmark` | 4 档（ULTRA/FAST/STANDARD/MILLI）schedule→deliver→ACKED 吞吐与延迟 + 档位配置盘点 | `RESULT\|delivery\|` / `RESULT\|tier_config\|` |
+| `PrecisionLatencyBenchmark` | 全 4 档（MILLI/ULTRA/FAST/STANDARD）触发精度 p50/p99/p999 + 空闲 CPU | `RESULT\|precision\|` |
+
+MILLI 档为 1ms 事件驱动直插桶，吞吐语义与批量档不同（单发、信号驱动），但同一套投递测量逻辑适用。
 
 ---
 
 ## 用法
 
-### Windows
-
-```powershell
-.\benchmark\scripts\benchmark.ps1 [Options]
-```
-
-### Linux/macOS
-
-```bash
-./benchmark/scripts/benchmark.sh [Options]
-```
-
-### 参数
-
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `-Quick` / `--quick` | 快速测试模式 | false |
-| `-Stress` / `--stress` | 包含压力测试 | false |
-| `-StressOnly <type>` / `--stress-only=<type>` | 仅压力测试: http / grpc | - |
-| `-Scenario <name>` / `--scenario=<name>` | 场景: all / internal / create / scheduler | all |
-| `-GrpcTier <tier>` / `--grpc-tier=<tier>` | gRPC 精度档位 | STANDARD |
+| `-Quick` / `--quick` | 快速模式（跳过 Precision 基准） | false |
+| `-Scenario <name>` / `--scenario=<name>` | 场景: all / create / delivery / precision | all |
 | `-NoCompile` / `--no-compile` | 跳过编译 | false |
-| `-Compare` / `--compare` | 查看上次报告 | false |
-| `-VerboseOutput` / `--verbose` | 显示完整日志 | false |
-
-### 测试场景
-
-| 场景 | 说明 | 需要服务器 |
-|------|------|-----------|
-| internal | IntentStore 吞吐、内存、冷热交换、WAL、存储引擎 | 否 |
-| create | HTTP + gRPC 创建路径吞吐和延迟 | 是 |
-| scheduler | 调度器触发精度（5 档位唤醒延迟 + E2E） | 是 |
-| stress | 多线程梯度压力扫描，拐点检测 | 是 |
+| `-Compare` / `--compare` | 查看最近一次报告 | false |
 
 ### 示例
 
@@ -92,14 +70,11 @@ benchmark/
 # 快速验证
 .\benchmark\scripts\benchmark.ps1 -Quick
 
-# 全量 + 压力测试
-.\benchmark\scripts\benchmark.ps1 -Stress
+# 仅投递吞吐
+.\benchmark\scripts\benchmark.ps1 -Scenario delivery
 
-# 仅 gRPC 压力测试
-.\benchmark\scripts\benchmark.ps1 -Stress -StressOnly grpc
-
-# 仅内部组件测试
-.\benchmark\scripts\benchmark.ps1 -Scenario internal
+# 仅触发精度
+.\benchmark\scripts\benchmark.ps1 -Scenario precision
 
 # 查看上次报告
 .\benchmark\scripts\benchmark.ps1 -Compare
@@ -107,40 +82,49 @@ benchmark/
 
 ---
 
-## 输出格式
+## 报告格式
 
-### Excel 报告（6 个 Sheet）
+MD 报告包含五部分：
 
-| Sheet | 内容 |
-|-------|------|
-| Summary | 吞吐量对比（HTTP vs gRPC）、回归对比 |
-| Create Path | 各线程数下的 QPS、P50/P90/P99 |
-| Scheduler | 5 档位的唤醒延迟、E2E 延迟、利用率、背压 |
-| Internal | IntentStore QPS、内存、WAL、存储引擎对比 |
-| SLO | 各档位 SLO 验证（目标 vs 实际，PASS/FAIL） |
-| Environment | 时间、Commit、分支、Java、OS、CPU |
+| 章节 | 内容 |
+|------|------|
+| 环境 | 时间、Commit、分支、Java、OS、CPU |
+| 创建吞吐 | 单发/批量 QPS、耗时 |
+| 投递吞吐 | 每档 QPS、create/delivery 耗时、wake/E2E p50/p95/p99、overhead p99、SLO 通过/失败 |
+| 档位资源盘点 | 每档扫描模式、消费者数、队列容量、最大并发、窗口、批量大小（精简决策的收益侧） |
+| 触发精度 | 每档（全 4 档）p50/p99/p999 |
 
-### MD 报告
+投递的 SLO 通过/失败对照 `config.json` 中该档的 `p99_wakeup_ms` 与 `p99_e2e_ms`。
 
-中文 Markdown 格式，结构与 Excel 对应，适合嵌入 GitHub Release Notes。
+### 测量有效性说明（2026-08-05 迭代）
+
+- **E2E/drain 计时**：`DeliveryPathBenchmark` 使用 `System.nanoTime()` 相对计时，
+  免疫 Windows `currentTimeMillis` ~15.6ms 量化（此前 MILLI e2e 测量在 Windows 无效）。
+- **fire delay 抖动**：每轮 4.7–5.3s 随机。固定 5s 与所有 fixed-rate 档的
+  scanInterval 整除相位锁定，wake 退化为单相位样本；抖动后 wake 呈真实均匀分布。
 
 ---
 
 ## 配置
 
-`config.json` 定义 SLO 阈值：
+`config.json` 定义各档位 SLO（毫秒）：
 
 ```json
 {
   "slo": {
-    "ULTRA":    { "p95_wakeup_us": 15000,  "p99_wakeup_us": 25000,  "p95_e2e_ms": 50,   "p99_e2e_ms": 100  },
-    "FAST":     { "p95_wakeup_us": 30000,  "p99_wakeup_us": 50000,  "p95_e2e_ms": 100,  "p99_e2e_ms": 200  },
-    "HIGH":     { "p95_wakeup_us": 50000,  "p99_wakeup_us": 80000,  "p95_e2e_ms": 200,  "p99_e2e_ms": 400  },
-    "STANDARD": { "p95_wakeup_us": 200000, "p99_wakeup_us": 400000, "p95_e2e_ms": 800,  "p99_e2e_ms": 1500 },
-    "ECONOMY":  { "p95_wakeup_us": 400000, "p99_wakeup_us": 800000, "p95_e2e_ms": 1500, "p99_e2e_ms": 3000 }
-  }
+    "ULTRA":    { "p95_wakeup_ms": 15,  "p99_wakeup_ms": 25,  "p95_e2e_ms": 50,  "p99_e2e_ms": 100 },
+    "MILLI":    { "p95_wakeup_ms": 1,   "p99_wakeup_ms": 5,   "p95_e2e_ms": 5,   "p99_e2e_ms": 20 }
+  },
+  "rotation": { "keep_recent": 10 }
 }
 ```
+
+**wake SLO 校准规则**：fixed-rate 档（FAST/STANDARD）的 wake 延迟
+结构上呈 uniform[0, window]（桶下取整 + 固定轮询拾取），任何低于 window 的
+wake SLO 都会在某个分位上必然失败。因此 fixed-rate 档按
+`p95_wakeup = 1.0 × window`、`p99_wakeup = 1.2 × window` 校准——其判别目标是
+扫描线程饥饿等病态回归（wake 超出窗口），而非窗口内量化。adaptive 档
+（MILLI/ULTRA）使用绝对小值阈值。e2e SLO 不受此影响。
 
 ---
 
@@ -150,21 +134,16 @@ benchmark/
 |------|------|------|
 | JDK 25+ | 编译和运行 | 是 |
 | Maven 3.9+ | 构建系统 | 是 |
-| Python 3 + xlsxwriter | Excel 报告生成 | 是（Linux/macOS） |
-| PowerShell 5.1+ | Windows 脚本 | Windows |
 
-安装 xlsxwriter：
-```bash
-pip install xlsxwriter
-```
+无 Python / Excel / 服务器依赖。
 
 ---
 
 ## 常见问题
 
-**Q: 如何只运行调度器测试？**
+**Q: 如何只运行调度器/投递测试？**
 ```powershell
-.\benchmark\scripts\benchmark.ps1 -Scenario scheduler
+.\benchmark\scripts\benchmark.ps1 -Scenario delivery
 ```
 
 **Q: 如何查看历史对比？**
@@ -172,15 +151,8 @@ pip install xlsxwriter
 .\benchmark\scripts\benchmark.ps1 -Compare
 ```
 
-**Q: Excel 生成失败？**
-确认 Python 3 和 xlsxwriter 已安装：
-```bash
-python3 --version
-pip install xlsxwriter
-```
-
 **Q: 如何清理旧报告？**
-报告自动轮转（保留最近 10 组）。手动清理：
+报告自动轮转（保留最近 10 份）。手动清理：
 ```bash
 rm -rf benchmark/results/reports/*
 rm -rf benchmark/results/logs/*

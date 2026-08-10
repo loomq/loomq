@@ -14,6 +14,9 @@ import java.util.UUID;
  */
 public class Intent {
 
+    /** intentId 最大 UTF-8 字节数（槽格式上限；SlotCodec 布局与入口校验的单一约束来源）。 */
+    public static final int MAX_ID_BYTES = 24;
+
     // ========== 系统字段 ==========
 
     /**
@@ -51,7 +54,7 @@ public class Intent {
     /**
      * 最晚有效时间 (RFC3339)
      */
-    private Instant deadline;
+    private volatile Instant deadline;
 
     /**
      * 过期后动作：DISCARD 或 DEAD_LETTER
@@ -61,7 +64,7 @@ public class Intent {
     /**
      * 精度档位：由 PrecisionTierCatalog 提供默认 preset
      */
-    private PrecisionTier precisionTier;
+    private volatile PrecisionTier precisionTier;
 
     /**
      * WAL 持久化级别，覆盖精度档位默认值。
@@ -80,13 +83,6 @@ public class Intent {
      * 所属分片 ID
      */
     private String shardId;
-
-    // ========== 可靠性字段 ==========
-
-    /**
-     * ACK 级别：ASYNC / DURABLE / REPLICATED
-     */
-    private AckMode ackLevel;
 
     // ========== 回调字段 ==========
 
@@ -127,7 +123,7 @@ public class Intent {
     private String lastDeliveryId;
 
     /**
-     * 单调递增的写版本号，用于 Raft 写幂等和乐观并发控制。
+     * 单调递增的写版本号，用于乐观并发控制。
      */
     private volatile long revision;
 
@@ -141,7 +137,6 @@ public class Intent {
         this.updatedAt = this.createdAt;
         this.expiredAction = ExpiredAction.DISCARD;
         this.precisionTier = defaultPrecisionTier();
-        this.ackLevel = AckMode.DURABLE;
         this.attempts = 0;
         this.revision = 0L;
     }
@@ -154,7 +149,6 @@ public class Intent {
         this.updatedAt = this.createdAt;
         this.expiredAction = ExpiredAction.DISCARD;
         this.precisionTier = defaultPrecisionTier();
-        this.ackLevel = AckMode.DURABLE;
         this.attempts = 0;
         this.revision = 0L;
     }
@@ -171,7 +165,6 @@ public class Intent {
                    WalMode walMode,
                    String shardKey,
                    String shardId,
-                   AckMode ackLevel,
                    Callback callback,
                    RedeliveryPolicy redelivery,
                    String idempotencyKey,
@@ -191,7 +184,6 @@ public class Intent {
         this.walMode = walMode;
         this.shardKey = shardKey;
         this.shardId = shardId;
-        this.ackLevel = ackLevel != null ? ackLevel : AckMode.DURABLE;
         this.callback = callback;
         this.redelivery = redelivery;
         this.idempotencyKey = idempotencyKey;
@@ -216,7 +208,6 @@ public class Intent {
                                  WalMode walMode,
                                  String shardKey,
                                  String shardId,
-                                 AckMode ackLevel,
                                  Callback callback,
                                  RedeliveryPolicy redelivery,
                                  String idempotencyKey,
@@ -237,7 +228,6 @@ public class Intent {
             walMode,
             shardKey,
             shardId,
-            ackLevel,
             callback,
             redelivery,
             idempotencyKey,
@@ -249,10 +239,11 @@ public class Intent {
     }
 
     /**
-     * 创建当前 Intent 的独立副本。
+     * 创建当前 Intent 的独立副本（I5 边界不变量）。
      *
-     * Raft 写路径会先在内存中生成最终快照，再提交到日志，避免直接
-     * 修改 store 中的当前态对象。
+     * <p>快照用于 SPI 边界传递（DeliveryHandler / IntentObserver / CallbackHandler），
+     * 确保用户代码无法持有或变异内核活状态。禁止将快照用于结算、调度或状态迁移路径
+     * --结算必须作用于 store 中的活对象。</p>
      */
     public Intent copy() {
         return restore(
@@ -268,9 +259,8 @@ public class Intent {
             walMode,
             shardKey,
             shardId,
-            ackLevel,
-            callback,
-            redelivery,
+            callback != null ? callback.copy() : null,
+            redelivery != null ? redelivery.copy() : null,
             idempotencyKey,
             tags,
             attempts,
@@ -402,8 +392,7 @@ public class Intent {
     /**
      * 增加写版本号。
      *
-     * Raft 写路径和本地写路径都会在状态变更后调用它，避免重复提交
-     * 或陈旧写请求覆盖更新后的状态。
+     * 状态变更后调用它，避免重复提交或陈旧写请求覆盖更新后的状态。
      */
     public void incrementRevision() {
         this.revision++;
@@ -503,14 +492,6 @@ public class Intent {
 
     public void setShardId(String shardId) {
         this.shardId = shardId;
-    }
-
-    public AckMode getAckMode() {
-        return ackLevel;
-    }
-
-    public void setAckMode(AckMode ackLevel) {
-        this.ackLevel = ackLevel;
     }
 
     public Callback getCallback() {

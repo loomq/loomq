@@ -12,24 +12,18 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class IntentTraceStore {
 
-    private static final IntentTraceStore INSTANCE = new IntentTraceStore();
-
     private final int maxSize;
     private final ConcurrentHashMap<String, IntentTrace> traces;
     private final EvictionQueue evictionQueue;
 
-    private IntentTraceStore() {
+    public IntentTraceStore() {
         this(100_000);
     }
 
-    private IntentTraceStore(int maxSize) {
+    public IntentTraceStore(int maxSize) {
         this.maxSize = maxSize;
         this.traces = new ConcurrentHashMap<>();
         this.evictionQueue = new EvictionQueue();
-    }
-
-    public static IntentTraceStore getInstance() {
-        return INSTANCE;
     }
 
     /**

@@ -243,7 +243,7 @@ class PrecisionSchedulerTest {
     void isTierUnderBackpressureShouldReturnFalseWhenNotUnderPressure() {
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         scheduler = new PrecisionScheduler(intentStore, handler, null);
-        assertFalse(scheduler.isTierUnderBackpressure(PrecisionTier.ECONOMY));
+        assertFalse(scheduler.isTierUnderBackpressure(PrecisionTier.STANDARD));
     }
 
     @Test
@@ -251,7 +251,7 @@ class PrecisionSchedulerTest {
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         scheduler = new PrecisionScheduler(intentStore, handler, null);
         Map<PrecisionTier, PrecisionScheduler.BackpressureInfo> status = scheduler.getBackpressureStatus();
-        assertEquals(5, status.size());
+        assertEquals(PrecisionTierCatalog.defaultCatalog().supportedTiers().size(), status.size());
         for (PrecisionTier tier : PrecisionTierCatalog.defaultCatalog().supportedTiers()) {
             PrecisionScheduler.BackpressureInfo info = status.get(tier);
             assertNotNull(info);
