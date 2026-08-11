@@ -125,17 +125,20 @@ class SlotSpillTest {
     void spilledIntentSurvivesRestart() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
         Path dir = tmp.resolve("wheel");
-        try (WheelStore s = new WheelStore(cfg(dir, 1), clock::get)) {
+        try (WheelStore s = new WheelStore(cfg(dir, 2), clock::get)) {
             long execMs = clock.get() + 5_000;
-            SlotLocation loc1 = s.put(intent("intent_rst0000001", clock, execMs)); // SEC
-            SlotLocation loc2 = s.put(intent("intent_rst0000002", clock, execMs)); // MIN (spill)
-            assertEquals(WheelTier.MIN, loc2.tier());
+            SlotLocation loc1 = s.put(intent("intent_rst0000001", clock, execMs)); // SEC slot0
+            SlotLocation loc2 = s.put(intent("intent_rst0000002", clock, execMs)); // SEC slot1
+            SlotLocation loc3 = s.put(intent("intent_rst0000003", clock, execMs)); // SEC 满 → MIN slot0 (spill)
+            assertEquals(WheelTier.SEC, loc1.tier());
+            assertEquals(WheelTier.SEC, loc2.tier());
+            assertEquals(WheelTier.MIN, loc3.tier(), "SEC 满(2) → 第 3 个 spill 到 MIN");
         }
-        try (WheelStore s2 = new WheelStore(cfg(dir, 1), clock::get)) {
+        try (WheelStore s2 = new WheelStore(cfg(dir, 2), clock::get)) {
             List<Intent> found = new ArrayList<>();
             s2.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
-            assertEquals(2, found.size(), "spill 槽重启后可恢复（含粗档）");
-            assertTrue(found.stream().anyMatch(i -> "intent_rst0000002".equals(i.getIntentId())));
+            assertEquals(3, found.size(), "spill 槽重启后可恢复（含部分占用的 MIN 桶）");
+            assertTrue(found.stream().anyMatch(i -> "intent_rst0000003".equals(i.getIntentId())));
         }
     }
 

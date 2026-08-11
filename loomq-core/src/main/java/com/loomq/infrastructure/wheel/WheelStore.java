@@ -413,18 +413,16 @@ public final class WheelStore implements AutoCloseable {
             MemorySegment.copy(seg, off, MemorySegment.ofArray(buf), 0, SlotCodec.SLOT_SIZE);
             return buf;
         }
-        /** 启动恢复：全桶扫描，占用槽取高水位，空槽入 free-list；next = maxOccupied + 1。 */
+        /** 启动恢复：全桶扫描，空槽全部入 free-list；next 置 slotsPerBucket——freeList 已含全部空槽，
+         *  next 不得 mint 其内部索引（否则 freeList 耗尽后 next 双重分配覆写）。alloc 先服 freeList，耗尽即真满抛。 */
         void rebuildFreeList() {
-            int maxOccupied = -1;
             freeList.clear();
             for (int i = 0; i < slotsPerBucket; i++) {
-                if (SlotCodec.isOccupied(read(i))) {
-                    maxOccupied = i;
-                } else {
+                if (!SlotCodec.isOccupied(read(i))) {
                     freeList.offer(i);
                 }
             }
-            next.set(maxOccupied + 1);
+            next.set(slotsPerBucket);
         }
         boolean hasUnflushed() { return writeCount.get() > flushedWriteCount; }
 

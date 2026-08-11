@@ -18,7 +18,11 @@ class SlotCompactionTest {
     @TempDir Path tmp;
 
     private WheelConfig cfg(Path dir) {
-        return new WheelConfig(dir.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        return cfg(dir, 16);
+    }
+
+    private WheelConfig cfg(Path dir, int slotsPerBucket) {
+        return new WheelConfig(dir.toString(), "t", 30, slotsPerBucket, 1, 10_000L, 60L * 60_000L, 60_000L, null);
     }
 
     private static Intent intent(String id, AtomicLong clock, long deltaMs) {
@@ -126,6 +130,40 @@ class SlotCompactionTest {
                 pool.close();
             }
             assertEquals(workers, used.size(), "并发 alloc 不得重复分发同一槽");
+        }
+    }
+
+    /**
+     * 重启重建 free-list 不得双重分配：重启前占槽 0,1（容量 4）→ freeList={2,3}。
+     * 旧实现 next=maxOccupied+1=2，freeList 耗尽后 next 会 mint 出已被 freeList 发过的 2/3 → 覆写丢 intent。
+     * 修复后 next=slotsPerBucket：freeList 耗尽即真满 → alloc 抛溢 → 链式 spill 到 MIN，绝不 mint 已发索引。
+     */
+    @Test
+    void reopenRebuildDoesNotDoubleAllocate() {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        Path dir = tmp.resolve("wheel");
+        // Phase 1: SEC 桶占槽 0,1（容量 4）
+        try (WheelStore s = new WheelStore(cfg(dir, 4), clock::get)) {
+            SlotLocation a = s.put(intent("intent_rbd00000001", clock, 1_000));
+            SlotLocation b = s.put(intent("intent_rbd00000002", clock, 1_000));
+            assertEquals(0, a.slotIndex());
+            assertEquals(1, b.slotIndex());
+        }
+        // Phase 2: 重启 → occupied{0,1}, freeList={2,3}。放 2 个复用 freeList，第 5 个应 spill 到 MIN（不得 mint 2/3 覆写）
+        try (WheelStore s2 = new WheelStore(cfg(dir, 4), clock::get)) {
+            SlotLocation c = s2.put(intent("intent_rbd00000003", clock, 1_000));
+            SlotLocation d = s2.put(intent("intent_rbd00000004", clock, 1_000));
+            assertEquals(2, c.slotIndex(), "第 1 个复用 freeList 槽 2");
+            assertEquals(3, d.slotIndex(), "第 2 个复用 freeList 槽 3");
+            SlotLocation e = s2.put(intent("intent_rbd00000005", clock, 1_000));
+            assertEquals(WheelTier.MIN, e.tier(), "第 5 个 freeList 耗尽 → 真满 spill 到 MIN，不得 mint 已发索引 2/3 覆写");
+            assertNotEquals(2, e.slotIndex(), "第 5 个不得落在已被 freeList 发过的槽 2");
+            assertNotEquals(3, e.slotIndex(), "第 5 个不得落在已被 freeList 发过的槽 3");
+            java.util.Set<String> ids = new java.util.HashSet<>();
+            s2.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(i -> ids.add(i.getIntentId()));
+            assertEquals(5, ids.size(), "重启后 5 个 intent 互异无覆写");
+            assertTrue(ids.containsAll(java.util.List.of(
+                "intent_rbd00000001", "intent_rbd00000002", "intent_rbd00000003", "intent_rbd00000004", "intent_rbd00000005")));
         }
     }
 }
