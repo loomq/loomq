@@ -95,8 +95,9 @@ public final class WheelStore implements AutoCloseable {
     /**
      * 写入 intent 并返回实际分配的槽位。桶满时经溢出链落到下一层更粗档
      * （SEC→MIN→HOUR→DAY），突破单桶容量硬顶；仅当整条链都满（DAY 满）才抛
-     * {@link SlotOverflowException}。try 仅包 {@code alloc()}：payload 超 210B 的
-     * {@link SlotCodec#encode} 溢出（同为 SlotOverflowException）不被误判为桶满而 spill。
+     * {@link SlotOverflowException}。溢出链 try 仅包 {@code alloc()}：payload 超 210B 的
+     * {@link SlotCodec#encode} 溢出（同为 SlotOverflowException）不被误判为桶满而 spill；
+     * encode 失败会将刚 alloc 的保留槽回滚（releaseReserved），避免烧槽致后续同秒 put 误 spill 降级。
      */
     public SlotLocation put(Intent intent) {
         SlotLocation loc = locate(intent.getExecuteAt());
@@ -119,7 +120,13 @@ public final class WheelStore implements AutoCloseable {
                 tier = coarser;
                 continue;
             }
-            byte[] encoded = SlotCodec.encode(intent);
+            byte[] encoded;
+            try {
+                encoded = SlotCodec.encode(intent);
+            } catch (RuntimeException e) {
+                b.releaseReserved(slot);   // 编码失败回滚保留槽，避免烧槽致后续同秒 put 误 spill
+                throw e;
+            }
             b.write(slot, encoded);
             return new SlotLocation(tier, bucketKey, slot, false);
         }
@@ -372,6 +379,10 @@ public final class WheelStore implements AutoCloseable {
                     + " (slotsPerBucket=" + slotsPerBucket + "); consider widening the time window or adding overflow chain");
             }
             return idx;
+        }
+        /** 释放刚 alloc 但尚未写入的保留槽（encode 失败回滚）；槽必为空，直接入 free-list。 */
+        void releaseReserved(int slot) {
+            freeList.push(slot);
         }
         /** 回收槽：写 status=0 空槽 + 入 free-list（供 alloc 复用）。双重 free 防护：已空槽不重复入栈。 */
         void free(int slot) {

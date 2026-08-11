@@ -116,6 +116,7 @@ class SlotSpillTest {
             SlotLocation loc3 = s.put(intent("intent_ovs0000004", clock, sec2));    // SEC 满 → MIN
             assertEquals(WheelTier.MIN, loc3.tier());
             assertEquals(loc2.slotIndex(), loc3.slotIndex(), "spill 槽 free 后复用同一索引");
+            assertEquals(loc2.bucketKey(), loc3.bucketKey(), "两次 spill 落同一 MIN 桶");
             assertNotNull(s.readSlot(loc3));
         }
     }
@@ -179,6 +180,14 @@ class SlotSpillTest {
             List<Intent> found = new ArrayList<>();
             s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
             assertEquals(0, found.size(), "payload 溢出 intent 不落盘");
+            // 保留槽已回滚：下一个同秒正常 put 仍落 SEC（未被烧毁导致误 spill 降级）
+            SlotLocation loc = s.put(intent("intent_plo0000002", clock, clock.get() + 5_000));
+            assertEquals(WheelTier.SEC, loc.tier(), "encode 失败后保留槽应回滚，同秒 put 仍落 SEC");
+            assertEquals(0L, s.getSpillCounts().getOrDefault(WheelTier.SEC, 0L),
+                "SEC spill 计数全程为 0（回滚后同秒 put 未误 spill）");
+            List<Intent> found2 = new ArrayList<>();
+            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found2::add);
+            assertEquals(1, found2.size(), "只有后一个正常 intent 落盘");
         }
     }
 }
