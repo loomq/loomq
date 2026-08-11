@@ -376,7 +376,8 @@ public final class WheelStore implements AutoCloseable {
                 // Wave3: 用可识别的 SlotOverflowException 替代裸 IllegalStateException,
                 // 让调用方能区分"桶满"与其他 ISE,并在文档明示容量模型(1024 槽/桶)。
                 throw new SlotOverflowException("bucket overflow: " + tier + "/" + bucketKey
-                    + " (slotsPerBucket=" + slotsPerBucket + "); consider widening the time window or adding overflow chain");
+                    + " (slotsPerBucket=" + slotsPerBucket + "); spill chain exhausted at " + tier
+                    + " — consider widening the time window or increasing slotsPerBucket");
             }
             return idx;
         }

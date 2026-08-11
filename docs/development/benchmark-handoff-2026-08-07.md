@@ -92,7 +92,11 @@ PHTW 的 SEC 轮（1s×60）每桶固定 **1024 个 256B 定长槽**，**append-
 
 **验证**：`StallDetectionTest` 连续 **10 轮零停摆** @默认 1024 桶；`DeliveryPathBenchmark` 各档 `qps_median>0`；fast 测试 **311 通过**。
 
-> 其余方向（见 `.claude/plans/2026-08-07-wheel-bucket-throughput-ceiling.md`）：**C. 溢出 spill**（满桶溢出到下一层/tail）**仍未做**，是唯一遗留的未来方向；D. 接受限制文档化、基准退回突发 已不再需要。
+> 其余方向：**C. 溢出 spill** 已实现（2026-08-11，见下方 §3.6）；D. 接受限制文档化、基准退回突发 已不再需要。
+
+### 3.6 溢出链 spill（2026-08-11 已实现）
+
+桶满（活跃在途 > 桶容量）经溢出链落到下一层更粗档：SEC→MIN→HOUR→DAY；仅整条链都满（DAY 满）才抛 `SlotOverflowException` 兜底。实现于 `put()` 内部（`WheelTier.nextCoarser` + 重算 bucketKey），对调用方透明——locationIndex/PromotionDaemon/终态覆写/回收/恢复/扫描零改动。try 仅包 `alloc()`：payload 超 210B 的 encode 溢出不被误判为桶满而 spill（且保留槽经 `releaseReserved` 回滚，杜绝烧槽）。**不含 tail**：tail 职责是超 day 视界（>30d），近未来 intent 溢出进 tail 会被恢复期 `TailIndex.promoteInto` 推回原满桶 → 恢复时 put 再溢出 → 引擎启动失败；溢出链止于 DAY。提交：`c01f412`（spill 机制 + spillCounts）→ `9f7b3cf`（交互边界测试）→ `313a938`（encode 失败回滚修复）。
 
 ---
 
@@ -129,17 +133,16 @@ PHTW 的 SEC 轮（1s×60）每桶固定 **1024 个 256B 定长槽**，**append-
 - **回归测试**：`FinalizePersistFailureRegressionTest`（fast-tag，进 CI）——注入恒定失败的终态持久化，断言 `onDelivered` 仍触发 + `persistFailures` 记录。
 - **验证**：`StallDetectionTest` 连续 **10 轮零停摆** + fast 306 通过；ULTRA 投递 `qps_median=24k, e2e_p50=4ms, wake_p99=2ms`（此前 qps_median=0）。
 
-### 4.5 遗留（仅剩溢出 spill 方向）
+### 4.5 遗留（溢出链已实现，仅剩 DAY 兜底）
 
-容量根治（方向 B 单槽 compaction）**已完成**（见 §3.5）。唯一遗留的未来方向：
-- **C. 溢出 spill**（满桶溢出到下一层/TailIndex）—— 未做，作为后续候选（见 §3.5 与 §5）。
+容量根治（方向 B 单槽 compaction）+ 溢出链（方向 C spill）**均已完成**（见 §3.5/§3.6）。桶满仅剩 DAY 兜底（实际不可达）。
 
 ---
 
 ## 5. 决策与遗留项（2026-08-07 已定）
 
 1. **引擎投递停顿（Issue B）**：✅ **已修复**（方案 A 解耦 onDelivered 与终态持久化 + D 基准解阻塞）。见 §4.4。
-2. **容量根治（Issue A）**：✅ **已修复**（方向 B 单槽 compaction）。见 §3.5。`slotsPerBucket` 回退默认 1024，基准不再用 262144 规避。唯一遗留未来方向：**C. 溢出 spill**。
+2. **容量根治（Issue A）**：✅ **已修复**（方向 B 单槽 compaction）。见 §3.5。`slotsPerBucket` 回退默认 1024，基准不再用 262144 规避。溢出链（方向 C spill）✅ 已实现（见 §3.6）。
 3. **基准投递数字**：✅ 修复后可用（ULTRA 24k QPS 等），README 投递列可更新。
 4. **消费者扫参甜点**：桶容量已解（默认 1024 桶 + compaction），扫参可测；但注意持续吞吐仍受活跃在途 ≤ 桶容量约束（非消费者），甜点解读需谨慎。
 
