@@ -50,12 +50,14 @@ class OverflowSpillEngineTest {
             });
 
             long t0 = System.currentTimeMillis();
-            // 100 个同一秒 executeAt：SEC 桶容量 64 → 第 65 个起必须 spill 到 MIN 才能落盘
+            // 100 个同一秒 executeAt：SEC 桶容量 64 → 第 65 个起必须 spill 到 MIN 才能落盘。
+            // join 每个 createIntent future：无 spill 时第 65 个的 SlotOverflowException 会在 join 处快速抛
+            // （而非落在被丢弃的 future 里等 30s 超时）。
             for (int i = 0; i < 100; i++) {
                 Intent it = new Intent();
                 it.setExecuteAt(Instant.ofEpochMilli(t0 + 5_000));
                 it.setPrecisionTier(PrecisionTier.STANDARD);
-                engine.createIntent(it, AckMode.DURABLE);   // 无 spill 时第 65 个抛 SlotOverflowException
+                engine.createIntent(it, AckMode.DURABLE).join();
             }
 
             long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
