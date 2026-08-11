@@ -46,6 +46,8 @@ public final class WheelStore implements AutoCloseable {
     // tier → (bucketKey → Bucket)
     private final Map<WheelTier, ConcurrentHashMap<Long, Bucket>> wheels = new EnumMap<>(WheelTier.class);
     private final Arena arena = Arena.ofShared();
+    /** 溢出链 spill 计数：按源档统计桶满后溢出到下一档的次数。 */
+    private final EnumMap<WheelTier, AtomicLong> spillCounts = new EnumMap<>(WheelTier.class);
     /** 空槽模板:status=0。free 时整槽清零,readSlot/isOccupied 据此判空。 */
     private static final byte[] EMPTY_SLOT = new byte[SlotCodec.SLOT_SIZE];
 
@@ -55,7 +57,10 @@ public final class WheelStore implements AutoCloseable {
         this.slotsPerBucket = config.slotsPerBucket();
         this.bucketBytes = slotsPerBucket * SlotCodec.SLOT_SIZE;
         this.horizonMs = (long) config.horizonDays() * WheelTier.DAY.windowMs; // 由 config.horizonDays() 覆盖
-        for (WheelTier t : WheelTier.values()) wheels.put(t, new ConcurrentHashMap<>());
+        for (WheelTier t : WheelTier.values()) {
+            wheels.put(t, new ConcurrentHashMap<>());
+            spillCounts.put(t, new AtomicLong());
+        }
         loadExistingBuckets();
     }
 
@@ -87,16 +92,37 @@ public final class WheelStore implements AutoCloseable {
         return new SlotLocation(tier, bucketKey, -1, false);
     }
 
+    /**
+     * 写入 intent 并返回实际分配的槽位。桶满时经溢出链落到下一层更粗档
+     * （SEC→MIN→HOUR→DAY），突破单桶容量硬顶；仅当整条链都满（DAY 满）才抛
+     * {@link SlotOverflowException}。try 仅包 {@code alloc()}：payload 超 210B 的
+     * {@link SlotCodec#encode} 溢出（同为 SlotOverflowException）不被误判为桶满而 spill。
+     */
     public SlotLocation put(Intent intent) {
         SlotLocation loc = locate(intent.getExecuteAt());
         if (loc.inTail()) {
             throw new IllegalStateException("out-of-horizon put must go via TailIndex; got " + loc);
         }
-        Bucket b = getOrCreateBucket(loc.tier(), loc.bucketKey());
-        int slot = b.alloc();
-        byte[] encoded = SlotCodec.encode(intent);
-        b.write(slot, encoded);
-        return new SlotLocation(loc.tier(), loc.bucketKey(), slot, false);
+        WheelTier tier = loc.tier();
+        long executeAtMs = intent.getExecuteAt().toEpochMilli();
+        while (true) {
+            long bucketKey = executeAtMs / tier.windowMs;
+            Bucket b = getOrCreateBucket(tier, bucketKey);
+            int slot;
+            try {
+                slot = b.alloc();
+            } catch (SlotOverflowException e) {
+                WheelTier coarser = tier.nextCoarser();
+                if (coarser == null) throw e;              // 链终点(DAY)仍满 → 原样抛出
+                spillCounts.get(tier).incrementAndGet();
+                log.warn("Bucket overflow {} -> spill {} to {}", tier, intent.getIntentId(), coarser);
+                tier = coarser;
+                continue;
+            }
+            byte[] encoded = SlotCodec.encode(intent);
+            b.write(slot, encoded);
+            return new SlotLocation(tier, bucketKey, slot, false);
+        }
     }
 
     public Intent readSlot(SlotLocation loc) {
@@ -268,6 +294,13 @@ public final class WheelStore implements AutoCloseable {
         Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
         if (b == null) return;
         b.free(loc.slotIndex());
+    }
+
+    /** 溢出链 spill 计数快照（按源档；未溢出档为 0）。 */
+    public Map<WheelTier, Long> getSpillCounts() {
+        Map<WheelTier, Long> out = new EnumMap<>(WheelTier.class);
+        spillCounts.forEach((t, c) -> out.put(t, c.get()));
+        return out;
     }
 
     /** 暴露 WheelTier 的 windowMs(供 BucketReclaimer 计算过期)。 */

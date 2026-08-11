@@ -18,7 +18,8 @@ class FactoryFromPropertiesTest {
 
     /**
      * A4:LoomqEngineFactory.createFromProperties 必须读 wheel.* 属性。用 wheel.slots_per_bucket=2,
-     * 3 个同执行时刻 Intent 落同一桶,第 3 个溢出(默认 1024 不会)。证明 wheel.* 被读取。
+     * 9 个同执行时刻 Intent：SEC(2)+MIN(2)+HOUR(2)+DAY(2)=8 落整条链,第 9 个触发链终点溢出
+     * (默认 1024 不会)。证明 wheel.* 被读取,同时覆盖 spill 链。
      */
     @Test
     void fromPropertiesReadsWheelProps() throws Exception {
@@ -30,18 +31,18 @@ class FactoryFromPropertiesTest {
         engine.start();
         try {
             Instant exec = Instant.now().plusSeconds(10);
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 8; i++) {
                 Intent it = new Intent("intent_fct0000000" + i);
                 it.setExecuteAt(exec);
                 it.setPrecisionTier(PrecisionTier.STANDARD);
                 engine.createIntent(it, AckMode.ASYNC).join();
             }
-            Intent third = new Intent("intent_fct00000002");
-            third.setExecuteAt(exec);
-            third.setPrecisionTier(PrecisionTier.STANDARD);
+            Intent ninth = new Intent("intent_fct00000008");
+            ninth.setExecuteAt(exec);
+            ninth.setPrecisionTier(PrecisionTier.STANDARD);
             assertThrows(RuntimeException.class,
-                () -> engine.createIntent(third, AckMode.ASYNC).join(),
-                "wheel.slots_per_bucket=2 from properties must cause bucket overflow");
+                () -> engine.createIntent(ninth, AckMode.ASYNC).join(),
+                "wheel.slots_per_bucket=2 must exhaust spill chain on 9th same-instant intent");
         } finally {
             engine.close();
         }
