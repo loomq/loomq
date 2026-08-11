@@ -377,7 +377,7 @@ public final class WheelStore implements AutoCloseable {
                 // 让调用方能区分"桶满"与其他 ISE,并在文档明示容量模型(1024 槽/桶)。
                 throw new SlotOverflowException("bucket overflow: " + tier + "/" + bucketKey
                     + " (slotsPerBucket=" + slotsPerBucket + "); spill chain exhausted at " + tier
-                    + " — consider widening the time window or increasing slotsPerBucket");
+                    + " — consider increasing slotsPerBucket");
             }
             return idx;
         }

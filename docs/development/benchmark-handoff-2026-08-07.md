@@ -96,7 +96,7 @@ PHTW 的 SEC 轮（1s×60）每桶固定 **1024 个 256B 定长槽**，**append-
 
 ### 3.6 溢出链 spill（2026-08-11 已实现）
 
-桶满（活跃在途 > 桶容量）经溢出链落到下一层更粗档：SEC→MIN→HOUR→DAY；仅整条链都满（DAY 满）才抛 `SlotOverflowException` 兜底。实现于 `put()` 内部（`WheelTier.nextCoarser` + 重算 bucketKey），对调用方透明——locationIndex/PromotionDaemon/终态覆写/回收/恢复/扫描零改动。try 仅包 `alloc()`：payload 超 210B 的 encode 溢出不被误判为桶满而 spill（且保留槽经 `releaseReserved` 回滚，杜绝烧槽）。**不含 tail**：tail 职责是超 day 视界（>30d），近未来 intent 溢出进 tail 会被恢复期 `TailIndex.promoteInto` 推回原满桶 → 恢复时 put 再溢出 → 引擎启动失败；溢出链止于 DAY。提交：`c01f412`（spill 机制 + spillCounts）→ `9f7b3cf`（交互边界测试）→ `313a938`（encode 失败回滚修复）。
+桶满（活跃在途 > 桶容量）经溢出链落到下一层更粗档：SEC→MIN→HOUR→DAY；仅整条链都满（DAY 满）才抛 `SlotOverflowException` 兜底。实现于 `put()` 内部（`WheelTier.nextCoarser` + 重算 bucketKey），对调用方透明——locationIndex/PromotionDaemon/终态覆写/回收/恢复/扫描零改动。try 仅包 `alloc()`：payload 超 210B 的 encode 溢出不被误判为桶满而 spill（且保留槽经 `releaseReserved` 回滚，杜绝烧槽）。**不含 tail**：tail 职责是超 day 视界（>30d）；近未来 intent 落 tail 会在恢复期被 `TailIndex.promoteInto` 推回 wheel 的 `put()`——溢出链使其再次 spill（wheel→tail→wheel 无收益往返；整条链都满的病理场景仍抛错）。溢出链止于 DAY。提交：`754b2b4`（nextCoarser）→ `c01f412`（spill 机制 + spillCounts）→ `9f7b3cf`（交互边界测试）→ `313a938`（encode 失败回滚修复）。
 
 ---
 
