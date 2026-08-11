@@ -91,4 +91,94 @@ class SlotSpillTest {
                 () -> s.put(intent("intent_day0000005", clock, execMs)));
         }
     }
+
+    @Test
+    void spilledSlotSupportsTerminalOverwriteAndReclaim() {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        try (WheelStore s = new WheelStore(cfg(tmp, 1), clock::get)) {
+            long sec = clock.get() + 5_000;                     // 秒 S
+            long sec2 = clock.get() + 6_000;                    // 秒 S+1（同一分钟）
+            SlotLocation loc1 = s.put(intent("intent_ovs0000001", clock, sec));    // SEC@S
+            SlotLocation loc2 = s.put(intent("intent_ovs0000002", clock, sec));    // SEC 满 → MIN
+            assertEquals(WheelTier.MIN, loc2.tier(), "第 2 个 spill 到 MIN");
+            // 终态原地覆写 spill 落点（模拟 persistTerminalInPlace）
+            Intent term = intent("intent_ovs0000002", clock, sec);
+            term.transitionTo(IntentStatus.CANCELED);
+            term.incrementRevision();
+            s.overwriteSlot(loc2, SlotCodec.encode(term));
+            assertEquals(IntentStatus.CANCELED, s.readSlot(loc2).getStatus(), "spill 落点覆写为终态");
+            // 回收 spill 槽 → 空
+            s.freeSlot(loc2);
+            assertNull(s.readSlot(loc2), "回收后槽为空");
+            // 秒 S+1 的 SEC 桶占满后，新 intent spill 到同一 MIN 桶 → 复用 freed 槽
+            SlotLocation pre = s.put(intent("intent_ovs0000003", clock, sec2));     // SEC@S+1
+            assertEquals(WheelTier.SEC, pre.tier());
+            SlotLocation loc3 = s.put(intent("intent_ovs0000004", clock, sec2));    // SEC 满 → MIN
+            assertEquals(WheelTier.MIN, loc3.tier());
+            assertEquals(loc2.slotIndex(), loc3.slotIndex(), "spill 槽 free 后复用同一索引");
+            assertNotNull(s.readSlot(loc3));
+        }
+    }
+
+    @Test
+    void spilledIntentSurvivesRestart() {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        Path dir = tmp.resolve("wheel");
+        try (WheelStore s = new WheelStore(cfg(dir, 1), clock::get)) {
+            long execMs = clock.get() + 5_000;
+            SlotLocation loc1 = s.put(intent("intent_rst0000001", clock, execMs)); // SEC
+            SlotLocation loc2 = s.put(intent("intent_rst0000002", clock, execMs)); // MIN (spill)
+            assertEquals(WheelTier.MIN, loc2.tier());
+        }
+        try (WheelStore s2 = new WheelStore(cfg(dir, 1), clock::get)) {
+            List<Intent> found = new ArrayList<>();
+            s2.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            assertEquals(2, found.size(), "spill 槽重启后可恢复（含粗档）");
+            assertTrue(found.stream().anyMatch(i -> "intent_rst0000002".equals(i.getIntentId())));
+        }
+    }
+
+    @Test
+    void concurrentOverflowSpillsToDistinctSlots() throws Exception {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        try (WheelStore s = new WheelStore(cfg(tmp, 5), clock::get)) {
+            long execMs = clock.get() + 5_000; // 同一秒：SEC 容量 5，16 并发 → 5 SEC + 11 spill
+            int workers = 16;
+            java.util.Set<String> seen = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
+            try {
+                java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+                for (int i = 0; i < workers; i++) {
+                    final int n = i;
+                    futures.add(pool.submit(() -> {
+                        SlotLocation loc = s.put(intent("intent_csp" + n + "000000", clock, execMs));
+                        assertNotNull(s.readSlot(loc));
+                        seen.add(loc.tier() + "/" + loc.bucketKey() + "/" + loc.slotIndex());
+                    }));
+                }
+                for (var f : futures) f.get();
+            } finally {
+                pool.close();
+            }
+            assertEquals(workers, seen.size(), "并发 spill 后槽位互异，无重复分发");
+            List<Intent> found = new ArrayList<>();
+            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            assertEquals(workers, found.size(), "并发 spill 后全部可扫描");
+        }
+    }
+
+    @Test
+    void payloadOverflowIsNotSpilledAsBucketOverflow() {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        try (WheelStore s = new WheelStore(cfg(tmp, 1), clock::get)) {
+            Intent big = intent("intent_plo0000001", clock, clock.get() + 5_000);
+            big.setShardKey("x".repeat(300));   // encodePayload 超 210B
+            assertThrows(SlotOverflowException.class, () -> s.put(big));
+            assertEquals(0L, s.getSpillCounts().getOrDefault(WheelTier.SEC, 0L),
+                "payload 溢出不得计入桶溢出 spill 计数");
+            List<Intent> found = new ArrayList<>();
+            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            assertEquals(0, found.size(), "payload 溢出 intent 不落盘");
+        }
+    }
 }
