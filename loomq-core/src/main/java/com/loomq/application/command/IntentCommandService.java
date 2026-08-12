@@ -462,7 +462,7 @@ public final class IntentCommandService {
                 }
                 scheduler.removeFromSchedule(intent);
                 intent.incrementRevision();
-                persistTerminalInPlace(intent);   // 原地覆写终态，不追加新槽
+                persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
                 intentStore.update(intent);
                 locationIndex.remove(intentId);  // 终态 Intent 不保留索引(桶回收依赖)
                 // I5: 锁内取快照，锁外派发
@@ -506,7 +506,7 @@ public final class IntentCommandService {
  *       remove 返回 false 表示已被并发取消者移除(已追加 tombstone),直接返回 false 不重复计数。
  *       appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需布尔门控</li>
      *   <li>wheel:按 intentId 串行化(computeIfAbsent 锁)→ 锁内重读索引取最新槽 → 读槽解码 →
-     *       transitionTo(CANCELED) + incrementRevision → 写新槽(append-only,recovery 按 max revision
+     *       transitionTo(CANCELED) + incrementRevision → 写新槽(recovery 按 max revision
      *       去重,terminal 跳过)→ 索引指向新 CANCELED 槽(在 awaitCommit 之前,杜绝在途 promote 复活)
      *       + awaitCommit。串行化保证后到者重读得到先到者写入的 CANCELED 槽(terminal)→ transitionTo
      *       抛 ISE → 返回 false,杜绝 double-write + double 计数</li>
@@ -535,7 +535,7 @@ public final class IntentCommandService {
             synchronized (lock) {
                 try {
                     // 必须在锁内重读索引:锁外拿到的 loc 是先到者写新槽前的旧槽位,指向 SCHEDULED 旧槽
-                    // (WheelStore append-only,旧槽不被覆写)。重读得到先到者更新后的 CANCELED 槽才能让
+                    // (WheelStore 状态变更写新槽,旧槽不被覆写)。重读得到先到者更新后的 CANCELED 槽才能让
                     // 后到者见到 terminal 状态。若先到者已走出锁并移除索引项,这里拿到 null → 返回 false。
                     SlotLocation latest = locationIndex.get(intentId);
                     if (latest == null) {
@@ -554,7 +554,7 @@ public final class IntentCommandService {
                         return false;
                     }
                     cold.incrementRevision();
-                    // WheelStore 为 append-only:此处写入新槽(revision 更高),recovery 按 intentId
+                    // 状态变更写新槽(revision 更高),recovery 按 intentId
                     // 取 max revision 胜者,terminal 状态跳过——不会重复投递。
                     // 关键:在 awaitCommit 之前把索引指向新 CANCELED 槽。否则 awaitCommit 窗口内,
                     // locationIndex 仍指向旧 SCHEDULED 槽,PromotionDaemon.promote 的 latest.equals(h.loc())
@@ -715,7 +715,7 @@ public final class IntentCommandService {
      * 经此方法恒为 DURABLE；fireNow 认领分支不调用本方法——在途投递即为效果，不落盘
      * SCHEDULED@now（避免崩溃恢复将其判 overdue 丢弃）。
      *
-     * <p>WheelStore 为 append-only:每次写入分配新槽,旧槽残留。recovery 按 intentId 取
+     * <p>非终态状态变更分配新槽,旧槽残留;终态原地覆写 + 单槽回收。recovery 按 intentId 取
      * max revision 胜者,故旧槽不会引发 ghost 投递。</p>
      */
     private void persistIntentState(Intent intent, AckMode ackMode) {
@@ -765,6 +765,11 @@ public final class IntentCommandService {
         } finally {
             multiSlotIntents.remove(intentId);
         }
+    }
+
+    /** 恢复期由 WheelRecovery 注入:磁盘上幸存槽数 >1 的 Intent 视为多槽(终态保留墓碑不回收)。 */
+    public void markMultiSlot(java.util.Set<String> ids) {
+        multiSlotIntents.addAll(ids);
     }
 
     /**

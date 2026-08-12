@@ -245,6 +245,13 @@ public class LoomqEngine implements AutoCloseable {
                     recoveryReport.hotRestored(), recoveryReport.coldRegistered());
             }
 
+            // F1:恢复期重建 multiSlot 标记,必须在 scheduler.start() 之前注入——
+            // 否则重排程过的 Intent 在重启后会被误判单槽,终态回收掉当前槽后,
+            // 陈旧兄弟槽会在下次重启按 max-revision 复活重投(幽灵投递)。
+            if (!recoveryReport.multiSlotIntentIds().isEmpty()) {
+                commandService.markMultiSlot(recoveryReport.multiSlotIntentIds());
+            }
+
             // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
             commitBarrier.start();
 

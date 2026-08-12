@@ -291,7 +291,7 @@ public final class WheelStore implements AutoCloseable {
         if (loc.inTail() || loc.slotIndex() < 0) return;
         Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
         if (b == null) return;
-        if (!SlotCodec.isOccupied(b.read(loc.slotIndex()))) return;  // 已回收槽不覆写（防复活）
+        if (!SlotCodec.isOccupied(b.read(loc.slotIndex()))) return;  // 空槽(已回收未复用)不覆写(防复活);已复用槽会被覆写——调用方须以 locationIndex 为准,回收前先清索引
         b.write(loc.slotIndex(), encoded);
     }
 
@@ -374,7 +374,7 @@ public final class WheelStore implements AutoCloseable {
             int idx = next.getAndIncrement();
             if (idx >= slotsPerBucket) {
                 // Wave3: 用可识别的 SlotOverflowException 替代裸 IllegalStateException,
-                // 让调用方能区分"桶满"与其他 ISE,并在文档明示容量模型(1024 槽/桶)。
+                // put() 内桶满走溢出链 spill,此异常仅在整条链满(DAY)时向上抛。
                 throw new SlotOverflowException("bucket overflow: " + tier + "/" + bucketKey
                     + " (slotsPerBucket=" + slotsPerBucket + "); spill chain exhausted at " + tier
                     + " — consider increasing slotsPerBucket");

@@ -38,7 +38,7 @@ flowchart TB
     end
 
     subgraph PHTW["持久化子系统 PHTW (磁盘权威)"]
-        Wheel["WheelStore<br/>4 层 mmap 时间轮 sec/min/hour/day<br/>append-only 定长槽"]
+        Wheel["WheelStore<br/>4 层 mmap 时间轮 sec/min/hour/day<br/>定长槽 + 单槽回收 + 溢出链"]
         Tail["TailIndex<br/>>30 天 run 文件 + tombstone"]
         GCB["GroupCommitBarrier<br/>ticket 式 rendezvous msync"]
         Idx["IntentLocationIndex<br/>intentId → SlotLocation"]
@@ -182,9 +182,9 @@ stateDiagram-v2
 - 每层一 wheel：`SEC(1s×60)` / `MIN(60s×60)` / `HOUR(1h×24)` / `DAY(24h×horizonDays)`，默认视界 30 天；`pickTier(delta)` 按延迟选层。
 - 桶 = 一个 mmap 文件：`<dataDir>/<tier>/<bucketKey>.bin`，`bucketKey = floor(executeAt / windowMs)` 绝对寻址（非滚动）。每桶 `slotsPerBucket`（默认 **1024**）个 **256B 定长槽**，桶文件创建即 truncate 到定长。
 - 槽格式（`SlotCodec`）：`status(1) | revision(8) | CRC32(4) | executeAt(8) | idLen(1) | intentId(≤24B) | payload(≤210B)`。CRC 覆盖 revision 之后的字节，撕裂写可检出并跳过。
-- **Append-only**：`alloc()` 用 `AtomicInteger` 无锁分槽，每次写入（含状态变更）都分配新槽，旧槽残留；启动时 `recoverHighWaterMark()` 扫首个空槽恢复 `next`，防重启覆写。同一 intentId 的多版本由恢复时按 **max revision 去重**裁决。
+- **单槽 compaction + 溢出链**：`alloc()` 无锁分槽，先服 free-list（回收槽复用）再 `next` 单调分配；启动时 `rebuildFreeList()` 全桶扫描，空槽入 free-list、`next` 置 `slotsPerBucket`（防 free-list 耗尽后 mint 已发索引）。终态经 `persistTerminalInPlace` 原地覆写最新槽 + `reclaimTerminal` 清空入 free-list；重排程过的多槽 Intent 保留终态槽作 tombstone。桶满走溢出链 spill（SEC→MIN→HOUR→DAY）。同一 intentId 的多版本由恢复时按 **max revision 去重**裁决。
 - 底层使用 Java FFM API（`Arena.ofShared()` + `MemorySegment`）做 mmap；`forceDirty()` 只对"写计数 > 已刷计数"的脏桶 `seg.force()`。
-- **终态记录语义**：wheel 是"当前真相"而非"投递历史"。在途期间 update 内容后，终态落盘记录携带的是最新内容而非首轮投递内容。append-only 模型下旧槽残留由 recovery 按 max revision 去重，不构成投递历史。
+- **终态记录语义**：wheel 是"当前真相"而非"投递历史"。在途期间 update 内容后，终态落盘记录携带的是最新内容而非首轮投递内容。终态槽回收 + 陈旧槽由 recovery 按 max revision 去重，不构成投递历史。
 
 ### 5.2 TailIndex —— 超视界尾区
 
@@ -222,7 +222,7 @@ stateDiagram-v2
 `WheelRecovery.recover()` 在引擎启动时执行，替代旧版 RecoveryPipeline（snapshot + WAL replay）：
 
 1. `tail.promoteInto(store)`：把已进入 day 视界的 tail 条目落回 wheel（冷→冷磁盘重组，仅一次）。
-2. **全量扫描** wheel 所有槽 + tail 全部条目，按 intentId 取 **max revision** 构建全局最新映射（append-only 残留的旧槽/旧条目在此被裁决掉，防 ghost 投递）。
+2. **全量扫描** wheel 所有槽 + tail 全部条目，按 intentId 取 **max revision** 构建全局最新映射（陈旧兄弟槽/条目在此被裁决掉，防 ghost 投递）；并按 intentId 计数幸存槽数，>1 的重建 multiSlot 标记（终态须保留墓碑），count==1 的终态槽回收泄漏墓碑。
 3. 逐胜者处理：重建 `IntentLocationIndex`；终态跳过；`executeAt < now` 跳过；热的（≤ hotBoundary）`intentStore.upsert + scheduler.restore`；冷的注册 `PromotionDaemon` cohort。
 
 产出 `WheelRecoveryReport(hotRestored, coldRegistered)`。
@@ -284,8 +284,8 @@ LoomqEngine.createIntent (虚拟线程异步)
 
 以下均为代码中确认存在的限制，新 Contributor 须知：
 
-1. **无生命周期治理**：`WheelStore` append-only，旧槽残留由 recovery 去重处理（无 ghost 投递）；`BucketReclaimer` 定期删除过期且无引用的桶文件（默认保留期 = horizon + 1 天）；`TailIndex` run 文件超阈值时触发 compaction（默认 512MB）；`WheelRecovery` 启动时**全量物化**所有槽到内存 HashMap（O(N)），数据量大时恢复耗时与内存压力可观。
-2. **桶槽数硬上限**：每桶固定 `slotsPerBucket`（默认 1024）槽，同一 bucketKey 写满后 `alloc()` 抛 `IllegalStateException("bucket overflow")`。上限只能在初始化时经 `WheelConfig` 调整，运行期不可变。
+1. **无生命周期治理**：`WheelStore` 非终态 append + 终态单槽回收，陈旧槽由 recovery 去重处理（无 ghost 投递）；`BucketReclaimer` 定期删除过期且无引用的桶文件（默认保留期 = horizon + 1 天）；`TailIndex` run 文件超阈值时触发 compaction（默认 512MB）；`WheelRecovery` 启动时**全量物化**所有槽到内存 HashMap（O(N)），数据量大时恢复耗时与内存压力可观。
+2. **桶容量与溢出链**：每桶固定 `slotsPerBucket`（默认 1024）槽。活跃在途超桶容量时经溢出链 spill 到下一层更粗档（SEC→MIN→HOUR→DAY），仅整条链都满（DAY 满）才抛 `SlotOverflowException`。上限只能在初始化时经 `WheelConfig` 调整，运行期不可变。
 3. **`IntentTraceStore` 非注入路径**：`PrecisionScheduler` 的无参构造仍 `new IntentTraceStore()`，非 `LoomqEngine` 创建的调度器实例不共享引擎级 trace store。`MetricsCollector` 已改为引擎注入（无 `getInstance()`）。
 4. **冷操作不完整**：冷 Intent 支持取消，但**不支持改期与 fireNow**（见 §5.4）。
 5. **intentId / payload 尺寸约束**：槽内 intentId ≤ 24B、payload ≤ 210B（超出抛 `SlotOverflowException`）；tail run 记录 intentId ≤ 255B。超长标识需上层自行散列。

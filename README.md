@@ -119,7 +119,7 @@ flowchart LR
 
 ## 持久化与可靠性（PHTW）
 
-持久化栈由 `WheelStore`（4 层 mmap 时间轮，append-only）+ `TailIndex`（超 30 天 run 文件）+ `GroupCommitBarrier`（group-commit msync）+ `IntentLocationIndex` + `PromotionDaemon` + `WheelRecovery` 构成。**磁盘是权威，内存 `IntentStore` 只是热窗口镜像；无 WAL、无快照**。
+持久化栈由 `WheelStore`（4 层 mmap 时间轮，非终态 append + 终态单槽回收 + 溢出链）+ `TailIndex`（超 30 天 run 文件）+ `GroupCommitBarrier`（group-commit msync）+ `IntentLocationIndex` + `PromotionDaemon` + `WheelRecovery` 构成。**磁盘是权威，内存 `IntentStore` 只是热窗口镜像；无 WAL、无快照**。
 
 | AckMode | 持久化 | API 返回时机 | 崩溃窗口 |
 |:--------|:-------|:------------|:---------|
@@ -128,7 +128,7 @@ flowchart LR
 | `REPLICATED` | 预留多副本确认 | — | 无（未来集群，当前映射 `DURABLE`） |
 
 - 状态变更操作（`update` / `cancel` / `fireNow`）**硬编码 DURABLE**，即使 Intent 以 `ASYNC` 创建，其取消/改期也必然落盘后才返回。
-- 重启 `WheelRecovery` 按 **max revision** 去重（append-only 旧槽残留），终态不补投，避免对下游产生过时事件。
+- 重启 `WheelRecovery` 按 **max revision** 去重（陈旧兄弟槽），终态不补投，避免对下游产生过时事件；并重建 multiSlot 标记、回收泄漏终态槽。
 
 ---
 

@@ -51,8 +51,8 @@ import org.slf4j.LoggerFactory;
  * <h2>核心不变量</h2>
  * <ul>
  *   <li><b>I1 单持有方</b>: 任一 intentId 同一时刻最多存在于一个调度结构（bucket / cohort / 派发队列 / promotion cohort）</li>
- *   <li><b>I2 持久化先于承诺</b>: 状态对调用方可见前必须已对磁盘可见（DURABLE 落盘）</li>
- *   <li><b>I3 revision 单调 + 终态不可逆</b>: append-only + max-revision 去重的基础</li>
+ *   <li><b>I2 持久化先于承诺</b>: 状态对调用方可见前必须已对磁盘可见（DURABLE 落盘;I6 容错下终态持久化失败降级为 best-effort,onDelivered 仍触发）</li>
+ *   <li><b>I3 revision 单调 + 终态不可逆</b>: 非终态 append + 终态原地覆写,recovery 按 max-revision 去重的基础</li>
  *   <li><b>I4 索引即所有权账本</b>: 认领必须经 {@code intentIndex} 原子摘除（CAS）</li>
  * </ul>
  *
@@ -94,7 +94,7 @@ public class PrecisionScheduler {
     /**
      * 状态变更持久化钩子（由 LoomqEngine 注入，接到 IntentCommandService 的 DURABLE 落盘）。
      * 重试重排程是新的调度承诺而非中间态：必须落盘，否则崩溃恢复看到的是
-     * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。
+     * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
      */
     private volatile StateChangeSink stateChangeSink;
 
@@ -1270,8 +1270,16 @@ public class PrecisionScheduler {
     /** 阻塞到最近一次 persistStateChange 的 put 落盘；须在 synchronized(intent) 之外调用。 */
     private void awaitStateChangeCommit() {
         StateChangeSink s = stateChangeSink;
-        if (s != null) {
+        if (s == null) return;
+        try {
             s.awaitCommit();
+        } catch (Exception e) {
+            // I6 容错(镜像 persistStateChange/persistTerminal):await 失败(如慢盘双超时)
+            // 不阻塞调度流程——reclaimTerminal 与 onDelivered 照常执行,否则复现 Issue B
+            // 死锁(onDelivered 被吞 + 槽位泄漏)。代价:终态落盘确认丢失,崩溃恢复可能按旧
+            // revision 重投,属可接受耐久劣化。
+            persistFailures.incrementAndGet();
+            logger.error("awaitStateChangeCommit failed: {}", e.getMessage(), e);
         }
     }
 
@@ -1462,7 +1470,7 @@ public class PrecisionScheduler {
                         intentStore.update(intent);
                         // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
                         // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
-                        // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
+                        // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
                         persistStateChange(intent);
                         persisted = true;
                         unindexIntent(intent.getIntentId(), oldExecuteAtMs);
@@ -1601,7 +1609,7 @@ public class PrecisionScheduler {
     public interface StateChangeSink {
         /** 非阻塞：写 PHTW + 索引，不等待落盘。须在 synchronized(intent) 内调用以保持 I2/I3 原子性。 */
         void persist(Intent intent);
-        /** 非阻塞：终态原地覆写最新槽（不追加）；须在 synchronized(intent) 内调用。 */
+        /** 非阻塞：终态原地覆写最新槽(不追加;无索引/tail 时回退追加)；须在 synchronized(intent) 内调用。 */
         void persistTerminalInPlace(Intent intent);
         /** 阻塞到持久化完成；仅在 synchronized(intent) 之外调用（VT 可正常 unmount）。 */
         void awaitCommit();
