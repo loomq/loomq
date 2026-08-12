@@ -1502,6 +1502,15 @@ public class PrecisionScheduler {
         String terminalId = null;
         try {
             synchronized (intent) {
+                // 终态守卫：在途投递期间 intent 可能已被并发终态化——deadline 在飞行中
+                // 越过（checkExpiredIntents → handleExpired 标 EXPIRED）或 cancel 竞态
+                // （标 CANCELED）。终态胜者在途投递结果：直接跳过结算（观察器已由
+                // onExpired/取消路径通知），否则 transitionTo(DUE) 从终态抛 ISE →
+                // onDelivered 丢失 + ACK 未落盘 → 重启按旧 SCHEDULED 槽重复投递。
+                if (intent.getStatus().isTerminal()) {
+                    enqueueTimeNanos.remove(intent.getIntentId());
+                    return;
+                }
                 // 内存中状态转换（不持久化 — 终态才做一次 upsert）
                 intent.transitionTo(IntentStatus.DUE);
                 intent.transitionTo(IntentStatus.DISPATCHING);
@@ -1619,6 +1628,12 @@ public class PrecisionScheduler {
         boolean persisted = false;
         String terminalId = null;
         synchronized (intent) {
+            // 终态守卫（同 finalizeIntent）：在途投递失败结算时 intent 可能已被
+            // handleExpired/cancel 终态化——跳过重试/死信决策，终态保持。
+            if (intent.getStatus().isTerminal()) {
+                enqueueTimeNanos.remove(intent.getIntentId());
+                return;
+            }
             int maxAttempts = intent.getRedelivery() != null
                 ? intent.getRedelivery().getMaxAttempts()
                 : 5;

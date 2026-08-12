@@ -52,6 +52,10 @@ public final class CohortManager {
     private final AtomicLong totalRegistered = new AtomicLong(0);
     private final AtomicLong totalFlushed = new AtomicLong(0);
     private final AtomicLong wakeEventCount = new AtomicLong(0);
+    /** wakeLoop 异常计数（诊断：park 时长溢出等会让 wakeLoop 每 100ms 报错空转）。 */
+    private final AtomicLong wakeLoopErrors = new AtomicLong(0);
+
+    long getWakeLoopErrors() { return wakeLoopErrors.get(); }
 
     CohortManager(BucketGroupManager bucketGroupManager, PrecisionTierCatalog catalog,
                   Consumer<Collection<Intent>> scanTrigger, MetricsCollector metrics) {
@@ -191,6 +195,11 @@ public final class CohortManager {
         return (wakeAtMs / precisionWindowMs) * precisionWindowMs;
     }
 
+    /** park 上限：Duration.toNanos 在 >292 年的跨度上 multiplyExact 溢出抛异常，
+     *  wakeLoop 每 100ms 报错空转（日志风暴）+ 更晚 cohort 饿死。24h 分片 park，无功能影响。
+     *  与 PromotionDaemon.MAX_PARK_MS / adaptiveScanLoop 的钳制同旨。 */
+    private static final long MAX_PARK_MS = 24L * 60 * 60_000L; // 24h
+
     private void wakeLoop() {
         while (running.get()) {
             try {
@@ -204,8 +213,9 @@ public final class CohortManager {
                 long nowMs = System.currentTimeMillis();
 
                 if (bucketKey > nowMs) {
-                    // Sleep until the earliest cohort's time
-                    long sleepMs = bucketKey - nowMs;
+                    // Sleep until the earliest cohort's time (24h 分片钳制，防 >292 年跨度
+                    // Duration.toNanos 溢出抛异常 → 报错空转 + 后续 cohort 饿死)
+                    long sleepMs = Math.min(bucketKey - nowMs, MAX_PARK_MS);
                     LockSupport.parkNanos(Duration.ofMillis(sleepMs).toNanos());
                     continue;
                 }
@@ -242,6 +252,7 @@ public final class CohortManager {
                     }
                 }
             } catch (Exception e) {
+                wakeLoopErrors.incrementAndGet();
                 logger.error("CohortManager wake loop error", e);
                 LockSupport.parkNanos(Duration.ofMillis(100).toNanos());
             }

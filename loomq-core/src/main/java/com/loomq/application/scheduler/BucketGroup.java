@@ -153,13 +153,26 @@ public class BucketGroup {
                 removeFromBucket(prev.bucketKey(), intentId);
             }
             ConcurrentHashMap<String, BucketEntry> newBucket = new ConcurrentHashMap<>();
-            ConcurrentHashMap<String, BucketEntry> bucket =
-                buckets.computeIfAbsent(bucketKey, k -> newBucket);
-            if (bucket.put(intentId, new BucketEntry(intent, rev)) == null) {
-                pendingCount.incrementAndGet();
-            }
-            if (bucket == newBucket) {
-                newBucketCreated.set(true);
+            BucketEntry entry = new BucketEntry(intent, rev);
+            // 原子入桶：取桶 + put 合并为一次 buckets.compute——scanDue 的 buckets.remove
+            // 无法在"取桶"与"put"之间摘除目标桶，杜绝条目落入游离桶后 intentIndex 悬垂、
+            // intent 永不投递的丢失窗口（旧实现 computeIfAbsent + put 两步存在该竞态）。
+            // 条目要么在 map 内（下次扫描认领），要么在 scanDue 已摘除并正在迭代的桶内
+            // （本 cycle 认领），不存在"游离"状态。
+            buckets.compute(bucketKey, (k, existing) -> {
+                ConcurrentHashMap<String, BucketEntry> b = existing != null ? existing : newBucket;
+                if (b.put(intentId, entry) == null) {
+                    pendingCount.incrementAndGet();
+                }
+                if (b == newBucket) {
+                    newBucketCreated.set(true);
+                }
+                return b;
+            });
+            // Test hook: fires after the entry is attached. Used to simulate scanDue's
+            // bucket detach racing the put (BugBucketDetachRaceTest).
+            if (testAddPostComputeHook != null) {
+                testAddPostComputeHook.run();
             }
             return new ClaimEntry(bucketKey, rev);
         });
@@ -416,10 +429,20 @@ public class BucketGroup {
     /** Test-only: if set, fires after CAS claim succeeds but before dueIntents/re-add. */
     volatile Runnable testScanPostClaimHook;
 
+    /** Test-only: if set, fires after bucket acquisition but before the entry put (add 的取桶/入桶两步之间)。 */
+    volatile Runnable testAddPostComputeHook;
+
     /** Test-only: detach bucket without iterating (simulates scanDue's buckets.remove step). */
     boolean testDetachBucket(Instant executeAt) {
         long bucketKey = floorToBucket(executeAt.toEpochMilli());
         return buckets.remove(bucketKey) != null;
+    }
+
+    /** Test-only: 目标桶是否已含该 intent（验证 add 的取桶/入桶原子性不变量）。 */
+    boolean testBucketContains(Instant executeAt, String intentId) {
+        long bucketKey = floorToBucket(executeAt.toEpochMilli());
+        ConcurrentHashMap<String, BucketEntry> bucket = buckets.get(bucketKey);
+        return bucket != null && bucket.containsKey(intentId);
     }
 
     /** Test-only: attempt CAS claim on intentIndex. Returns true if claim succeeded. */
