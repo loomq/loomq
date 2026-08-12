@@ -15,8 +15,9 @@ class LoomqEngineConfigHookTest {
     @TempDir Path tmp;
 
     /**
-     * A4:Builder.wheelConfig(cfg) 必须被尊重 —— 用极小 slotsPerBucket=2,3 个同执行时刻的
-     * Intent 落同一桶,第 3 个触发桶溢出(若用默认 1024 则不会溢出)。证明 wheelConfig 生效。
+     * A4:Builder.wheelConfig(cfg) 必须被尊重 —— 用极小 slotsPerBucket=2,9 个同执行时刻的
+     * Intent：SEC(2)+MIN(2)+HOUR(2)+DAY(2)=8 落整条链,第 9 个触发链终点溢出
+     * (若用默认 1024 则不会溢出)。证明 wheelConfig 生效,同时覆盖 spill 链。
      */
     @Test
     void builderWheelConfigHookIsHonored() throws Exception {
@@ -25,19 +26,19 @@ class LoomqEngineConfigHookTest {
         engine.start();
         try {
             Instant exec = Instant.now().plusSeconds(10);
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 8; i++) {
                 Intent it = new Intent("intent_cfg0000000" + i);
                 it.setExecuteAt(exec);
                 it.setPrecisionTier(PrecisionTier.STANDARD);
                 engine.createIntent(it, AckMode.ASYNC).join();
             }
-            Intent third = new Intent("intent_cfg00000002");
-            third.setExecuteAt(exec);
-            third.setPrecisionTier(PrecisionTier.STANDARD);
-            // 第 3 个同桶 Intent:slotsPerBucket=2 → 桶溢出 → createIntent 抛错
+            Intent ninth = new Intent("intent_cfg00000008");
+            ninth.setExecuteAt(exec);
+            ninth.setPrecisionTier(PrecisionTier.STANDARD);
+            // 第 9 个同秒 Intent:整条溢出链(2+2+2+2)耗尽 → createIntent 抛错
             assertThrows(RuntimeException.class,
-                () -> engine.createIntent(third, AckMode.ASYNC).join(),
-                "slotsPerBucket=2 must cause bucket overflow on 3rd same-bucket intent (proves wheelConfig honored)");
+                () -> engine.createIntent(ninth, AckMode.ASYNC).join(),
+                "slotsPerBucket=2 must exhaust spill chain on 9th same-instant intent (proves wheelConfig honored)");
         } finally {
             engine.close();
         }

@@ -31,7 +31,7 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>载入热 Intent(≤ now+hotBoundaryMs)到内存 + 调度器,注册冷 Intent(> hotBoundaryMs)
  * 到 PromotionDaemon,重建 IntentLocationIndex。模拟重启:新实例从磁盘恢复。</p>
  *
- * <p><b>全局去重修正</b>:WheelStore 是 append-only(不清理槽位)。把 within-horizon 槽
+ * <p><b>全局去重修正</b>:WheelStore 非终态 append、终态单槽回收(陈旧兄弟槽仍残留)。把 within-horizon 槽
  * reschedule 到 beyond-horizon 后,旧 day-wheel 槽(低 revision)与新 tail 条目(高 revision)
  * 共存。recover 必须按 intentId 在 day-wheel + tail 全局取最大 revision 的条目,仅处理胜者,
  * 否则旧槽会在重启时引发 ghost 投递/提升。以下测试覆盖:terminal 跳过、过期跳过、
@@ -159,7 +159,7 @@ class WheelRecoveryTest {
             v1.transitionTo(IntentStatus.SCHEDULED);
             v1.incrementRevision();
             store.put(v1);
-            // rev 2: CANCELED, same intentId + executeAt (→ same bucket, new slot; append-only)
+            // rev 2: CANCELED, same intentId + executeAt (→ same bucket, new slot; 非终态 append)
             Intent v2 = v1.copy();
             v2.transitionTo(IntentStatus.CANCELED);
             v2.incrementRevision();
@@ -243,5 +243,63 @@ class WheelRecoveryTest {
                 assertEquals(1, afterOverdue - beforeOverdue,
                     "recovery overdue metric must increment by 1");
             }
+    }
+
+    @Test
+    void shouldRebuildMultiSlotMarkersAndReclaimLeakedTerminalOnRecovery() {
+        AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        SlotLocation leakedLoc;
+        SlotLocation tombLoc;
+        String multiId = "intent_multislot0001";
+        String singleId = "intent_single0000001";
+        try (WheelStore store = new WheelStore(cfg, clock::get);
+             TailIndex tail = new TailIndex(tmp, clock::get)) {
+            // (a) 泄漏的单槽终态墓碑:槽内已是终态但未回收(模拟 overwrite 后 reclaim 前崩溃)
+            Intent leaked = new Intent("intent_leaked0001");
+            leaked.setExecuteAt(Instant.ofEpochMilli(clock.get() + 5_000));
+            leaked.transitionTo(IntentStatus.SCHEDULED);
+            leaked.transitionTo(IntentStatus.CANCELED);
+            leakedLoc = store.put(leaked);
+            // (b) 多槽终态墓碑:rev1 SCHEDULED 陈旧兄弟 + rev2 终态
+            Intent t1 = new Intent("intent_tomb0000001");
+            t1.setExecuteAt(Instant.ofEpochMilli(clock.get() + 5_000));
+            t1.transitionTo(IntentStatus.SCHEDULED);
+            t1.incrementRevision();
+            store.put(t1);
+            Intent t2 = t1.copy();
+            t2.incrementRevision();
+            t2.transitionTo(IntentStatus.CANCELED);
+            tombLoc = store.put(t2);
+            // (c) 多槽活态 intent:陈旧兄弟(rev1)+ 当前(rev2),均 SCHEDULED 且未来
+            Intent m1 = new Intent(multiId);
+            m1.setExecuteAt(Instant.ofEpochMilli(clock.get() + 5_000));
+            m1.transitionTo(IntentStatus.SCHEDULED);
+            m1.incrementRevision();
+            store.put(m1);
+            Intent m2 = m1.copy();
+            m2.incrementRevision();
+            store.put(m2);
+            // (d) 单槽活态 intent
+            Intent single = new Intent(singleId);
+            single.setExecuteAt(Instant.ofEpochMilli(clock.get() + 5_000));
+            single.transitionTo(IntentStatus.SCHEDULED);
+            store.put(single);
+        }
+
+        try (WheelStore store2 = new WheelStore(cfg, clock::get);
+             TailIndex tail2 = new TailIndex(tmp, clock::get);
+             ConcurrentIntentStore mem = new ConcurrentIntentStore();
+             IntentLocationIndex idx = new IntentLocationIndex();
+             PromotionDaemon daemon = new PromotionDaemon(store2, tail2, idx, clock::get, (i, loc) -> {}, 60_000L)) {
+            PrecisionScheduler scheduler = new PrecisionScheduler(
+                mem, i -> CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.SUCCESS), null);
+            WheelRecovery rec = new WheelRecovery(store2, tail2, 60L * 60_000L, new MetricsCollector());
+            WheelRecoveryReport rpt = rec.recover(mem, scheduler, idx, daemon);
+            assertNull(store2.readSlot(leakedLoc), "泄漏的单槽终态墓碑应被恢复期回收");
+            assertNotNull(store2.readSlot(tombLoc), "count>1 的多槽终态墓碑应保留(参与 max-revision 去重)");
+            assertTrue(rpt.multiSlotIntentIds().contains(multiId), "恢复为活态的多槽 intent 应被标记 multiSlot");
+            assertFalse(rpt.multiSlotIntentIds().contains(singleId), "单槽 intent 不应被标记 multiSlot");
+        }
     }
 }

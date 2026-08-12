@@ -9,6 +9,7 @@ import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.infrastructure.wheel.BucketReclaimer;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
@@ -145,7 +146,7 @@ public class LoomqEngine implements AutoCloseable {
                 intentStore,
                 deliveryHandler,
                 builder.redeliveryDecider,
-                null,
+                builder.precisionTierCatalog,
                 metricsCollector,
                 builder.intentTraceStore != null ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore()
             );
@@ -180,7 +181,9 @@ public class LoomqEngine implements AutoCloseable {
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
             scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
                 @Override public void persist(Intent intent) { commandService.persistStateChangePutOnly(intent); }
+                @Override public void persistTerminalInPlace(Intent intent) { commandService.persistTerminalInPlace(intent); }
                 @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
+                @Override public void reclaimTerminal(String intentId) { commandService.reclaimTerminal(intentId); }
             });
 
             // Spec B: 终态 Intent 从 locationIndex 移除(桶回收依赖索引判断活跃桶)。
@@ -240,6 +243,13 @@ public class LoomqEngine implements AutoCloseable {
             if (recoveryReport.hotRestored() > 0 || recoveryReport.coldRegistered() > 0) {
                 logger.info("WheelRecovery: hotRestored={}, coldRegistered={}",
                     recoveryReport.hotRestored(), recoveryReport.coldRegistered());
+            }
+
+            // F1:恢复期重建 multiSlot 标记,必须在 scheduler.start() 之前注入——
+            // 否则重排程过的 Intent 在重启后会被误判单槽,终态回收掉当前槽后,
+            // 陈旧兄弟槽会在下次重启按 max-revision 复活重投(幽灵投递)。
+            if (!recoveryReport.multiSlotIntentIds().isEmpty()) {
+                commandService.markMultiSlot(recoveryReport.multiSlotIntentIds());
             }
 
             // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
@@ -571,6 +581,7 @@ public class LoomqEngine implements AutoCloseable {
         private IntentStore intentStore;
         private MetricsCollector metricsCollector;
         private com.loomq.tracing.IntentTraceStore intentTraceStore;
+        private PrecisionTierCatalog precisionTierCatalog;
 
         /**
          * @deprecated 改用 {@link #dataDir(Path)};PHTW 已无 WAL,字段名陈旧。委托 dataDir。
@@ -637,6 +648,12 @@ public class LoomqEngine implements AutoCloseable {
         /** Inject a custom IntentTraceStore (default: new instance per engine). */
         public Builder intentTraceStore(com.loomq.tracing.IntentTraceStore store) {
             this.intentTraceStore = store;
+            return this;
+        }
+
+        /** Inject a custom precision tier catalog (default: {@link PrecisionTierCatalog#defaultCatalog()}). */
+        public Builder catalog(PrecisionTierCatalog catalog) {
+            this.precisionTierCatalog = catalog;
             return this;
         }
 

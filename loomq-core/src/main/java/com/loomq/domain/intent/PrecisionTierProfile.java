@@ -87,6 +87,23 @@ public record PrecisionTierProfile(
              dispatchQueueCapacity, WalMode.DURABLE, precisionWindowMs);
     }
 
+    public PrecisionTierProfile withConsumerCount(int v) {
+        return new PrecisionTierProfile(precisionWindowMs, maxConcurrency, batchSize, batchWindowMs,
+            v, dispatchQueueCapacity, walMode, scanIntervalMs, directBucket, adaptiveScan, maxBuckets);
+    }
+    public PrecisionTierProfile withMaxConcurrency(int v) {
+        return new PrecisionTierProfile(precisionWindowMs, v, batchSize, batchWindowMs,
+            consumerCount, dispatchQueueCapacity, walMode, scanIntervalMs, directBucket, adaptiveScan, maxBuckets);
+    }
+    public PrecisionTierProfile withBatchSize(int v) {
+        return new PrecisionTierProfile(precisionWindowMs, maxConcurrency, v, batchWindowMs,
+            consumerCount, dispatchQueueCapacity, walMode, scanIntervalMs, directBucket, adaptiveScan, maxBuckets);
+    }
+    public PrecisionTierProfile withDispatchQueueCapacity(int v) {
+        return new PrecisionTierProfile(precisionWindowMs, maxConcurrency, batchSize, batchWindowMs,
+            consumerCount, v, walMode, scanIntervalMs, directBucket, adaptiveScan, maxBuckets);
+    }
+
     public boolean isBatchEnabled() {
         return batchSize > 1;
     }

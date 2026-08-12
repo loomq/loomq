@@ -51,8 +51,8 @@ import org.slf4j.LoggerFactory;
  * <h2>核心不变量</h2>
  * <ul>
  *   <li><b>I1 单持有方</b>: 任一 intentId 同一时刻最多存在于一个调度结构（bucket / cohort / 派发队列 / promotion cohort）</li>
- *   <li><b>I2 持久化先于承诺</b>: 状态对调用方可见前必须已对磁盘可见（DURABLE 落盘）</li>
- *   <li><b>I3 revision 单调 + 终态不可逆</b>: append-only + max-revision 去重的基础</li>
+ *   <li><b>I2 持久化先于承诺</b>: 状态对调用方可见前必须已对磁盘可见（DURABLE 落盘;I6 容错下终态持久化失败降级为 best-effort,onDelivered 仍触发）</li>
+ *   <li><b>I3 revision 单调 + 终态不可逆</b>: 非终态 append + 终态原地覆写,recovery 按 max-revision 去重的基础</li>
  *   <li><b>I4 索引即所有权账本</b>: 认领必须经 {@code intentIndex} 原子摘除（CAS）</li>
  * </ul>
  *
@@ -94,7 +94,7 @@ public class PrecisionScheduler {
     /**
      * 状态变更持久化钩子（由 LoomqEngine 注入，接到 IntentCommandService 的 DURABLE 落盘）。
      * 重试重排程是新的调度承诺而非中间态：必须落盘，否则崩溃恢复看到的是
-     * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。
+     * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
      */
     private volatile StateChangeSink stateChangeSink;
 
@@ -1136,6 +1136,20 @@ public class PrecisionScheduler {
 
     public BorrowStats getBorrowStats() { return borrowStats; }
 
+    /** 诊断：submitFinalize 结算任务抛异常次数（finalize 异常被吞，onDelivered 可能不触发）。 */
+    private final AtomicLong finalizeTaskExceptions = new AtomicLong();
+    public long getFinalizeTaskExceptions() { return finalizeTaskExceptions.get(); }
+
+    /** 诊断：persistStateChange 持久化失败次数（I6 容错吞掉，onDelivered 仍触发）。 */
+    private final AtomicLong persistFailures = new AtomicLong();
+    public long getPersistFailures() { return persistFailures.get(); }
+
+    /** 诊断：最近的 finalize 异常样本（类名:消息），有界，供取证。 */
+    private final java.util.concurrent.ConcurrentLinkedQueue<String> finalizeExceptionSamples = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    public java.util.List<String> getFinalizeExceptionSamples() {
+        return new ArrayList<>(finalizeExceptionSamples);
+    }
+
     /** 设置 Intent 生命周期观察器列表（由 LoomqEngine 调用） */
     public void setObservers(List<IntentObserver> observers) {
         this.observers.clear();
@@ -1179,6 +1193,11 @@ public class PrecisionScheduler {
                 try {
                     task.run();
                 } catch (Exception e) {
+                    finalizeTaskExceptions.incrementAndGet();
+                    if (finalizeExceptionSamples.size() < 20) {
+                        finalizeExceptionSamples.add(e.getClass().getSimpleName() + ": "
+                            + (e.getMessage() != null ? e.getMessage() : "(null)"));
+                    }
                     logger.error("Error in delivery callback for intent {}", intent.getIntentId(), e);
                 } finally {
                     tierInFlight.get(tier).decrementAndGet();
@@ -1202,20 +1221,65 @@ public class PrecisionScheduler {
      * 杜绝未来调用方遗忘递增导致 recovery 去重失效。
      * 须在 synchronized(intent) 内调用以维持 I2/I3 原子性;阻塞的持久化等待
      * 由 {@link #awaitStateChangeCommit()} 在锁外完成,避免 VT 在锁内 pin carrier。
+     *
+     * <p><b>I6(容错):持久化失败不阻塞调度流程。</b> 终态/状态 put 失败(如 SEC 桶
+     * SlotOverflowException)时,吞掉异常并记录 —— 否则异常在 synchronized 块内传播,
+     * 会跳过后续的观察器通知(如 SUCCESS 的 onDelivered),导致已投递 intent 的
+     * 通知被吞、基准在途槽位永久泄漏、引擎死锁停摆(Issue B 根因,见
+     * docs/development/issue-b-rootcause-2026-08-07.md)。崩溃一致性冲击:终态未落盘,
+     * 重启 recovery 可能按旧 revision 重投 —— 属可接受的耐久劣化,优于不可恢复死锁。
      */
     private void persistStateChange(Intent intent) {
         intent.incrementRevision();
         StateChangeSink s = stateChangeSink;
         if (s != null) {
-            s.persist(intent);   // 仅非阻塞 put；阻塞等待由 awaitStateChangeCommit 在锁外完成
+            try {
+                s.persist(intent);   // 仅非阻塞 put；阻塞等待由 awaitStateChangeCommit 在锁外完成
+            } catch (Exception e) {
+                persistFailures.incrementAndGet();
+                logger.error("persistStateChange failed for intent {} (revision {}): {}",
+                    intent.getIntentId(), intent.getRevision(), e.getMessage(), e);
+            }
+        }
+    }
+
+    /** 终态原地覆写（I6 容错镜像 persistStateChange）：revision 递增 + 非阻塞原地覆写。 */
+    private void persistTerminal(Intent intent) {
+        intent.incrementRevision();
+        StateChangeSink s = stateChangeSink;
+        if (s != null) {
+            try {
+                s.persistTerminalInPlace(intent);
+            } catch (Exception e) {
+                persistFailures.incrementAndGet();
+                logger.error("persistTerminalInPlace failed for intent {} (revision {}): {}",
+                    intent.getIntentId(), intent.getRevision(), e.getMessage(), e);
+            }
+        }
+    }
+
+    /** 终态槽回收；须在 awaitStateChangeCommit 之后调用。 */
+    private void reclaimTerminal(String intentId) {
+        StateChangeSink s = stateChangeSink;
+        if (s != null) {
+            try { s.reclaimTerminal(intentId); }
+            catch (Exception e) { logger.warn("reclaimTerminal failed for {}: {}", intentId, e); }
         }
     }
 
     /** 阻塞到最近一次 persistStateChange 的 put 落盘；须在 synchronized(intent) 之外调用。 */
     private void awaitStateChangeCommit() {
         StateChangeSink s = stateChangeSink;
-        if (s != null) {
+        if (s == null) return;
+        try {
             s.awaitCommit();
+        } catch (Exception e) {
+            // I6 容错(镜像 persistStateChange/persistTerminal):await 失败(如慢盘双超时)
+            // 不阻塞调度流程——reclaimTerminal 与 onDelivered 照常执行,否则复现 Issue B
+            // 死锁(onDelivered 被吞 + 槽位泄漏)。代价:终态落盘确认丢失,崩溃恢复可能按旧
+            // revision 重投,属可接受耐久劣化。
+            persistFailures.incrementAndGet();
+            logger.error("awaitStateChangeCommit failed: {}", e.getMessage(), e);
         }
     }
 
@@ -1309,6 +1373,7 @@ public class PrecisionScheduler {
         // I5: collect-then-defer -- 锁内取快照，锁外派发
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         boolean persisted = false;
+        String terminalId = null;
         synchronized (intent) {
             unindexIntent(intent.getIntentId(), executeAtMs(intent));
             logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
@@ -1322,7 +1387,8 @@ public class PrecisionScheduler {
                     break;
             }
             intentStore.update(intent);
-            persistStateChange(intent);           // P1-1
+            persistTerminal(intent);              // 终态原地覆写（不追加）
+            terminalId = intent.getIntentId();
             persisted = true;
 
             if (!observers.isEmpty()) {
@@ -1333,6 +1399,10 @@ public class PrecisionScheduler {
         // 持久化等待移到锁外：VT 在此正常 unmount，避免在 synchronized 内 park 而 pin carrier。
         if (persisted) {
             awaitStateChangeCommit();
+        }
+        // 终态槽回收：须在 awaitStateChangeCommit 之后，确保原地覆写已落盘再释放槽位。
+        if (terminalId != null) {
+            reclaimTerminal(terminalId);
         }
         // I5: onExpired 在锁外派发
         if (deferredNotify != null) {
@@ -1353,6 +1423,7 @@ public class PrecisionScheduler {
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         boolean needReschedule = false;
         boolean persisted = false;
+        String terminalId = null;
         try {
             synchronized (intent) {
                 // 内存中状态转换（不持久化 — 终态才做一次 upsert）
@@ -1373,7 +1444,8 @@ public class PrecisionScheduler {
                         intent.transitionTo(IntentStatus.DELIVERED);
                         intent.transitionTo(IntentStatus.ACKED);
                         intentStore.update(intent);
-                        persistStateChange(intent);           // P1-1: incrementRevision + non-blocking put; DURABLE await deferred to awaitStateChangeCommit() (outside lock)
+                        persistTerminal(intent);              // 终态原地覆写（不追加）
+                        terminalId = intent.getIntentId();
                         persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         // Trace: record acked
@@ -1398,7 +1470,7 @@ public class PrecisionScheduler {
                         intentStore.update(intent);
                         // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
                         // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
-                        // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
+                        // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
                         persistStateChange(intent);
                         persisted = true;
                         unindexIntent(intent.getIntentId(), oldExecuteAtMs);
@@ -1410,7 +1482,8 @@ public class PrecisionScheduler {
                     case DEAD_LETTER:
                         intent.transitionTo(IntentStatus.DEAD_LETTERED);
                         intentStore.update(intent);
-                        persistStateChange(intent);           // P1-1
+                        persistTerminal(intent);              // 终态原地覆写（不追加）
+                        terminalId = intent.getIntentId();
                         persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.warn("Intent {} dead-lettered", intent.getIntentId());
@@ -1423,7 +1496,8 @@ public class PrecisionScheduler {
                     case EXPIRED:
                         intent.transitionTo(IntentStatus.EXPIRED);
                         intentStore.update(intent);
-                        persistStateChange(intent);           // P1-1
+                        persistTerminal(intent);              // 终态原地覆写（不追加）
+                        terminalId = intent.getIntentId();
                         persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.info("Intent {} expired", intent.getIntentId());
@@ -1437,6 +1511,10 @@ public class PrecisionScheduler {
             // 持久化等待移到锁外：VT 在此正常 unmount，避免在 synchronized 内 park 而 pin carrier。
             if (persisted) {
                 awaitStateChangeCommit();
+            }
+            // 终态槽回收：须在 awaitStateChangeCommit 之后，确保原地覆写已落盘再释放槽位。
+            if (terminalId != null) {
+                reclaimTerminal(terminalId);
             }
             // I5: 观察器通知在锁外派发
             if (deferredNotify != null) {
@@ -1463,6 +1541,7 @@ public class PrecisionScheduler {
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         boolean needReschedule = false;
         boolean persisted = false;
+        String terminalId = null;
         synchronized (intent) {
             int maxAttempts = intent.getRedelivery() != null
                 ? intent.getRedelivery().getMaxAttempts()
@@ -1475,7 +1554,8 @@ public class PrecisionScheduler {
             if (intent.getAttempts() >= maxAttempts) {
                 intent.transitionTo(IntentStatus.DEAD_LETTERED);
                 intentStore.update(intent);
-                persistStateChange(intent);           // P1-1
+                persistTerminal(intent);              // 终态原地覆写（不追加）
+                terminalId = intent.getIntentId();
                 persisted = true;
                 unindexIntent(intent.getIntentId(), executeAtMs(intent));
                 logger.warn("Intent dead-lettered after max attempts: id={}", intent.getIntentId());
@@ -1505,6 +1585,10 @@ public class PrecisionScheduler {
         if (persisted) {
             awaitStateChangeCommit();
         }
+        // 终态槽回收：须在 awaitStateChangeCommit 之后，确保原地覆写已落盘再释放槽位。
+        if (terminalId != null) {
+            reclaimTerminal(terminalId);
+        }
         // I5: 观察器通知在锁外派发
         if (deferredNotify != null) {
             notifyObservers(deferredNotify);
@@ -1525,8 +1609,12 @@ public class PrecisionScheduler {
     public interface StateChangeSink {
         /** 非阻塞：写 PHTW + 索引，不等待落盘。须在 synchronized(intent) 内调用以保持 I2/I3 原子性。 */
         void persist(Intent intent);
+        /** 非阻塞：终态原地覆写最新槽(不追加;无索引/tail 时回退追加)；须在 synchronized(intent) 内调用。 */
+        void persistTerminalInPlace(Intent intent);
         /** 阻塞到持久化完成；仅在 synchronized(intent) 之外调用（VT 可正常 unmount）。 */
         void awaitCommit();
+        /** 终态槽回收（单槽清空入 free-list；多槽保留 tombstone）；仅在 awaitCommit 之后调用。 */
+        void reclaimTerminal(String intentId);
     }
 
     public static class BorrowStats {
@@ -1605,6 +1693,10 @@ public class PrecisionScheduler {
      */
     public BucketGroupManager getBucketGroupManager() {
         return bucketGroupManager;
+    }
+
+    public PrecisionTierCatalog getPrecisionTierCatalog() {
+        return precisionTierCatalog;
     }
 
     public CohortManager getCohortManager() {

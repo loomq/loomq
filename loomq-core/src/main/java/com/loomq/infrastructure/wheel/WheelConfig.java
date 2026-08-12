@@ -75,6 +75,12 @@ public record WheelConfig(
             bucketRetentionMs, compactionThresholdBytes);
     }
 
+    public WheelConfig withSlotsPerBucket(int v) {
+        return new WheelConfig(dataDir, shardId, horizonDays, v, groupCommitIntervalMs,
+            awaitCommitTimeoutMs, hotBoundaryMs, promotionLeadMs, defaultTier,
+            bucketRetentionMs, compactionThresholdBytes);
+    }
+
     private static String requireText(String value, String fieldName) {
         String checked = Objects.requireNonNull(value, fieldName + " cannot be null");
         if (checked.isBlank()) {
