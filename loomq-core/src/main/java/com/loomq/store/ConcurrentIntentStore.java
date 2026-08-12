@@ -222,7 +222,11 @@ public class ConcurrentIntentStore implements IntentStore {
             if (existing != null) {
                 decrementStatus(previousStatus);
                 if (previousIdempotencyKey != null && !Objects.equals(previousIdempotencyKey, intent.getIdempotencyKey())) {
-                    idempotencyRecords.remove(previousIdempotencyKey);
+                    // 只移除仍属于本 intent 的记录：记录 map 按 key 覆盖写入，同 key 可能已被
+                    // 另一 intent 占用（createIntent 不做幂等检查）。无条件 remove 会误删
+                    // usurper 的记录，使其幂等保证失效（同 round 1 delete/checkIdempotency 修复）。
+                    idempotencyRecords.computeIfPresent(previousIdempotencyKey, (k, rec) ->
+                        rec.getIntentId().equals(intent.getIntentId()) ? null : rec);
                 }
             }
 

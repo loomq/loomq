@@ -356,6 +356,7 @@ public final class IntentCommandService {
 
         boolean reschedule = false;
         boolean persisted = false;
+        boolean removedForReschedule = false;
         try {
             synchronized (intent) {
                 if (intent.getStatus().isTerminal()) {
@@ -378,6 +379,8 @@ public final class IntentCommandService {
                             // 旧内容，更新仅在重试/崩溃恢复路径确定生效（见方法 javadoc）。
                             logger.warn(CLAIMED_SKIP_WARN, intentId);
                             reschedule = false;
+                        } else {
+                            removedForReschedule = true;
                         }
                     } else {
                         logger.warn("Cannot reschedule intent {} in {} state; keeping original schedule", intentId, st);
@@ -399,6 +402,7 @@ public final class IntentCommandService {
                             boolean wasScheduled = scheduler.removeFromSchedule(intent, oldExecuteAt);
                             if (wasScheduled) {
                                 reschedule = true;
+                                removedForReschedule = true;
                             } else {
                                 logger.warn(CLAIMED_SKIP_WARN, intentId);
                             }
@@ -435,6 +439,18 @@ public final class IntentCommandService {
             return Optional.of(intent);
         } catch (RuntimeException e) {
             logger.error("Failed to update intent: id={}", intentId, e);
+            // 回滚：更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按当前
+            // executeAt 重新调度——否则 intent 在 store 中为 SCHEDULED 却不在任何
+            // bucket/cohort，静默永不投递直到重启恢复（投递延迟丢失）。
+            if (removedForReschedule && intent.getStatus() == IntentStatus.SCHEDULED) {
+                try {
+                    scheduler.schedule(intent);
+                } catch (Exception re) {
+                    logger.error(
+                        "Failed to re-schedule intent {} after update failure; it will not be delivered until restart",
+                        intentId, re);
+                }
+            }
             throw e;
         }
     }
