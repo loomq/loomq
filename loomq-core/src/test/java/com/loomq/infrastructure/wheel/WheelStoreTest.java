@@ -108,4 +108,48 @@ class WheelStoreTest {
             assertEquals(4, ids.size(), "no overwrites — all 4 distinct");
         }
     }
+
+    /**
+     * deleteBucket 的 TOCTOU 守卫:BucketReclaimer 在"收集引用快照"与"删除文件"之间,
+     * 同 key 桶可能被并发 put() 重建(computeIfAbsent 安装新桶、重新打开文件)。
+     * 若此时仍删文件,会命中新桶的落盘文件——新 Intent 的槽字节随文件消失(重启静默丢失)。
+     * 守卫:close 之后仅当 map 中该 key 无其他桶对象时才删除文件。
+     *
+     * <p>通过 {@link WheelStore#testBeforeFileDeleteHook} 在删文件前确定性注入并发重建。</p>
+     */
+    @Test
+    void deleteBucketMustNotDeleteRecreatedBucketFile() {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        // 过去 40 天的 executeAt(> retention = 31 天),SEC 桶
+        long pastMs = clock.get() - 40L * 24 * 60 * 60_000L;
+
+        try (WheelStore store = new WheelStore(cfg, clock::get)) {
+            Intent a = new Intent("intent_reclaim_a001");
+            a.setExecuteAt(Instant.ofEpochMilli(pastMs));
+            a.transitionTo(IntentStatus.SCHEDULED);
+            SlotLocation locA = store.put(a);
+            assertFalse(locA.inTail());
+
+            // 文件删除前 hook:并发重建同 key 桶(BucketReclaimer 引用快照是 stale 的)
+            store.testBeforeFileDeleteHook = () -> {
+                Intent b = new Intent("intent_reclaim_b001");
+                b.setExecuteAt(Instant.ofEpochMilli(pastMs));
+                b.transitionTo(IntentStatus.SCHEDULED);
+                store.put(b);
+            };
+            BucketReclaimer reclaimer = new BucketReclaimer(store, new IntentLocationIndex(),
+                31L * 24 * 60 * 60_000L);
+            reclaimer.reclaimOnce();
+            store.testBeforeFileDeleteHook = null;
+        }
+
+        // 重启语义:新开 WheelStore,并发重建的 B 必须仍在磁盘上
+        try (WheelStore store2 = new WheelStore(cfg, clock::get)) {
+            List<Intent> slots = new ArrayList<>();
+            store2.scanSlotsFrom(Instant.ofEpochMilli(0)).forEachRemaining(e -> slots.add(e.intent()));
+            assertEquals(1, slots.size(), "recreated bucket file must survive deleteBucket (TOCTOU guard)");
+            assertEquals("intent_reclaim_b001", slots.get(0).getIntentId());
+        }
+    }
 }

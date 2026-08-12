@@ -18,6 +18,7 @@ import com.loomq.store.IntentStore;
 import com.loomq.tracing.IntentTraceStore;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -300,6 +301,47 @@ class WheelRecoveryTest {
             assertNotNull(store2.readSlot(tombLoc), "count>1 的多槽终态墓碑应保留(参与 max-revision 去重)");
             assertTrue(rpt.multiSlotIntentIds().contains(multiId), "恢复为活态的多槽 intent 应被标记 multiSlot");
             assertFalse(rpt.multiSlotIntentIds().contains(singleId), "单槽 intent 不应被标记 multiSlot");
+        }
+    }
+
+    /**
+     * 停机窗口到期的 Intent 终态化必须<b>原地覆写</b>原槽,而非用 store.put 分配新槽。
+     * 原实现分配新槽后旧 SCHEDULED 槽残留(stale 兄弟),同 id 槽数恒为 2:
+     * 终态槽因 count>1 永不回收,只能等桶文件过期(31 天)被 BucketReclaimer 删除。
+     * 原地覆写后磁盘上仅剩 1 个终态槽,下次重启 terminal+count==1 即被 freeSlot 回收自愈。
+     */
+    @Test
+    void shouldTerminalizeOverdueIntentInPlaceWithoutLeakingStaleSlot() {
+        AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        try (WheelStore store = new WheelStore(cfg, clock::get);
+             TailIndex tail = new TailIndex(tmp, clock::get)) {
+            // 停机窗口期间到期的 Intent:execMs < now,磁盘上为 SCHEDULED 单槽(rev=1,对齐真实创建语义)
+            Intent overdue = new Intent("intent_overdue000001");
+            overdue.setExecuteAt(Instant.ofEpochMilli(clock.get() - 60_000));
+            overdue.transitionTo(IntentStatus.SCHEDULED);
+            overdue.incrementRevision();
+            store.put(overdue);
+        }
+
+        // 模拟重启:recover 应把过期 intent 终态化
+        try (WheelStore store2 = new WheelStore(cfg, clock::get);
+             TailIndex tail2 = new TailIndex(tmp, clock::get);
+             ConcurrentIntentStore mem = new ConcurrentIntentStore();
+             IntentLocationIndex idx = new IntentLocationIndex();
+             PromotionDaemon daemon = new PromotionDaemon(store2, tail2, idx, clock::get, (i, loc) -> {}, 60_000L)) {
+            PrecisionScheduler scheduler = new PrecisionScheduler(
+                mem, i -> CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.SUCCESS), null);
+            new WheelRecovery(store2, tail2, 60L * 60_000L, new MetricsCollector()).recover(mem, scheduler, idx, daemon);
+
+            // 终态化应原地覆写原槽:磁盘上仅剩 1 个槽(EXPIRED, rev=2),不得残留 SCHEDULED 兄弟槽
+            List<Intent> slots = new java.util.ArrayList<>();
+            store2.scanSlotsFrom(Instant.ofEpochMilli(0)).forEachRemaining(e -> slots.add(e.intent()));
+            assertEquals(1, slots.size(),
+                "overdue terminalization must overwrite the original slot in place (no stale sibling)");
+            assertEquals(IntentStatus.EXPIRED, slots.get(0).getStatus());
+            assertEquals(2, slots.get(0).getRevision());
+            assertNull(mem.findById("intent_overdue000001"), "overdue intent must not be loaded into memory");
         }
     }
 }

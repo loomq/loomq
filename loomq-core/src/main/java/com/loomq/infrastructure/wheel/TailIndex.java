@@ -168,7 +168,16 @@ public final class TailIndex implements AutoCloseable {
                     TailRecord r = byId.get(intentId);
                     if (r == null) continue; // 并发 remove 已摘除
                     if (r.executeAtMs() > horizon) continue; // 并发 re-PUT 到更远的 ms
-                    Intent it = SlotCodec.decode(r.encodedSlot());
+                    Intent it;
+                    try {
+                        // P1-6 同款防御:tail 记录无 isTorn 预检(wheel 槽有),一条 CRC 损坏即让
+                        // decode 抛异常中断整个 promoteInto(recover 第一步)→ 引擎起不来。
+                        // 损坏条目跳过并告警,与 WheelRecovery 尾部扫描的防御解码保持一致。
+                        it = SlotCodec.decode(r.encodedSlot());
+                    } catch (RuntimeException dex) {
+                        log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId, dex);
+                        continue;
+                    }
                     store.put(it); // mmap memcpy,持锁期间开销可忽略
                     appendRecord(TYPE_TOMBSTONE, intentId, r.executeAtMs(), null);
                     applyRemove(intentId);
