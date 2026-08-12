@@ -137,6 +137,14 @@ public final class LoomqEngineFactory {
         WheelConfig wheelConfig = WheelConfig.fromProperties(props).withDataDir(dataDir);
         builder.wheelConfig(wheelConfig);
 
+        // wheel.default_tier 显式配置 → 引擎级默认档(与 Builder.defaultTier 同语义)。
+        // 此前 WheelConfig.defaultTier 被 LoomqEngine 构造完全忽略(只读 builder.defaultTier,
+        // 工厂路径恒 null)——Properties 配置的默认档静默失效。
+        String defaultTier = props.getProperty("wheel.default_tier", props.getProperty("wheel.defaultTier"));
+        if (defaultTier != null && !defaultTier.isBlank()) {
+            builder.defaultTier(com.loomq.domain.intent.PrecisionTier.fromString(defaultTier));
+        }
+
         return builder;
     }
 }

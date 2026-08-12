@@ -178,7 +178,17 @@ public final class TailIndex implements AutoCloseable {
                         log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId, dex);
                         continue;
                     }
-                    store.put(it); // mmap memcpy,持锁期间开销可忽略
+                    try {
+                        // R6: DAY 桶满（溢出链终点）防护——engine.start 的恢复流程第一步
+                        // 即 promoteInto，异常穿透会让引擎每次重启都在同一条目上失败（被砖）。
+                        // 保留 tail 条目（不 tombstone、不移除），待 DAY 桶随投递回收后
+                        // 下次恢复再试；运行期 createIntent 同条件失败有补偿路径，恢复期
+                        // 选择"引擎可启动 + 延迟投递"优于"启动失败"。
+                        store.put(it); // mmap memcpy,持锁期间开销可忽略
+                    } catch (SlotOverflowException e) {
+                        log.error("promoteInto: day wheel full, keeping tail entry for intent {} (retry on next recovery)", intentId, e);
+                        continue;
+                    }
                     appendRecord(TYPE_TOMBSTONE, intentId, r.executeAtMs(), null);
                     applyRemove(intentId);
                     promoted++;

@@ -1451,6 +1451,15 @@ public class PrecisionScheduler {
         boolean persisted = false;
         String terminalId = null;
         synchronized (intent) {
+            // R6: 终态守卫——consumer 过期闸门（投递前最后一道闸）与扫描线程的
+            // checkExpiredIntents 可对同一 intent 并发进入 handleExpired：败者二次
+            // transitionTo 从终态抛 ISE。consumer 路径无 try/catch，ISE 直接杀死
+            // 消费者 VT（固定 Thread[]，无监督）→ 档位投递容量静默永久退化；扫描
+            // 路径有 try/catch 吞掉，故败者归属决定后果。锁内复查，竞态败者幂等跳过
+            // （终态已由先到者落盘+回收）。
+            if (intent.getStatus().isTerminal()) {
+                return;
+            }
             unindexIntent(intent.getIntentId(), executeAtMs(intent));
             logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
 
@@ -1512,7 +1521,15 @@ public class PrecisionScheduler {
                     return;
                 }
                 // 内存中状态转换（不持久化 — 终态才做一次 upsert）
-                intent.transitionTo(IntentStatus.DUE);
+                // R6: 结算前奏容错——updateIntent 的 updater 无状态白名单校验，可把
+                // SCHEDULED 置为 DUE（状态机允许 SCHEDULED→DUE；updater 只在 SCHEDULED
+                // 上运行，DUE 是唯一可达的非终态迁移）。DUE 起步时跳过 transitionTo(DUE)
+                // ——DUE→DUE 非法，会抛 ISE 被 runFinalizeTask 吞掉：ACK 未落盘、
+                // onDelivered 丢失、intent 卡死 DUE（索引已被认领消耗），重启按旧
+                // SCHEDULED 槽重复投递。直接推进 DISPATCHING 续链。
+                if (intent.getStatus() != IntentStatus.DUE) {
+                    intent.transitionTo(IntentStatus.DUE);
+                }
                 intent.transitionTo(IntentStatus.DISPATCHING);
                 intent.incrementAttempts();
 
@@ -1544,6 +1561,27 @@ public class PrecisionScheduler {
                         break;
 
                     case RETRY: {
+                        // 与 handleDeliveryFailure(异常路径)对齐:RETRY 结果同样受 maxAttempts
+                        // 约束——否则 handler 恒返回 RETRY 时无限重排程,绕过重试上限契约,
+                        // 与异常路径(attempts >= maxAttempts → DEAD_LETTERED)语义不一致。
+                        int maxAttempts = intent.getRedelivery() != null
+                            ? intent.getRedelivery().getMaxAttempts()
+                            : 5;
+                        if (intent.getAttempts() >= maxAttempts) {
+                            intent.transitionTo(IntentStatus.DEAD_LETTERED);
+                            intentStore.update(intent);
+                            persistTerminal(intent);              // 终态原地覆写(不追加)
+                            terminalId = intent.getIntentId();
+                            persisted = true;
+                            unindexIntent(intent.getIntentId(), executeAtMs(intent));
+                            logger.warn("Intent dead-lettered after max attempts (RETRY result): id={}",
+                                intent.getIntentId());
+                            if (!observers.isEmpty()) {
+                                final Intent snapshot = intent.copy();
+                                deferredNotify = o -> o.onDeadLettered(snapshot);
+                            }
+                            break;
+                        }
                         long oldExecuteAtMs = executeAtMs(intent);
                         long delayMs = intent.getRedelivery() != null
                             ? intent.getRedelivery().calculateDelay(intent.getAttempts())
@@ -1638,7 +1676,11 @@ public class PrecisionScheduler {
                 ? intent.getRedelivery().getMaxAttempts()
                 : 5;
 
-            intent.transitionTo(IntentStatus.DUE);
+            // R6: 结算前奏容错（同 finalizeIntent）：updater 置 DUE 的 intent 在投递
+            // 失败结算时同样从 DUE 起步，跳过 transitionTo(DUE) 直接推进 DISPATCHING。
+            if (intent.getStatus() != IntentStatus.DUE) {
+                intent.transitionTo(IntentStatus.DUE);
+            }
             intent.transitionTo(IntentStatus.DISPATCHING);
             intent.incrementAttempts();
 

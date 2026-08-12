@@ -147,6 +147,16 @@ public final class IntentCommandService {
     public long createIntent(Intent intent, AckMode ackMode) {
         ensureRunning();
         IntentValidator.validate(intent);
+        // R6: 同一 intentId 双活副本 → 双投递内容分叉 + store 条目来回覆写 + 磁盘残留
+        // 非终态 stale 槽（recovery 按 max revision 去重，败者槽永不回收，桶容量永久
+        // 泄漏，I1 破坏）。locationIndex 是"活 intent"登记表；磁盘终态（含补偿 CANCELED）
+        // 的 intent 允许同 id 重建（幂等重试）。检查在补偿路径之外——否则失败补偿会把
+        // 已存在的 intent 覆写成 CANCELED。并发同 id 创建仍有预检 TOCTOU 窗口，由调用方
+        // 序列化（与 checkIdempotency 同纪律）。
+        if (hasActiveDuplicate(intent.getIntentId())) {
+            throw new IllegalArgumentException(
+                "duplicate intentId: " + intent.getIntentId() + " already active");
+        }
 
         long seq = sequenceNumber.incrementAndGet();
 
@@ -248,6 +258,17 @@ public final class IntentCommandService {
 
         for (Intent intent : intents) {
             IntentValidator.validate(intent);
+        }
+
+        // R6: 批量创建预检——与已有活 intent 冲突或批内重复 intentId → 写盘前整体拒绝。
+        // 预检失败不触发补偿（补偿只对已写入条目生效），避免把已存在的 intent 覆写为
+        // CANCELED。
+        java.util.Set<String> seenIds = new java.util.HashSet<>(intents.size());
+        for (Intent intent : intents) {
+            if (!seenIds.add(intent.getIntentId()) || hasActiveDuplicate(intent.getIntentId())) {
+                throw new IllegalArgumentException(
+                    "duplicate intentId: " + intent.getIntentId() + " already active");
+            }
         }
 
         // 逐条解析持久化语义：整批的耐久性不能由首条 intent 决定——混合批次（如首条
@@ -821,5 +842,32 @@ public final class IntentCommandService {
         if (!running.get()) {
             throw new IllegalStateException("Engine is not running");
         }
+    }
+
+    /**
+     * 判定 intentId 是否已有"活跃"副本（非终态）。
+     *
+     * <p>磁盘为权威：locationIndex 指向的最新槽非终态即活跃。终态（含补偿 CANCELED，
+     * 其索引条目在补偿后仍保留）允许同 id 重建——这是"创建失败后幂等重试"的合法路径。
+     * tail 位置经 {@code scanFrom} 解码判定（终态化 tail 条目走回退追加，同样可判）。
+     * 槽空但索引在（不一致状态）按活跃保守拒绝。
+     */
+    private boolean hasActiveDuplicate(String intentId) {
+        SlotLocation loc = locationIndex.get(intentId);
+        if (loc == null) {
+            return false;
+        }
+        if (loc.inTail()) {
+            var it = tailIndex.scanFrom(loc.bucketKey());
+            while (it.hasNext()) {
+                Intent cur = SlotCodec.decode(it.next().encodedSlot());
+                if (intentId.equals(cur.getIntentId()) && !cur.getStatus().isTerminal()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        Intent cur = wheelStore.readSlot(loc);
+        return cur != null && !cur.getStatus().isTerminal();
     }
 }
