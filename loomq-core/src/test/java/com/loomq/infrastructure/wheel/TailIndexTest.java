@@ -120,6 +120,44 @@ class TailIndexTest {
         }
     }
 
+    /**
+     * 损坏的 tail 记录(槽区 CRC 被翻转)不应中断整个 promoteInto——
+     * promoteInto 是 recover 的第一步,一条损坏记录导致引擎启动失败,
+     * 与 WheelRecovery 尾部扫描的 P1-6 防御解码(P1-6)不一致。
+     * 期望:损坏条目被跳过并告警,有效条目照常提升。
+     */
+    @Test
+    void shouldSkipCorruptRecordOnPromoteInsteadOfAborting() throws Exception {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        try (TailIndex tail = new TailIndex(tmp, clock::get)) {
+            tail.put(make("intent_good00000001", clock.get() + 10L * 86_400_000L));
+            tail.put(make("intent_bad0000000002", clock.get() + 20L * 86_400_000L));
+            tail.flush();
+        }
+        // 翻转第二条记录的槽内 CRC 字段(槽偏移 9..12)字节 → decode 必抛 CRC mismatch
+        Path runFile = tmp.resolve("tail").resolve("tail.log");
+        byte[] bytes = java.nio.file.Files.readAllBytes(runFile);
+        String id1 = "intent_good00000001";
+        int rec1Len = 1 + 8 + 1 + id1.getBytes(java.nio.charset.StandardCharsets.UTF_8).length + SlotCodec.SLOT_SIZE;
+        int crcOff = rec1Len + 1 + 8 + 1 + "intent_bad0000000002".getBytes(java.nio.charset.StandardCharsets.UTF_8).length + 9;
+        bytes[crcOff] ^= 0x55;
+        java.nio.file.Files.write(runFile, bytes);
+
+        // 重开:loadRun 重放(不校验 CRC,损坏记录进入内存),promoteInto 应跳过损坏条目
+        try (WheelStore store = new WheelStore(cfg, clock::get);
+             TailIndex tail2 = new TailIndex(tmp, clock::get)) {
+            int promoted = tail2.promoteInto(store);
+            assertEquals(1, promoted, "corrupt record must be skipped; valid record still promoted");
+            // 有效记录已入 wheel;损坏记录留在 tail(未提升、未 tombstone)
+            assertEquals(1, count(tail2), "corrupt record must remain in tail (skipped, not promoted)");
+            List<Intent> wheelSlots = new ArrayList<>();
+            store.scanSlotsFrom(Instant.ofEpochMilli(0)).forEachRemaining(e -> wheelSlots.add(e.intent()));
+            assertEquals(1, wheelSlots.size(), "only the valid record is promoted into the wheel");
+            assertEquals("intent_good00000001", wheelSlots.get(0).getIntentId());
+        }
+    }
+
     private Intent make(String id, long execAtMs) {
         Intent it = new Intent(id);
         it.setExecuteAt(Instant.ofEpochMilli(execAtMs));

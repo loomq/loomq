@@ -40,6 +40,9 @@ public final class PromotionDaemon implements AutoCloseable {
     private final Thread thread;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
+    /** park 上限：Duration.toNanos 在 >292 年的跨度上 long 溢出（负值 → parkNanos 立即返回 → 忙转）。 */
+    private static final long MAX_PARK_MS = 24L * 60 * 60_000L; // 24h
+
     public PromotionDaemon(WheelStore store, TailIndex tail, IntentLocationIndex locationIndex,
                            LongSupplier clock, BiConsumer<Intent, SlotLocation> onHotPromotion, long promotionLeadMs) {
         this.store = store; this.tail = tail; this.locationIndex = locationIndex;
@@ -121,7 +124,10 @@ public final class PromotionDaemon implements AutoCloseable {
                 if (first == null) { LockSupport.park(); continue; }
                 long now = clock.getAsLong();
                 if (first.getKey() > now) {
-                    LockSupport.parkNanos(java.time.Duration.ofMillis(first.getKey() - now).toNanos());
+                    // 钳制 park 时长：executeAt 超远（>292 年）时 Duration.toNanos 溢出为负，
+                    // parkNanos 立即返回 → 空转烧核。24h 上限分片 park，无功能影响。
+                    long parkMs = Math.min(first.getKey() - now, MAX_PARK_MS);
+                    LockSupport.parkNanos(java.time.Duration.ofMillis(parkMs).toNanos());
                     continue;
                 }
                 tickOnce();

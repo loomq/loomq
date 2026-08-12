@@ -77,8 +77,8 @@ public class PrecisionScheduler {
     // Intent 生命周期观察器列表（线程安全）
     private final List<IntentObserver> observers = new CopyOnWriteArrayList<>();
 
-    // 共享虚拟线程池（所有档位共享）
-    private final ExecutorService sharedExecutor;
+    // 共享虚拟线程池（所有档位共享）。非 final：stop() 后 start() 需重建（否则提交被拒）。
+    private ExecutorService sharedExecutor;
 
     // 档位级并发控制（可动态调整上限）
     private final Map<PrecisionTier, ResizableSemaphore> tierSemaphores;
@@ -287,6 +287,12 @@ public class PrecisionScheduler {
      */
     public void start() {
         if (running) return;
+        if (sharedExecutor.isShutdown()) {
+            // stop() 后重启：旧 executor 已关，重建共享虚拟线程池——
+            // 否则 startBatchConsumers 的 submit 被 RejectedExecutionException 打断，
+            // running=true 却无消费者/无扫描，调度器半死不活。
+            sharedExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        }
         running = true;
 
         logger.info("PrecisionScheduler starting...");
@@ -410,6 +416,10 @@ public class PrecisionScheduler {
                     continue;
                 }
                 if (earliest <= nowMs) {
+                    // 本分支扫完即走：扫描期间出现的新桶由下方 reEarliest 复查兜底（循环顶
+                    // 亦会重查），无需 bucket-add unpark——先抑制 listener（parkTarget=MIN_VALUE），
+                    // 避免 scanAndDispatch 内背压重入桶触发 unpark，遗留 permit 打断后续节流 park。
+                    parkTarget.set(Long.MIN_VALUE);
                     scanAndDispatch(tier);   // 内部已含 shouldCheckExpired + checkExpiredIntents
                     // P3-4：scanDue 把未到期 intent 重入同一 floor 桶，若最早桶仍 <= now，
                     // park 到最早桶内最小精确 executeAt（避免忙转）。仅未到期路径触发，O(bucket) 有界。
@@ -423,6 +433,13 @@ public class PrecisionScheduler {
                             if (shouldCheckExpired(tier)) checkExpiredIntents(tier);
                             continue;
                         }
+                        // 最早桶内仍有到期 intent（dispatch 队列满时 scanAndDispatch 把 intent
+                        // 重入桶，立即重扫路径无任何 park → 单平台线程 100% CPU 忙转，饿死
+                        // 其他档/cohort）。有界 park（scanIntervalMs）后再重试，背压解除即恢复。
+                        // parkTarget 保持 MIN_VALUE：背压期间队列已满，新 intent 反正无法入队，
+                        // 延迟 ≤ scanIntervalMs 无害。
+                        parkWithFallback(tier, TimeUnit.MILLISECONDS.toNanos(precisionTierCatalog.scanIntervalMs(tier)));
+                        continue;
                     }
                     continue;
                 }
@@ -466,6 +483,16 @@ public class PrecisionScheduler {
         // 唤醒 adaptive 扫描线程，使其观察 running=false 后退出
         for (Thread t : scannerThreads.values()) {
             LockSupport.unpark(t);
+        }
+        // 等扫描线程退出：stop() 后 start() 会重建扫描线程，若旧线程仍存活且观察到
+        // running=true 会继续扫描——同档双扫描线程（正确性靠 CAS 兜底，但指标/时序失真）。
+        for (Thread t : scannerThreads.values()) {
+            try {
+                t.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
         scannerThreads.clear();
         scannerParkTarget.clear();
@@ -624,7 +651,13 @@ public class PrecisionScheduler {
      * 添加到桶并等待调度
      */
     private void addToBucketAndDispatch(Intent intent) {
-        bucketGroupManager.add(intent);
+        BucketGroup.AddResult r = bucketGroupManager.add(intent);
+        if (r == BucketGroup.AddResult.FALLBACK_TO_COHORT) {
+            // 高水位降级：新桶未建、旧桶条目已摘、索引已清（intent 现归 cohort 管）。
+            // 结果不能丢弃——否则 intent 既不在桶也不在 cohort，静默丢失直到重启恢复。
+            cohortManager.register(intent);
+            metrics.incrementMilliFallback(intent.getPrecisionTier());
+        }
     }
 
     /**
@@ -667,7 +700,12 @@ public class PrecisionScheduler {
             } else if (delayMs > precisionWindowMs) {
                 cohortManager.register(intent);
             } else {
-                bucketGroupManager.add(intent);
+                BucketGroup.AddResult r = bucketGroupManager.add(intent);
+                if (r == BucketGroup.AddResult.FALLBACK_TO_COHORT) {
+                    // 高水位降级：结果不能丢弃（同 addToBucketAndDispatch 说明）
+                    cohortManager.register(intent);
+                    metrics.incrementMilliFallback(tier);
+                }
             }
             indexIntent(intent);
         }
@@ -787,6 +825,9 @@ public class PrecisionScheduler {
                         metrics.incrementBackpressureEvent(tier);
                         logger.error("CRITICAL: Backpressure — dispatch queue full for tier {}, requeuing intent {} for next scan cycle",
                             tier, intent.getIntentId());
+                        // 清理本次 enqueue 时间戳：重入后下次 offer 会重新登记；
+                        // 否则 intent 若在重入期间被取消，条目永不清理（内存泄漏）。
+                        enqueueTimeNanos.remove(intent.getIntentId());
                         // I5: 快照在锁内取，dispatch 在锁外
                         final Intent bpSnapshot;
                         synchronized (intent) {
@@ -795,8 +836,10 @@ public class PrecisionScheduler {
                         notifyObservers(o -> o.onDeliveryFailed(bpSnapshot,
                             new com.loomq.common.exception.BackPressureException(
                                 "Dispatch queue full for tier " + tier, null, 1000)));
-                        // 重新放回调度结构等待下次 scan cycle（intent 仍为 SCHEDULED 状态，无需回退）
-                        addToBucketAndDispatch(intent);
+                        // 重新放回调度结构等待下次 scan cycle（intent 仍为 SCHEDULED 状态，无需回退）。
+                        // 走强制入桶（addForced）：intent 已被系统接受（scanDue 已认领），
+                        // 忽略高水位降级——否则 FALLBACK_TO_COHORT 会把结果丢弃，intent 静默丢失。
+                        bucketGroupManager.addForced(intent);
                     }
                 }
 
@@ -898,14 +941,28 @@ public class PrecisionScheduler {
             // I5: 派发即快照——在 synchronized(intent) 内原子完成终态复查 + 防御性拷贝。
             // 快照与 cancel/update 互斥：要么取自变更前的完整状态，要么复查拦截（不投递）。
             // 撕裂读在结构上消除；SPI 边界只过快照，用户代码无法触达内核活状态。
-            Intent snapshot;
+            Intent snapshot = null;
+            boolean expired = false;
             synchronized (intent) {
                 if (intent.getStatus().isTerminal()) {
                     enqueueTimeNanos.remove(intent.getIntentId());
                     releasePermit(tier, acquired);
                     continue;
                 }
-                snapshot = intent.copy();
+                // 过期闸门：scanAndDispatch 先入队、后跑 checkExpiredIntents（同 cycle 竞态，
+                // 入队恒胜），此处是投递前最后一道闸——deadline 已过则按 ExpiredAction 终态化，
+                // 不得投递（deadline = 最晚有效时间契约）。
+                expired = intent.isExpired();
+                if (!expired) {
+                    snapshot = intent.copy();
+                }
+            }
+            if (expired) {
+                enqueueTimeNanos.remove(intent.getIntentId());
+                releasePermit(tier, acquired);
+                // 锁外终态化：handleExpired 自带 synchronized + 锁外 awaitCommit（不 pin carrier）
+                handleExpired(intent);
+                continue;
             }
 
             // Trace: record dequeued (right after pollFirst, before any other processing)
@@ -987,17 +1044,28 @@ public class PrecisionScheduler {
             // 许可获取在 synchronized(intent) 终态复查 + copy 之后，
             // 确保只为非终态 intent 占用 permit。终态复查与快照在同一个
             // 监视器下原子完成，消除了旧 removeIf 路径的 TOCTOU 窗口。
+            // 过期闸门：deadline 已过（投递前最后一道闸）→ 收集到锁外终态化，不得投递。
             List<Intent> liveBatch = new ArrayList<>(batch.size());
             List<Intent> snapshotBatch = new ArrayList<>(batch.size());
+            List<Intent> expiredBatch = new ArrayList<>(0);
             for (Intent intent : batch) {
                 synchronized (intent) {
                     if (intent.getStatus().isTerminal()) {
                         enqueueTimeNanos.remove(intent.getIntentId());
                         continue;
                     }
+                    if (intent.isExpired()) {
+                        enqueueTimeNanos.remove(intent.getIntentId());
+                        expiredBatch.add(intent);
+                        continue;
+                    }
                     liveBatch.add(intent);
                     snapshotBatch.add(intent.copy());
                 }
+            }
+            // 锁外终态化（handleExpired 自带 synchronized + 锁外 awaitCommit）
+            for (Intent intent : expiredBatch) {
+                handleExpired(intent);
             }
             if (liveBatch.isEmpty()) {
                 continue;
@@ -1113,6 +1181,7 @@ public class PrecisionScheduler {
             // 最低优先级档当作借用源；其槽位是延迟敏感资源，不得被低优先级档抢占。
             if (precisionTierCatalog.isDirectBucket(allTiers[i])) continue;
             ResizableSemaphore other = tierSemaphores.get(allTiers[i]);
+            if (other == null) continue;   // 自定义 catalog 可能未含该档（signal 缺失档无信号量）
 
             if (other.availablePermits() <= 0) continue;
             if (other.getBorrowedCount() >= (int) (other.getCurrentMax() * MAX_LEND_RATIO)) continue;
@@ -1188,25 +1257,32 @@ public class PrecisionScheduler {
      * 正常路径不应 reject;此处的兜底仅作防御,避免在途决策静默丢失。
      */
     private void submitFinalize(Intent intent, PrecisionTier tier, Runnable task) {
+        Runnable guarded = () -> runFinalizeTask(intent, tier, task);
         try {
-            sharedExecutor.submit(() -> {
-                try {
-                    task.run();
-                } catch (Exception e) {
-                    finalizeTaskExceptions.incrementAndGet();
-                    if (finalizeExceptionSamples.size() < 20) {
-                        finalizeExceptionSamples.add(e.getClass().getSimpleName() + ": "
-                            + (e.getMessage() != null ? e.getMessage() : "(null)"));
-                    }
-                    logger.error("Error in delivery callback for intent {}", intent.getIntentId(), e);
-                } finally {
-                    tierInFlight.get(tier).decrementAndGet();
-                }
-            });
+            sharedExecutor.submit(guarded);
         } catch (RejectedExecutionException e) {
-            tierInFlight.get(tier).decrementAndGet();
-            logger.error("sharedExecutor rejected finalize for intent {}; outcome may be lost",
+            // stop() 排空窗口的 TOCTOU：consumer 越过 while(running) 后新入的在途投递，
+            // 其结算提交会被已关闭的 executor 拒绝。原地执行保证 ACK/重试决策不丢——
+            // 否则投递已成功的 intent 重启后按旧 SCHEDULED 槽重投（重复投递）。
+            logger.warn("sharedExecutor rejected finalize for intent {}; running inline to preserve outcome",
                 intent.getIntentId(), e);
+            runFinalizeTask(intent, tier, task);
+        }
+    }
+
+    /** 结算任务主体：try/catch/finally 包裹，结束时 -1 在途计数（Fix 5）。 */
+    private void runFinalizeTask(Intent intent, PrecisionTier tier, Runnable task) {
+        try {
+            task.run();
+        } catch (Exception e) {
+            finalizeTaskExceptions.incrementAndGet();
+            if (finalizeExceptionSamples.size() < 20) {
+                finalizeExceptionSamples.add(e.getClass().getSimpleName() + ": "
+                    + (e.getMessage() != null ? e.getMessage() : "(null)"));
+            }
+            logger.error("Error in delivery callback for intent {}", intent.getIntentId(), e);
+        } finally {
+            tierInFlight.get(tier).decrementAndGet();
         }
     }
 
@@ -1375,6 +1451,15 @@ public class PrecisionScheduler {
         boolean persisted = false;
         String terminalId = null;
         synchronized (intent) {
+            // R6: 终态守卫——consumer 过期闸门（投递前最后一道闸）与扫描线程的
+            // checkExpiredIntents 可对同一 intent 并发进入 handleExpired：败者二次
+            // transitionTo 从终态抛 ISE。consumer 路径无 try/catch，ISE 直接杀死
+            // 消费者 VT（固定 Thread[]，无监督）→ 档位投递容量静默永久退化；扫描
+            // 路径有 try/catch 吞掉，故败者归属决定后果。锁内复查，竞态败者幂等跳过
+            // （终态已由先到者落盘+回收）。
+            if (intent.getStatus().isTerminal()) {
+                return;
+            }
             unindexIntent(intent.getIntentId(), executeAtMs(intent));
             logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
 
@@ -1426,8 +1511,25 @@ public class PrecisionScheduler {
         String terminalId = null;
         try {
             synchronized (intent) {
+                // 终态守卫：在途投递期间 intent 可能已被并发终态化——deadline 在飞行中
+                // 越过（checkExpiredIntents → handleExpired 标 EXPIRED）或 cancel 竞态
+                // （标 CANCELED）。终态胜者在途投递结果：直接跳过结算（观察器已由
+                // onExpired/取消路径通知），否则 transitionTo(DUE) 从终态抛 ISE →
+                // onDelivered 丢失 + ACK 未落盘 → 重启按旧 SCHEDULED 槽重复投递。
+                if (intent.getStatus().isTerminal()) {
+                    enqueueTimeNanos.remove(intent.getIntentId());
+                    return;
+                }
                 // 内存中状态转换（不持久化 — 终态才做一次 upsert）
-                intent.transitionTo(IntentStatus.DUE);
+                // R6: 结算前奏容错——updateIntent 的 updater 无状态白名单校验，可把
+                // SCHEDULED 置为 DUE（状态机允许 SCHEDULED→DUE；updater 只在 SCHEDULED
+                // 上运行，DUE 是唯一可达的非终态迁移）。DUE 起步时跳过 transitionTo(DUE)
+                // ——DUE→DUE 非法，会抛 ISE 被 runFinalizeTask 吞掉：ACK 未落盘、
+                // onDelivered 丢失、intent 卡死 DUE（索引已被认领消耗），重启按旧
+                // SCHEDULED 槽重复投递。直接推进 DISPATCHING 续链。
+                if (intent.getStatus() != IntentStatus.DUE) {
+                    intent.transitionTo(IntentStatus.DUE);
+                }
                 intent.transitionTo(IntentStatus.DISPATCHING);
                 intent.incrementAttempts();
 
@@ -1459,6 +1561,27 @@ public class PrecisionScheduler {
                         break;
 
                     case RETRY: {
+                        // 与 handleDeliveryFailure(异常路径)对齐:RETRY 结果同样受 maxAttempts
+                        // 约束——否则 handler 恒返回 RETRY 时无限重排程,绕过重试上限契约,
+                        // 与异常路径(attempts >= maxAttempts → DEAD_LETTERED)语义不一致。
+                        int maxAttempts = intent.getRedelivery() != null
+                            ? intent.getRedelivery().getMaxAttempts()
+                            : 5;
+                        if (intent.getAttempts() >= maxAttempts) {
+                            intent.transitionTo(IntentStatus.DEAD_LETTERED);
+                            intentStore.update(intent);
+                            persistTerminal(intent);              // 终态原地覆写(不追加)
+                            terminalId = intent.getIntentId();
+                            persisted = true;
+                            unindexIntent(intent.getIntentId(), executeAtMs(intent));
+                            logger.warn("Intent dead-lettered after max attempts (RETRY result): id={}",
+                                intent.getIntentId());
+                            if (!observers.isEmpty()) {
+                                final Intent snapshot = intent.copy();
+                                deferredNotify = o -> o.onDeadLettered(snapshot);
+                            }
+                            break;
+                        }
                         long oldExecuteAtMs = executeAtMs(intent);
                         long delayMs = intent.getRedelivery() != null
                             ? intent.getRedelivery().calculateDelay(intent.getAttempts())
@@ -1543,11 +1666,21 @@ public class PrecisionScheduler {
         boolean persisted = false;
         String terminalId = null;
         synchronized (intent) {
+            // 终态守卫（同 finalizeIntent）：在途投递失败结算时 intent 可能已被
+            // handleExpired/cancel 终态化——跳过重试/死信决策，终态保持。
+            if (intent.getStatus().isTerminal()) {
+                enqueueTimeNanos.remove(intent.getIntentId());
+                return;
+            }
             int maxAttempts = intent.getRedelivery() != null
                 ? intent.getRedelivery().getMaxAttempts()
                 : 5;
 
-            intent.transitionTo(IntentStatus.DUE);
+            // R6: 结算前奏容错（同 finalizeIntent）：updater 置 DUE 的 intent 在投递
+            // 失败结算时同样从 DUE 起步，跳过 transitionTo(DUE) 直接推进 DISPATCHING。
+            if (intent.getStatus() != IntentStatus.DUE) {
+                intent.transitionTo(IntentStatus.DUE);
+            }
             intent.transitionTo(IntentStatus.DISPATCHING);
             intent.incrementAttempts();
 
