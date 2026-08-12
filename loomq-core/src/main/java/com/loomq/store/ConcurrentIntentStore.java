@@ -93,7 +93,10 @@ public class ConcurrentIntentStore implements IntentStore {
 
         StoredIntent stored = intents.get(record.getIntentId());
         if (stored == null) {
-            idempotencyRecords.remove(idempotencyKey);
+            // TOCTOU：记录可能已被并发创建的同 key 新 intent 覆盖（记录 map 按 key 覆盖写入）。
+            // 仅当 map 中仍是本次读取的记录对象时才清理——否则会误删新 intent 的幂等记录，
+            // 使其幂等保证失效（重复请求被当作新请求）。
+            idempotencyRecords.computeIfPresent(idempotencyKey, (k, rec) -> rec == record ? null : rec);
             return IdempotencyResult.newRequest();
         }
 
@@ -112,7 +115,11 @@ public class ConcurrentIntentStore implements IntentStore {
             decrementStatus(removed.status());
             String idempotencyKey = removed.intent().getIdempotencyKey();
             if (idempotencyKey != null) {
-                idempotencyRecords.remove(idempotencyKey);
+                // 只移除属于本 intent 的幂等记录：记录 map 按 key 覆盖写入，同 key 可能已被
+                // 另一个 intent 占用（createIntent 不做幂等检查）。按记录归属校验后移除，
+                // 避免误删新 intent 的记录导致其幂等保证失效。
+                idempotencyRecords.computeIfPresent(idempotencyKey, (k, rec) ->
+                    rec.getIntentId().equals(intentId) ? null : rec);
             }
         }
     }

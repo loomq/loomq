@@ -149,4 +149,50 @@ class GroupCommitBarrierTest {
             assertTrue(bGen >= 2L, "B's own awaitCommit must eventually cover its ticket");
         }
     }
+
+    /**
+     * 内联 force 失败不得发布 durability frontier（虚假持久化确认）。
+     *
+     * <p>doInlineForce 的 forceDirty()/flush() 抛异常（ENOSPC/EIO/段已关闭）时字节并未落盘；
+     * 若仍推进 flushedTicket，其他在兜底分支等待的写者会看到 flushedTicket >= myTicket 而返回
+     * 成功——DURABLE 假阳：崩溃即丢数据，正是本类 javadoc 声称要杜绝的 under-wait。
+     * daemon 循环只在 force 成功后发布，内联兜底必须一致。</p>
+     *
+     * <p>构造：put 制造脏桶 → 关闭 store（arena 关闭 → 后续 seg.force() 抛 ISE）→ 并发写者
+     * awaitCommit。daemon 循环每次 force 失败且不发布；写者超时后走内联 force → 同样失败 →
+     * 两个写者都必须抛错（frontier 保持 0），而非返回成功。</p>
+     */
+    @Test
+    void inlineForceFailureMustNotPublishFrontier() throws Exception {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1L, 200L, 60L * 60_000L, 60_000L, null);
+        WheelStore store = new WheelStore(cfg, clock::get);
+        TailIndex tail = new TailIndex(tmp, clock::get);
+        GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 200);
+
+        Intent it = new Intent("intent_flf00000001");
+        it.setExecuteAt(Instant.ofEpochMilli(clock.get() + 1_000));
+        it.transitionTo(IntentStatus.SCHEDULED);
+        store.put(it); // 脏桶：forceDirty 有内容可刷
+
+        barrier.start();
+        // 让 daemon 跑过初始轮次，然后关闭 store → 所有桶段不活 → 后续 forceDirty 抛 ISE。
+        Thread.sleep(50);
+        store.close();
+        tail.close();
+
+        // 两个并发 DURABLE 写者：daemon 已无法 force（每轮抛错且不发布），超时后各自内联
+        // force 也失败。修复前：doInlineForce 的 finally 仍发布 frontier → 至少一个写者
+        // 拿到假成功返回。修复后：frontier 不动，两个写者都抛错。
+        CompletableFuture<Long> w1 = CompletableFuture.supplyAsync(barrier::awaitCommit);
+        CompletableFuture<Long> w2 = CompletableFuture.supplyAsync(barrier::awaitCommit);
+
+        assertThrows(java.util.concurrent.ExecutionException.class, w1::get,
+            "writer 1 must not receive a false DURABLE success when the force failed");
+        assertThrows(java.util.concurrent.ExecutionException.class, w2::get,
+            "writer 2 must not receive a false DURABLE success when the force failed");
+        assertEquals(0L, barrier.currentGeneration(),
+            "frontier must never advance past a failed force");
+        barrier.close();
+    }
 }

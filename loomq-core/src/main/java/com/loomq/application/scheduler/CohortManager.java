@@ -44,7 +44,8 @@ public final class CohortManager {
     private final Consumer<Collection<Intent>> scanTrigger;
     private final MetricsCollector metrics;
 
-    private final Thread wakeThread;
+    /** 非 final：stop() 后 start() 需重建（Java 线程不可重启）。 */
+    private Thread wakeThread;
     private final AtomicBoolean running;
 
     // Observability counters (CSA impact measurement)
@@ -70,6 +71,11 @@ public final class CohortManager {
 
     void start() {
         if (running.compareAndSet(false, true)) {
+            // stop() 后重启：旧线程已 join，重建（Java 线程不可二次 start）。
+            wakeThread = Thread.ofPlatform()
+                .name("cohort-waker")
+                .daemon(true)
+                .unstarted(this::wakeLoop);
             wakeThread.start();
             logger.info("CohortManager started");
         }
@@ -78,6 +84,12 @@ public final class CohortManager {
     void stop() {
         running.set(false);
         LockSupport.unpark(wakeThread);
+        // 等旧线程退出，杜绝重启后双 wake 线程（旧线程观察到 running=true 会继续跑）
+        try {
+            wakeThread.join(2000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**

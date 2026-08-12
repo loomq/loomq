@@ -97,6 +97,20 @@ public class BucketGroupManager {
     }
 
     /**
+     * 再入路径（scanAndDispatch 背压重入）：intent 已被系统接受（scanDue 已认领），
+     * 强制入桶、忽略高水位降级——否则 add() 的 FALLBACK_TO_COHORT 结果被丢弃，
+     * intent 既不在桶也不在 cohort，静默丢失直到重启恢复。
+     */
+    public void addForced(Intent intent) {
+        PrecisionTier tier = intent.getPrecisionTier();
+        BucketGroup group = bucketGroups.get(tier);
+        if (group == null) {
+            group = bucketGroups.get(precisionTierCatalog.defaultTier());
+        }
+        group.addForced(intent, intent.getExecuteAt());
+    }
+
+    /**
      * 从对应精度档位的桶中移除 Intent。
      *
      * @param intent Intent 实例
