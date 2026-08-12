@@ -1,2 +1,5 @@
 package com.loomq.application.recovery;
-public record WheelRecoveryReport(int hotRestored, int coldRegistered) {}
+
+import java.util.Set;
+
+public record WheelRecoveryReport(int hotRestored, int coldRegistered, Set<String> multiSlotIntentIds) {}

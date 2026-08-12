@@ -16,8 +16,10 @@ import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.store.IntentStore;
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,7 +27,7 @@ import org.slf4j.LoggerFactory;
  * 恢复:扫所有槽 → 重建索引 + 热载入内存 + 冷注册 promotion cohort。
  * 替代 RecoveryPipeline。无 WAL 回放——槽即当前态。一次性 O(N) 扫描(类比 WAL replay)。
  *
- * <p><b>跨视界去重</b>:WheelStore 是 append-only(不清理槽位),把 within-horizon 槽
+ * <p><b>跨视界去重</b>:WheelStore 非终态 append、终态单槽回收(陈旧兄弟槽仍残留),把 within-horizon 槽
  * reschedule 到 beyond-horizon 后,旧 day-wheel 槽(低 revision)与新 tail 条目(高 revision)
  * 共存。recover 按 intentId 在 day-wheel + tail 全局取最大 revision 的条目,仅处理胜者,
  * 避免重启时旧槽引发 ghost 投递/提升。</p>
@@ -52,15 +54,18 @@ public final class WheelRecovery {
         tail.promoteInto(store);
 
         // 2. Build global latest map: intentId → SlotEntry, max revision across day-wheel
-        //    slots AND tail entries. WheelStore is append-only (no slot clearing), so a
+        //    slots AND tail entries. Non-terminal writes append; terminal slots are reclaimed
+        //    in place (stale siblings remain), so a
         //    reschedule across the horizon leaves a stale lower-revision day-wheel slot
         //    alongside the new higher-revision tail entry. Dedup-ing by max revision across
         //    BOTH sources ensures only the winner is processed — preventing ghost
         //    promotion/delivery of the stale slot on restart.
         Map<String, SlotEntry> latest = new HashMap<>();
+        Map<String, Integer> slotCounts = new HashMap<>();
         Iterator<SlotEntry> it = store.scanSlotsFrom(Instant.ofEpochMilli(0));
         while (it.hasNext()) {
             SlotEntry e = it.next();
+            slotCounts.merge(e.intent().getIntentId(), 1, Integer::sum);
             SlotEntry prev = latest.get(e.intent().getIntentId());
             if (prev == null || e.intent().getRevision() > prev.intent().getRevision()) {
                 latest.put(e.intent().getIntentId(), e);
@@ -78,6 +83,7 @@ public final class WheelRecovery {
                 log.warn("Recovery: skipping corrupt tail entry (decode failed)", dex);
                 continue;
             }
+            slotCounts.merge(intent.getIntentId(), 1, Integer::sum);
             SlotEntry tailEntry = new SlotEntry(SlotLocation.tail(te.executeAtMs()), intent);
             SlotEntry prev = latest.get(intent.getIntentId());
             if (prev == null || intent.getRevision() > prev.intent().getRevision()) {
@@ -87,9 +93,20 @@ public final class WheelRecovery {
 
         // 3. Process only the max-revision winner per intentId
         int hot = 0, cold = 0;
+        Set<String> multiSlot = new HashSet<>();
         for (SlotEntry e : latest.values()) {
             Intent intent = e.intent();
-            if (intent.getStatus().isTerminal()) continue;  // 终态不索引(桶回收依赖)
+            String id = intent.getIntentId();
+            int count = slotCounts.getOrDefault(id, 0);
+            if (intent.getStatus().isTerminal()) {
+                // F3:唯一幸存且为终态 → 崩溃窗口泄漏的单槽终态墓碑(overwrite 与 reclaim 之间崩溃),
+                // 无兄弟槽可复活,恢复期回收清空,桶容量自愈(wheel 槽;tail 内终态不在此回收)。count>1 的合法多槽墓碑保留(参与去重)。
+                if (count == 1) {
+                    store.freeSlot(e.loc());
+                    log.info("Recovery: reclaimed leaked terminal slot {} for intent {}", e.loc(), id);
+                }
+                continue;
+            }
             long execMs = intent.getExecuteAt().toEpochMilli();
             if (execMs < nowMs) {
                 // P0-2: 停机窗口到期的 Intent 不再静默丢弃。按 ExpiredAction 补终态
@@ -100,27 +117,28 @@ public final class WheelRecovery {
                 try {
                     intent.transitionTo(terminal);
                     intent.incrementRevision();
-                    SlotLocation newLoc = store.put(intent);   // 写终态 revision(append-only)
+                    SlotLocation newLoc = store.put(intent);   // 写终态 revision
                     metricsCollector.incrementRecoveryOverdue();
                     log.warn("Recovery: intent {} overdue (execMs={} < now={}); marked {}",
-                        intent.getIntentId(), execMs, nowMs, terminal);
+                        id, execMs, nowMs, terminal);
                 } catch (Exception ex) {
-                    log.error("Recovery: failed to mark overdue intent {}", intent.getIntentId(), ex);
+                    log.error("Recovery: failed to mark overdue intent {}", id, ex);
                 }
                 continue;
             }
-            idx.put(intent.getIntentId(), e.loc());          // rebuild index: only non-terminal, non-overdue
+            if (count > 1) multiSlot.add(id);    // F1: 磁盘上幸存兄弟 >1 → 终态须保留墓碑不回收
+            idx.put(id, e.loc());                // rebuild index: only non-terminal, non-overdue
             if (execMs <= hotBoundary) {
                 memStore.upsert(intent);
                 scheduler.restore(intent);
                 hot++;
             } else {
-                daemon.register(intent.getIntentId(), e.loc(), execMs);
+                daemon.register(id, e.loc(), execMs);
                 cold++;
             }
         }
 
-        log.info("WheelRecovery: hotRestored={}, coldRegistered={}", hot, cold);
-        return new WheelRecoveryReport(hot, cold);
+        log.info("WheelRecovery: hotRestored={}, coldRegistered={}, multiSlot={}", hot, cold, multiSlot.size());
+        return new WheelRecoveryReport(hot, cold, multiSlot);
     }
 }

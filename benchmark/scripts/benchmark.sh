@@ -20,6 +20,7 @@ QUICK=false
 SCENARIO="all"
 NO_COMPILE=false
 COMPARE=false
+SWEEP_CONSUMERS=""
 
 for arg in "$@"; do
     case $arg in
@@ -27,6 +28,7 @@ for arg in "$@"; do
         --scenario=*) SCENARIO="${arg#*=}" ;;
         --no-compile) NO_COMPILE=true ;;
         --compare) COMPARE=true ;;
+        --sweep-consumers=*) SWEEP_CONSUMERS="${arg#*=}" ;;
         --help|-h)
             echo "LoomQ 性能基准测试"
             echo ""
@@ -35,6 +37,7 @@ for arg in "$@"; do
             echo "  --scenario=NAME      场景: all / create / delivery / precision"
             echo "  --no-compile         跳过编译"
             echo "  --compare            查看最近一次报告"
+            echo "  --sweep-consumers=N  消费者数扫参 (追加 -Dsweep.consumers=N)"
             echo "  --help               显示帮助"
             exit 0
             ;;
@@ -108,7 +111,9 @@ fi
 echo ">>> 运行基准测试 (场景: $SCENARIO, 测试: $TEST_SELECT)"
 LOG_FILE="$LOGS_DIR/benchmark-$TIMESTAMP.log"
 set +e
-(cd "$PROJECT_ROOT" && mvn test -pl loomq-core "-Dtest=$TEST_SELECT" "-Dtest.excludedGroups=" > "$LOG_FILE" 2>&1)
+SWEEP_ARGS=()
+[ -n "$SWEEP_CONSUMERS" ] && SWEEP_ARGS=("-Dsweep.consumers=$SWEEP_CONSUMERS")
+(cd "$PROJECT_ROOT" && mvn test -pl loomq-core "-Dtest=$TEST_SELECT" "-Dtest.excludedGroups=" "${SWEEP_ARGS[@]}" > "$LOG_FILE" 2>&1)
 MVN_EXIT=$?
 set -e
 
@@ -141,12 +146,12 @@ MD_FILE="$REPORTS_DIR/benchmark-report-$TIMESTAMP.md"
 
     echo "## 创建吞吐"
     echo ""
-    echo "| 模式 | 数量 | 耗时(ms) | QPS |"
-    echo "|------|------|----------|-----|"
+    echo "| 模式 | QPS(median) | QPS(IQR) | samples |"
+    echo "|------|-------------|----------|---------|"
     while IFS= read -r line; do
         case "$line" in
             RESULT\|create\|*)
-                echo "| $(kv "$line" batch) | $(kv "$line" count) | $(kv "$line" ms) | $(kv "$line" qps) |"
+                echo "| $(kv "$line" batch) | $(kv "$line" qps_median) | $(kv "$line" qps_iqr) | $(kv "$line" samples) |"
                 ;;
         esac
     done < "$RESULT_FILE"
@@ -154,8 +159,8 @@ MD_FILE="$REPORTS_DIR/benchmark-report-$TIMESTAMP.md"
 
     echo "## 投递吞吐"
     echo ""
-    echo "| 档位 | QPS | create_ms | delivery_ms | wake p50/p95/p99 | e2e p50/p95/p99 | overhead p99 | SLO(wake p99) | SLO(e2e p99) |"
-    echo "|------|-----|-----------|-------------|------------------|------------------|--------------|----------------|---------------|"
+    echo "| 档位 | QPS(median) | QPS(IQR) | wake p50/p99 | e2e p50/p99 | overhead p99 | SLO(wake p99) | SLO(e2e p99) |"
+    echo "|------|-------------|----------|--------------|-------------|--------------|----------------|---------------|"
     while IFS= read -r line; do
         case "$line" in
             RESULT\|delivery\|*)
@@ -167,7 +172,7 @@ MD_FILE="$REPORTS_DIR/benchmark-report-$TIMESTAMP.md"
                 wpass="PASS"; epass="PASS"
                 [ -n "$wt" ] && [ "$w9" -gt "$wt" ] && wpass="FAIL"
                 [ -n "$et" ] && [ "$e9" -gt "$et" ] && epass="FAIL"
-                echo "| $tier | $(kv "$line" qps_mean) | $(kv "$line" create_mean_ms) | $(kv "$line" delivery_mean_ms) | $(kv "$line" wake_p50_ms)/$(kv "$line" wake_p95_ms)/$w9 | $(kv "$line" e2e_p50_ms)/$(kv "$line" e2e_p95_ms)/$e9 | $(kv "$line" overhead_p99_ms) | $wpass | $epass |"
+                echo "| $tier | $(kv "$line" qps_median) | $(kv "$line" qps_iqr) | $(kv "$line" wake_p50_ms)/$w9 | $(kv "$line" e2e_p50_ms)/$e9 | $(kv "$line" overhead_p99_ms) | $wpass | $epass |"
                 ;;
         esac
     done < "$RESULT_FILE"
@@ -181,6 +186,19 @@ MD_FILE="$REPORTS_DIR/benchmark-report-$TIMESTAMP.md"
         case "$line" in
             RESULT\|tier_config\|*)
                 echo "| $(kv "$line" tier) | $(kv "$line" scanner) | $(kv "$line" consumers) | $(kv "$line" queue_capacity) | $(kv "$line" max_concurrency) | $(kv "$line" window_ms) | $(kv "$line" batch_size) |"
+                ;;
+        esac
+    done < "$RESULT_FILE"
+    echo ""
+
+    echo "## 消费者数扫参"
+    echo ""
+    echo "| 档位 | consumers | QPS(median) | QPS(IQR) | e2e p99 |"
+    echo "|------|-----------|-------------|----------|---------|"
+    while IFS= read -r line; do
+        case "$line" in
+            RESULT\|delivery\|*consumers=*)
+                echo "| $(kv "$line" tier) | $(kv "$line" consumers) | $(kv "$line" qps_median) | $(kv "$line" qps_iqr) | $(kv "$line" e2e_p99_ms) |"
                 ;;
         esac
     done < "$RESULT_FILE"

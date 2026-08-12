@@ -119,7 +119,7 @@ flowchart LR
 
 ## 持久化与可靠性（PHTW）
 
-持久化栈由 `WheelStore`（4 层 mmap 时间轮，append-only）+ `TailIndex`（超 30 天 run 文件）+ `GroupCommitBarrier`（group-commit msync）+ `IntentLocationIndex` + `PromotionDaemon` + `WheelRecovery` 构成。**磁盘是权威，内存 `IntentStore` 只是热窗口镜像；无 WAL、无快照**。
+持久化栈由 `WheelStore`（4 层 mmap 时间轮，非终态 append + 终态单槽回收 + 溢出链）+ `TailIndex`（超 30 天 run 文件）+ `GroupCommitBarrier`（group-commit msync）+ `IntentLocationIndex` + `PromotionDaemon` + `WheelRecovery` 构成。**磁盘是权威，内存 `IntentStore` 只是热窗口镜像；无 WAL、无快照**。
 
 | AckMode | 持久化 | API 返回时机 | 崩溃窗口 |
 |:--------|:-------|:------------|:---------|
@@ -128,39 +128,41 @@ flowchart LR
 | `REPLICATED` | 预留多副本确认 | — | 无（未来集群，当前映射 `DURABLE`） |
 
 - 状态变更操作（`update` / `cancel` / `fireNow`）**硬编码 DURABLE**，即使 Intent 以 `ASYNC` 创建，其取消/改期也必然落盘后才返回。
-- 重启 `WheelRecovery` 按 **max revision** 去重（append-only 旧槽残留），终态不补投，避免对下游产生过时事件。
+- 重启 `WheelRecovery` 按 **max revision** 去重（陈旧兄弟槽），终态不补投，避免对下游产生过时事件；并重建 multiSlot 标记、回收泄漏终态槽。
 
 ---
 
 ## 基准测试
 
 > 数字来自受控环境实测，硬件 / 负载不同会有差异。完整 SLO 与复现方式见 [`benchmark/README.md`](benchmark/README.md)。
+>
+> **方法**：持续稳态闭环吞吐（`SteadyStateHarness`，固定在途 + 纳秒精度 + 整窗中位数/IQR），非突发峰值。投递为 `DURABLE`（每个 Intent 落盘 2 次：创建 + 终态）。数字比早期的突发峰值低，但更接近真实持续负载。
 
-**Windows** · Microsoft Windows 10.0.26200 · 22 核 · JDK 25.0.4 · commit `7acb8c5`
-
-| 创建吞吐 | 单发 | 批量 |
-|---------|------:|-----:|
-| **QPS** | 11,628 | 45,455 |
-
-| 档位 | QPS | wake p50/p99 | e2e p50/p99 | 触发精度 p50/p99/p999 |
-|------|----:|-------------|-------------|----------------------|
-| MILLI | 56,818 | 0 / 2 ms | 7 / 13 ms | 0 / 1 / 1 ms |
-| ULTRA | 96,154 | 0 / 0 ms | 4 / 6 ms | 0 / 1 / 1 ms |
-| FAST | 14,706 | 25 / 25 ms | 44 / 52 ms | 10 / 25 / 25 ms |
-| STANDARD | 2,189 | 100 / 250 ms | 216 / 475 ms | 100 / 250 / 250 ms |
-
-**WSL (Ubuntu, 原生 ext4)** · Linux 6.6.87.2-microsoft-standard-WSL2 · 22 核 · openjdk 25.0.4 · commit `7acb8c5`
+**Windows** · Microsoft Windows 10.0.26200 · 22 核 · JDK 25.0.4 · commit `cf4b679`
 
 | 创建吞吐 | 单发 | 批量 |
 |---------|------:|-----:|
-| **QPS** | 10,204 | 55,556 |
+| **QPS (median)** | 34,285 | 33,789 |
 
-| 档位 | QPS | wake p50/p99 | e2e p50/p99 | 触发精度 p50/p99/p999 |
+| 档位 | QPS (median) | wake p50/p99 | e2e p50/p99 | 触发精度 p50/p99/p999 |
 |------|----:|-------------|-------------|----------------------|
-| MILLI | 119,048 | 0 / 0 ms | 3 / 6 ms | 0 / 1 / 1 ms |
-| ULTRA | 192,308 | 0 / 0 ms | 2 / 3 ms | 0 / 1 / 1 ms |
-| FAST | 26,316 | 10 / 25 ms | 13 / 29 ms | 10 / 25 / 25 ms |
-| STANDARD | 2,024 | 100 / 250 ms | 138 / 481 ms | 100 / 250 / 250 ms |
+| MILLI | 1,415 | 0 / 1 ms | 8 / 121 ms | 0 / 1 / 5 ms |
+| ULTRA | 30,345 | 0 / 2 ms | 3 / 15 ms | 2 / 10 / 10 ms |
+| FAST | 3,010 | 25 / 25 ms | 46 / 51 ms | 10 / 50 / 50 ms |
+| STANDARD | 99 | 250 / 250 ms | 496 / 502 ms | 100 / 250 / 250 ms |
+
+> MILLI / STANDARD 的数值受其档位配置（MILLI 直接入桶 + cohort 降级、STANDARD 批量窗口 100ms）约束，偏高延迟与低吞吐反映持续负载下的档位取舍，非引擎全局瓶颈。ULTRA 是持续稳态吞吐甜点（~30k QPS）。
+
+**WSL (Ubuntu, 原生 ext4)** · 22 核 · openjdk 25.0.4
+
+> 待在新方法（持续稳态闭环）下重测。下表为早期突发峰值方法的历史数据，仅作参考，不可与上表直接对比。
+
+| 档位 | QPS | e2e p50/p99 | 触发精度 p50/p99/p999 |
+|------|----:|-------------|----------------------|
+| MILLI | 119,048 | 3 / 6 ms | 0 / 1 / 1 ms |
+| ULTRA | 192,308 | 2 / 3 ms | 0 / 1 / 1 ms |
+| FAST | 26,316 | 13 / 29 ms | 10 / 25 / 25 ms |
+| STANDARD | 2,024 | 138 / 481 ms | 100 / 250 / 250 ms |
 
 ---
 

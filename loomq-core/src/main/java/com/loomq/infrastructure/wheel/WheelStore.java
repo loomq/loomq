@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
@@ -45,6 +46,10 @@ public final class WheelStore implements AutoCloseable {
     // tier → (bucketKey → Bucket)
     private final Map<WheelTier, ConcurrentHashMap<Long, Bucket>> wheels = new EnumMap<>(WheelTier.class);
     private final Arena arena = Arena.ofShared();
+    /** 溢出链 spill 计数：按源档统计桶满后溢出到下一档的次数。 */
+    private final EnumMap<WheelTier, AtomicLong> spillCounts = new EnumMap<>(WheelTier.class);
+    /** 空槽模板:status=0。free 时整槽清零,readSlot/isOccupied 据此判空。 */
+    private static final byte[] EMPTY_SLOT = new byte[SlotCodec.SLOT_SIZE];
 
     public WheelStore(WheelConfig config, LongSupplier clock) {
         this.config = config;
@@ -52,7 +57,10 @@ public final class WheelStore implements AutoCloseable {
         this.slotsPerBucket = config.slotsPerBucket();
         this.bucketBytes = slotsPerBucket * SlotCodec.SLOT_SIZE;
         this.horizonMs = (long) config.horizonDays() * WheelTier.DAY.windowMs; // 由 config.horizonDays() 覆盖
-        for (WheelTier t : WheelTier.values()) wheels.put(t, new ConcurrentHashMap<>());
+        for (WheelTier t : WheelTier.values()) {
+            wheels.put(t, new ConcurrentHashMap<>());
+            spillCounts.put(t, new AtomicLong());
+        }
         loadExistingBuckets();
     }
 
@@ -67,7 +75,7 @@ public final class WheelStore implements AutoCloseable {
                          try {
                              long key = Long.parseLong(p.getFileName().toString().replace(".bin", ""));
                              Bucket b = openBucket(tier, key);
-                             b.recoverHighWaterMark();
+                             b.rebuildFreeList();
                              wheels.get(tier).put(key, b);
                          } catch (Exception e) { log.warn("skip bucket {}", p, e); }
                      });
@@ -84,16 +92,44 @@ public final class WheelStore implements AutoCloseable {
         return new SlotLocation(tier, bucketKey, -1, false);
     }
 
+    /**
+     * 写入 intent 并返回实际分配的槽位。桶满时经溢出链落到下一层更粗档
+     * （SEC→MIN→HOUR→DAY），突破单桶容量硬顶；仅当整条链都满（DAY 满）才抛
+     * {@link SlotOverflowException}。溢出链 try 仅包 {@code alloc()}：payload 超 210B 的
+     * {@link SlotCodec#encode} 溢出（同为 SlotOverflowException）不被误判为桶满而 spill；
+     * encode 失败会将刚 alloc 的保留槽回滚（releaseReserved），避免烧槽致后续同秒 put 误 spill 降级。
+     */
     public SlotLocation put(Intent intent) {
         SlotLocation loc = locate(intent.getExecuteAt());
         if (loc.inTail()) {
             throw new IllegalStateException("out-of-horizon put must go via TailIndex; got " + loc);
         }
-        Bucket b = getOrCreateBucket(loc.tier(), loc.bucketKey());
-        int slot = b.alloc();
-        byte[] encoded = SlotCodec.encode(intent);
-        b.write(slot, encoded);
-        return new SlotLocation(loc.tier(), loc.bucketKey(), slot, false);
+        WheelTier tier = loc.tier();
+        long executeAtMs = intent.getExecuteAt().toEpochMilli();
+        while (true) {
+            long bucketKey = executeAtMs / tier.windowMs;
+            Bucket b = getOrCreateBucket(tier, bucketKey);
+            int slot;
+            try {
+                slot = b.alloc();
+            } catch (SlotOverflowException e) {
+                WheelTier coarser = tier.nextCoarser();
+                if (coarser == null) throw e;              // 链终点(DAY)仍满 → 原样抛出
+                spillCounts.get(tier).incrementAndGet();
+                log.warn("Bucket overflow {} -> spill {} to {}", tier, intent.getIntentId(), coarser);
+                tier = coarser;
+                continue;
+            }
+            byte[] encoded;
+            try {
+                encoded = SlotCodec.encode(intent);
+            } catch (RuntimeException e) {
+                b.releaseReserved(slot);   // 编码失败回滚保留槽，避免烧槽致后续同秒 put 误 spill
+                throw e;
+            }
+            b.write(slot, encoded);
+            return new SlotLocation(tier, bucketKey, slot, false);
+        }
     }
 
     public Intent readSlot(SlotLocation loc) {
@@ -250,6 +286,30 @@ public final class WheelStore implements AutoCloseable {
         }
     }
 
+    /** 原地覆写已有槽（终态原地写，不分配新槽）。tail / 缺桶 / 缺槽则 no-op。 */
+    public void overwriteSlot(SlotLocation loc, byte[] encoded) {
+        if (loc.inTail() || loc.slotIndex() < 0) return;
+        Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
+        if (b == null) return;
+        if (!SlotCodec.isOccupied(b.read(loc.slotIndex()))) return;  // 空槽(已回收未复用)不覆写(防复活);已复用槽会被覆写——调用方须以 locationIndex 为准,回收前先清索引
+        b.write(loc.slotIndex(), encoded);
+    }
+
+    /** 回收槽：清空 + 入 free-list。tail / 缺桶 / 缺槽则 no-op。 */
+    public void freeSlot(SlotLocation loc) {
+        if (loc.inTail() || loc.slotIndex() < 0) return;
+        Bucket b = wheels.get(loc.tier()).get(loc.bucketKey());
+        if (b == null) return;
+        b.free(loc.slotIndex());
+    }
+
+    /** 溢出链 spill 计数快照（按源档；未溢出档为 0）。 */
+    public Map<WheelTier, Long> getSpillCounts() {
+        Map<WheelTier, Long> out = new EnumMap<>(WheelTier.class);
+        spillCounts.forEach((t, c) -> out.put(t, c.get()));
+        return out;
+    }
+
     /** 暴露 WheelTier 的 windowMs(供 BucketReclaimer 计算过期)。 */
     public long tierWindowMs(WheelTier tier) { return tier.windowMs; }
 
@@ -295,6 +355,8 @@ public final class WheelStore implements AutoCloseable {
     private final class Bucket {
         final WheelTier tier; final long bucketKey; final Path path; final FileChannel channel;
         final MemorySegment seg; final AtomicInteger next = new AtomicInteger(0);
+        /** 回收槽 free-list：alloc 先复用，空则 next 单调分配。纯内存可重建（重启全桶扫描）。 */
+        final ConcurrentLinkedDeque<Integer> freeList = new ConcurrentLinkedDeque<>();
         private final AtomicLong writeCount = new AtomicLong();
         private volatile long flushedWriteCount = 0;
         private volatile boolean closed = false;
@@ -307,17 +369,33 @@ public final class WheelStore implements AutoCloseable {
         private final ReadWriteLock forceLock = new ReentrantReadWriteLock();
         Bucket(WheelTier t, long k, Path p, FileChannel ch, MemorySegment m) { tier=t; bucketKey=k; path=p; channel=ch; seg=m; }
         int alloc() {
+            Integer freed = freeList.poll();
+            if (freed != null) return freed;
             int idx = next.getAndIncrement();
             if (idx >= slotsPerBucket) {
                 // Wave3: 用可识别的 SlotOverflowException 替代裸 IllegalStateException,
-                // 让调用方能区分"桶满"与其他 ISE,并在文档明示容量模型(1024 槽/桶)。
+                // put() 内桶满走溢出链 spill,此异常仅在整条链满(DAY)时向上抛。
                 throw new SlotOverflowException("bucket overflow: " + tier + "/" + bucketKey
-                    + " (slotsPerBucket=" + slotsPerBucket + "); consider widening the time window or adding overflow chain");
+                    + " (slotsPerBucket=" + slotsPerBucket + "); spill chain exhausted at " + tier
+                    + " — consider increasing slotsPerBucket");
             }
             return idx;
         }
+        /** 释放刚 alloc 但尚未写入的保留槽（encode 失败回滚）；槽必为空，直接入 free-list。 */
+        void releaseReserved(int slot) {
+            freeList.push(slot);
+        }
+        /** 回收槽：写 status=0 空槽 + 入 free-list（供 alloc 复用）。双重 free 防护：已空槽不重复入栈。 */
+        void free(int slot) {
+            if (!SlotCodec.isOccupied(read(slot))) return;  // 双重 free 防护：已空槽不重复入栈
+            write(slot, EMPTY_SLOT);
+            freeList.push(slot);
+        }
         void write(int slot, byte[] data) {
             long off = (long) slot * SlotCodec.SLOT_SIZE;
+            if (off + SlotCodec.SLOT_SIZE > seg.byteSize()) {  // 越界防护：与 read() 一致
+                throw new IndexOutOfBoundsException("slot " + slot + " out of bounds for bucket " + tier + "/" + bucketKey);
+            }
             Lock rl = forceLock.readLock();
             rl.lock();
             try {
@@ -335,15 +413,16 @@ public final class WheelStore implements AutoCloseable {
             MemorySegment.copy(seg, off, MemorySegment.ofArray(buf), 0, SlotCodec.SLOT_SIZE);
             return buf;
         }
-        /** 启动恢复:扫描槽位找到第一个空槽(高水位),设为 next,防重启覆写。 */
-        void recoverHighWaterMark() {
-            int high = 0;
+        /** 启动恢复：全桶扫描，空槽全部入 free-list；next 置 slotsPerBucket——freeList 已含全部空槽，
+         *  next 不得 mint 其内部索引（否则 freeList 耗尽后 next 双重分配覆写）。alloc 先服 freeList，耗尽即真满抛。 */
+        void rebuildFreeList() {
+            freeList.clear();
             for (int i = 0; i < slotsPerBucket; i++) {
-                byte[] slot = read(i);
-                if (!SlotCodec.isOccupied(slot)) { high = i; break; }
-                high = i + 1;
+                if (!SlotCodec.isOccupied(read(i))) {
+                    freeList.offer(i);
+                }
             }
-            next.set(high);
+            next.set(slotsPerBucket);
         }
         boolean hasUnflushed() { return writeCount.get() > flushedWriteCount; }
 

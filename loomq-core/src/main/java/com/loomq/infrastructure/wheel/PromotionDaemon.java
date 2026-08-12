@@ -87,7 +87,7 @@ public final class PromotionDaemon implements AutoCloseable {
         try {
             // Re-verify against the latest index state — cancel/reschedule may have moved or
             // removed this intent between cohort registration and now. Without this check, a
-            // cold cancel that appends a CANCELED slot at a NEW loc (append-only WheelStore)
+            // cold cancel that appends a CANCELED slot at a NEW loc (state-change appends new slot)
             // and removes the index entry would still be resurrected: promote reads the OLD
             // SCHEDULED slot at the handle's loc and upserts it into memory + scheduler.
             SlotLocation latest = locationIndex.get(h.intentId());
