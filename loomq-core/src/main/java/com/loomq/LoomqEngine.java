@@ -568,14 +568,6 @@ public class LoomqEngine implements AutoCloseable {
         );
     }
 
-    // ========== 内部方法 ==========
-
-    private void ensureRunning() {
-        if (!running.get()) {
-            throw new IllegalStateException("Engine is not running");
-        }
-    }
-
     // ========== Builder ==========
 
     public static Builder builder() {

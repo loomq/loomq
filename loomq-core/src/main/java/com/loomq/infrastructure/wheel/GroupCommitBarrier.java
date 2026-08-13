@@ -46,9 +46,6 @@ public final class GroupCommitBarrier implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
-    /** 内联 force 兜底触发次数(可观测慢盘压力)。 */
-    private final AtomicLong inlineForceFallbacks = new AtomicLong(0);
-    public long getInlineForceFallbacks() { return inlineForceFallbacks.get(); }
 
     public GroupCommitBarrier(WheelStore store, TailIndex tail, long intervalMs, long awaitCommitTimeoutMs) {
         this.store = store;
@@ -109,7 +106,6 @@ public final class GroupCommitBarrier implements AutoCloseable {
             if (inlineForceInFlight.compareAndSet(false, true)) {
                 // 本轮由我执行内联 force
                 final long pending = writeTicket.get();
-                inlineForceFallbacks.incrementAndGet();
                 try {
                     inlineForceExecutor.submit(() -> doInlineForce(pending)).get();
                 } catch (java.util.concurrent.RejectedExecutionException ree) {

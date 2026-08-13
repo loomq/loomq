@@ -11,11 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.EnumMap;
-import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -157,28 +153,6 @@ public final class WheelStore implements AutoCloseable {
         byte[] slot = b.read(loc.slotIndex());
         if (!SlotCodec.isOccupied(slot) || SlotCodec.isTorn(slot)) return null;
         return SlotCodec.decode(slot);
-    }
-
-    public Iterator<Intent> scanFrom(Instant from) {
-        long fromMs = from.toEpochMilli();
-        List<Intent> acc = new ArrayList<>();
-        for (WheelTier tier : WheelTier.values()) {
-            ConcurrentHashMap<Long, Bucket> buckets = wheels.get(tier);
-            List<Long> keys = new ArrayList<>(buckets.keySet());
-            Collections.sort(keys);
-            for (long key : keys) {
-                if (key * tier.windowMs + tier.windowMs <= fromMs) continue;
-                Bucket b = buckets.get(key);
-                for (int i = 0; i < slotsPerBucket; i++) {
-                    byte[] slot = b.read(i);
-                    if (SlotCodec.isOccupied(slot) && !SlotCodec.isTorn(slot)) {
-                        Intent it = SlotCodec.decode(slot);
-                        if (it.getExecuteAt().toEpochMilli() >= fromMs) acc.add(it);
-                    }
-                }
-            }
-        }
-        return acc.iterator();
     }
 
     /**
@@ -338,9 +312,6 @@ public final class WheelStore implements AutoCloseable {
         spillCounts.forEach((t, c) -> out.put(t, c.get()));
         return out;
     }
-
-    /** 暴露 WheelTier 的 windowMs(供 BucketReclaimer 计算过期)。 */
-    public long tierWindowMs(WheelTier tier) { return tier.windowMs; }
 
     /** 暴露 clock(供 BucketReclaimer 判断过期)。 */
     public LongSupplier clock() { return clock; }

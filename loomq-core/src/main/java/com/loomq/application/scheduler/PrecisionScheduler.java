@@ -18,7 +18,6 @@ import com.loomq.tracing.IntentTraceStore;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.List;
@@ -65,7 +64,6 @@ public class PrecisionScheduler {
 
     private static final Logger logger = LoggerFactory.getLogger(PrecisionScheduler.class);
 
-    private static final long BACKPRESSURE_LOG_INTERVAL_MS = 1000;
     // AdapTBF constraints: max lend ratio per tier (protects low-priority tiers)
     private static final double MAX_LEND_RATIO = 0.5; // lend at most 50% of tier's slots
     // 投递超时(单条/批量统一);后续如需可配,移入 PrecisionTierCatalog
@@ -140,9 +138,6 @@ public class PrecisionScheduler {
 
     // Cohort-based batched wakeup (CSA-inspired): replaces per-intent VT sleep
     private final CohortManager cohortManager;
-
-    // 限频日志时间戳
-    private final AtomicLong lastBackpressureLogTimeMs = new AtomicLong(0);
 
     // Arrow-inspired cross-tier slot borrowing metrics
     private final BorrowStats borrowStats = new BorrowStats();
@@ -221,14 +216,6 @@ public class PrecisionScheduler {
         public double avgBlockingWaitMs() {
             int n = blockingWaitCount.get();
             return n > 0 ? (totalBlockingWaitNanos.get() / (double) n) / 1_000_000.0 : 0;
-        }
-        public void reset() {
-            totalAcquireWaitNanos.set(0);
-            totalPermitHoldNanos.set(0);
-            totalDeliverAsyncNanos.set(0);
-            totalBlockingWaitNanos.set(0);
-            deliverySampleCount.set(0);
-            blockingWaitCount.set(0);
         }
     }
 
@@ -791,29 +778,6 @@ public class PrecisionScheduler {
     }
 
     /**
-     * 用 committed state 重建调度器状态。
-     *
-     * 该方法会清空当前桶、cohort 和过期索引，再按 store 里的当前态
-     * 重新挂载所有非终态 intent。适用于快照后的调度重建。
-     */
-    public void rebuildFromCommittedState(Collection<Intent> intents) {
-        bucketGroupManager.clear();
-        intentExpiryIndex.clear();
-        cohortManager.clear();
-
-        if (intents == null || intents.isEmpty()) {
-            return;
-        }
-
-        for (Intent intent : intents) {
-            if (intent == null || intent.getExecuteAt() == null || intent.getStatus().isTerminal()) {
-                continue;
-            }
-            restore(intent);
-        }
-    }
-
-    /**
      * 扫描并投递指定精度档位的到期任务
      */
     private void scanAndDispatch(PrecisionTier tier) {
@@ -911,17 +875,6 @@ public class PrecisionScheduler {
         // 记录扫描耗时
         long durationMs = (System.nanoTime() - startTime) / 1_000_000;
         metrics.recordScanDurationByTier(tier, durationMs);
-    }
-
-    /**
-     * 限频日志：每秒最多 1 条，避免 I/O 阻塞扫描线程
-     */
-    private void logRateLimited(String format, Object... args) {
-        long now = System.currentTimeMillis();
-        long last = lastBackpressureLogTimeMs.get();
-        if (now - last >= BACKPRESSURE_LOG_INTERVAL_MS && lastBackpressureLogTimeMs.compareAndSet(last, now)) {
-            logger.warn(format, args);
-        }
     }
 
     /**
@@ -1881,7 +1834,6 @@ public class PrecisionScheduler {
         public final AtomicLong ownAcquires = new AtomicLong(0);
         public final AtomicLong ownBlockingAcquires = new AtomicLong(0);
         public final AtomicLong borrowedAcquires = new AtomicLong(0);
-        public long totalBorrowed() { return borrowedAcquires.get(); }
         public double borrowRate() {
             long own = ownAcquires.get();
             long blocking = ownBlockingAcquires.get();

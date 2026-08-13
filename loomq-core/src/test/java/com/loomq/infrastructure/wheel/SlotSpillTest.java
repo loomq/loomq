@@ -50,7 +50,7 @@ class SlotSpillTest {
             assertEquals("intent_sp1_000003", s.readSlot(locC).getIntentId());
             assertEquals(1L, s.getSpillCounts().get(WheelTier.SEC), "SEC 溢出计数 +1");
             List<Intent> found = new ArrayList<>();
-            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            s.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found.add(e.intent()));
             assertEquals(3, found.size(), "scanFrom 全可见（含 spill 落点）");
         }
     }
@@ -136,7 +136,7 @@ class SlotSpillTest {
         }
         try (WheelStore s2 = new WheelStore(cfg(dir, 2), clock::get)) {
             List<Intent> found = new ArrayList<>();
-            s2.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            s2.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found.add(e.intent()));
             assertEquals(3, found.size(), "spill 槽重启后可恢复（含部分占用的 MIN 桶）");
             assertTrue(found.stream().anyMatch(i -> "intent_rst0000003".equals(i.getIntentId())));
         }
@@ -166,7 +166,7 @@ class SlotSpillTest {
             }
             assertEquals(workers, seen.size(), "并发 spill 后槽位互异，无重复分发");
             List<Intent> found = new ArrayList<>();
-            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            s.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found.add(e.intent()));
             assertEquals(workers, found.size(), "并发 spill 后全部可扫描");
         }
     }
@@ -181,7 +181,7 @@ class SlotSpillTest {
             assertEquals(0L, s.getSpillCounts().getOrDefault(WheelTier.SEC, 0L),
                 "payload 溢出不得计入桶溢出 spill 计数");
             List<Intent> found = new ArrayList<>();
-            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            s.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found.add(e.intent()));
             assertEquals(0, found.size(), "payload 溢出 intent 不落盘");
             // 保留槽已回滚：下一个同秒正常 put 仍落 SEC（未被烧毁导致误 spill 降级）
             SlotLocation loc = s.put(intent("intent_plo0000002", clock, clock.get() + 5_000));
@@ -189,7 +189,7 @@ class SlotSpillTest {
             assertEquals(0L, s.getSpillCounts().getOrDefault(WheelTier.SEC, 0L),
                 "SEC spill 计数全程为 0（回滚后同秒 put 未误 spill）");
             List<Intent> found2 = new ArrayList<>();
-            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found2::add);
+            s.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found2.add(e.intent()));
             assertEquals(1, found2.size(), "只有后一个正常 intent 落盘");
         }
     }

@@ -2,8 +2,6 @@ package com.loomq.store;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
@@ -100,44 +98,6 @@ public class IdempotencyRecord {
      */
     public boolean isTerminal() {
         return status != null && status.isTerminal();
-    }
-
-    /**
-     * 序列化为字节数组（RocksDB 存储用）。
-     * 格式：idempotencyKeyLen(2B) + key + intentIdLen(2B) + id + createdAt(8B) + windowExpiry(8B)
-     */
-    public byte[] toBytes() {
-        byte[] keyBytes = idempotencyKey.getBytes(StandardCharsets.UTF_8);
-        byte[] idBytes = intentId.getBytes(StandardCharsets.UTF_8);
-        ByteBuffer buf = ByteBuffer.allocate(2 + keyBytes.length + 2 + idBytes.length + 8 + 8);
-        buf.putShort((short) keyBytes.length);
-        buf.put(keyBytes);
-        buf.putShort((short) idBytes.length);
-        buf.put(idBytes);
-        buf.putLong(createdAt.toEpochMilli());
-        buf.putLong(windowExpiry.toEpochMilli());
-        return buf.array();
-    }
-
-    /**
-     * 从字节数组反序列化。
-     */
-    public static IdempotencyRecord fromBytes(byte[] data) {
-        ByteBuffer buf = ByteBuffer.wrap(data);
-        short keyLen = buf.getShort();
-        byte[] keyBytes = new byte[keyLen];
-        buf.get(keyBytes);
-        String key = new String(keyBytes, StandardCharsets.UTF_8);
-
-        short idLen = buf.getShort();
-        byte[] idBytes = new byte[idLen];
-        buf.get(idBytes);
-        String intentId = new String(idBytes, StandardCharsets.UTF_8);
-
-        Instant createdAt = Instant.ofEpochMilli(buf.getLong());
-        Instant windowExpiry = Instant.ofEpochMilli(buf.getLong());
-
-        return new IdempotencyRecord(key, intentId, createdAt, windowExpiry, null);
     }
 
     // ========== Getters ==========

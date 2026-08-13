@@ -5,7 +5,4 @@ import java.util.Set;
 
 public record WheelRecoveryReport(int hotRestored, int coldRegistered, Set<String> multiSlotIntentIds,
                                   Map<String, Long> maxRevisions) {
-    public WheelRecoveryReport(int hotRestored, int coldRegistered, Set<String> multiSlotIntentIds) {
-        this(hotRestored, coldRegistered, multiSlotIntentIds, Map.of());
-    }
 }

@@ -60,7 +60,7 @@ class WheelStoreTest {
                 s.put(it);
             }
             List<Intent> found = new ArrayList<>();
-            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            s.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found.add(e.intent()));
             assertEquals(3, found.size());
         }
     }
@@ -103,10 +103,10 @@ class WheelStoreTest {
             d.transitionTo(IntentStatus.SCHEDULED);
             s2.put(d);
 
-            // scanFrom must return all 4 (3 original + 1 new), none overwritten
-            var iter = s2.scanFrom(Instant.ofEpochMilli(clock.get()));
+            // scanSlotsFrom must return all 4 (3 original + 1 new), none overwritten
+            var iter = s2.scanSlotsFrom(Instant.ofEpochMilli(clock.get()));
             java.util.Set<String> ids = new java.util.HashSet<>();
-            while (iter.hasNext()) ids.add(iter.next().getIntentId());
+            while (iter.hasNext()) ids.add(iter.next().intent().getIntentId());
             assertTrue(ids.contains(id1), "id1 must survive restart");
             assertTrue(ids.contains(id2), "id2 must survive restart");
             assertTrue(ids.contains(id3), "id3 must survive restart");

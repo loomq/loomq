@@ -55,10 +55,6 @@ public final class CohortManager {
      */
     private final AtomicLong generation = new AtomicLong();
 
-    // Observability counters (CSA impact measurement)
-    private final AtomicLong totalRegistered = new AtomicLong(0);
-    private final AtomicLong totalFlushed = new AtomicLong(0);
-    private final AtomicLong wakeEventCount = new AtomicLong(0);
     /** wakeLoop 异常计数（诊断：park 时长溢出等会让 wakeLoop 每 100ms 报错空转）。 */
     private final AtomicLong wakeLoopErrors = new AtomicLong(0);
 
@@ -124,7 +120,6 @@ public final class CohortManager {
         cohorts.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>())
                .addLast(intent);
         intentIdToCohortKey.put(intent.getIntentId(), key);
-        totalRegistered.incrementAndGet();
         // Signal: a new cohort may be earlier than the current sleep target
         LockSupport.unpark(wakeThread);
     }
@@ -189,9 +184,6 @@ public final class CohortManager {
         return first != null ? first.getPrecisionTier().name() : "UNKNOWN";
     }
 
-    public long getTotalRegistered() { return totalRegistered.get(); }
-    public long getTotalFlushed()    { return totalFlushed.get(); }
-    public long getWakeEventCount()  { return wakeEventCount.get(); }
 
     private long cohortKey(Intent intent) {
         long precisionWindowMs = catalog.precisionWindowMs(intent.getPrecisionTier());
@@ -247,8 +239,6 @@ public final class CohortManager {
                     validIntents.add(intent);
                 }
                 if (!validIntents.isEmpty()) {
-                    totalFlushed.addAndGet(validIntents.size());
-                    wakeEventCount.incrementAndGet();
                     long flushStartNanos = System.nanoTime();
                     bucketGroupManager.addAll(validIntents);
                     if (scanTrigger != null) {

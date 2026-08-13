@@ -160,7 +160,7 @@ class SlotCompactionTest {
             assertNotEquals(2, e.slotIndex(), "第 5 个不得落在已被 freeList 发过的槽 2");
             assertNotEquals(3, e.slotIndex(), "第 5 个不得落在已被 freeList 发过的槽 3");
             java.util.Set<String> ids = new java.util.HashSet<>();
-            s2.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(i -> ids.add(i.getIntentId()));
+            s2.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(se -> ids.add(se.intent().getIntentId()));
             assertEquals(5, ids.size(), "重启后 5 个 intent 互异无覆写");
             assertTrue(ids.containsAll(java.util.List.of(
                 "intent_rbd00000001", "intent_rbd00000002", "intent_rbd00000003", "intent_rbd00000004", "intent_rbd00000005")));

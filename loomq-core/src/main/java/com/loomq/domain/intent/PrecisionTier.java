@@ -77,13 +77,6 @@ public enum PrecisionTier {
     }
 
     /**
-     * JSON 序列化值
-     */
-    public String toJson() {
-        return name();
-    }
-
-    /**
      * JSON 反序列化
      * 不区分大小写，未知值返回目录默认档位
      *

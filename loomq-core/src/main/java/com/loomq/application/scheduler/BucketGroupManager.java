@@ -168,17 +168,6 @@ public class BucketGroupManager {
     }
 
     /**
-     * 获取总等待任务数
-     *
-     * @return 总任务数
-     */
-    public int getTotalPendingCount() {
-        return bucketGroups.values().stream()
-            .mapToInt(BucketGroup::getPendingCount)
-            .sum();
-    }
-
-    /**
      * 清空所有桶
      */
     public void clear() {

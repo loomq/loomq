@@ -27,13 +27,6 @@ public final class IntentTraceStore {
     }
 
     /**
-     * Record intent creation (用当前时刻作 createdAt)。
-     */
-    public void recordCreated(String intentId, String traceId, PrecisionTier tier) {
-        recordCreated(intentId, traceId, tier, System.currentTimeMillis());
-    }
-
-    /**
      * Record intent creation with the intent's own createdAt.
      *
      * <p>R21: 同 id 重建(R8 支持路径)是新 incarnation——调度器据此比较 trace 的
@@ -101,27 +94,6 @@ public final class IntentTraceStore {
      */
     public IntentTrace get(String intentId) {
         return traces.get(intentId);
-    }
-
-    /**
-     * Check if trace exists.
-     */
-    public boolean contains(String intentId) {
-        return traces.containsKey(intentId);
-    }
-
-    /**
-     * Remove trace by intent ID (for test cleanup).
-     */
-    public void remove(String intentId) {
-        traces.remove(intentId);
-    }
-
-    /**
-     * Get current size.
-     */
-    public int size() {
-        return traces.size();
     }
 
     private void put(String intentId, IntentTrace trace) {

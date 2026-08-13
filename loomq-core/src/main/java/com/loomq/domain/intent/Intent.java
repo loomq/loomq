@@ -386,13 +386,6 @@ public class Intent {
     }
 
     /**
-     * 检查是否可以执行
-     */
-    public boolean isExecutable() {
-        return status == IntentStatus.DUE && !isExpired();
-    }
-
-    /**
      * 增加尝试次数
      */
     public void incrementAttempts() {
