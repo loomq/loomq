@@ -44,8 +44,13 @@ public final class CohortManager {
     private final Consumer<Collection<Intent>> scanTrigger;
     private final MetricsCollector metrics;
 
-    /** 非 final：stop() 后 start() 需重建（Java 线程不可重启）。 */
-    private Thread wakeThread;
+    /**
+     * 非 final：stop() 后 start() 需重建（Java 线程不可重启）。
+     * volatile:register()/stop() 跨线程读——stop/start 重建后,并发 register 若读到
+     * 旧(已死)线程引用会把 unpark 投给死线程,新 wakeLoop 在空表上 park 时该次注册的
+     * cohort 唤醒信号永久丢失(延迟到下一次注册才自愈)。
+     */
+    private volatile Thread wakeThread;
     private final AtomicBoolean running;
 
     /**

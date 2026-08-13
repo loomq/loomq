@@ -253,8 +253,7 @@ public class PrecisionScheduler {
                               IntentTraceStore traceStore) {
         this.intentStore = intentStore;
         this.deliveryHandler = Objects.requireNonNull(deliveryHandler, "deliveryHandler must not be null");
-        this.metrics = metricsCollector;
-        this.traceStore = traceStore;
+        this.metrics = metricsCollector;        this.traceStore = traceStore;
         this.precisionTierCatalog = precisionTierCatalog != null
             ? precisionTierCatalog
             : PrecisionTierCatalog.defaultCatalog();
@@ -292,10 +291,6 @@ public class PrecisionScheduler {
             expiredCheckCounters.put(tier, new AtomicLong(0));
             tierInFlight.put(tier, new AtomicInteger(0));
         }
-
-        if (this.deliveryHandler == null) {
-            logger.warn("No DeliveryHandler configured - intents will not be delivered!");
-        }
     }
 
     /**
@@ -310,6 +305,9 @@ public class PrecisionScheduler {
             sharedExecutor = Executors.newVirtualThreadPerTaskExecutor();
         }
         running = true;
+        // 重启 = 全新服务:暂停态不跨重启延续(否则 pause→stop→start 后静默不投递,
+        // 直到显式 resume——运维无法从日志得知调度器处于暂停)。
+        paused = false;
 
         logger.info("PrecisionScheduler starting...");
 
@@ -637,6 +635,12 @@ public class PrecisionScheduler {
                 indexIntent(intent);
 
                 Instant executeAt = intent.getExecuteAt();
+                if (executeAt == null) {
+                    // R16 同旨防御:null executeAt 会污染调度器(locate NPE、过期索引
+                    // 语义丢失)。create 入口由 IntentValidator 拦截,此处兜底直连 API 调用。
+                    throw new IllegalArgumentException(
+                        "executeAt must not be null when scheduling intent " + intent.getIntentId());
+                }
                 Instant now = Instant.now();
                 long delayMs = Duration.between(now, executeAt).toMillis();
 
@@ -1345,13 +1349,12 @@ public class PrecisionScheduler {
     private void scheduleRetryOrHonorReschedule(Intent intent, PrecisionTier tier, long oldExecuteAtMs) {
         // R19: 在途改期尊重——updateIntent(newExecuteAt) 在投递期间会把共享活对象的
         // executeAt 改为用户新值并 DURABLE 持久化(claimed 后 removeFromSchedule 返回
-        // false 不重排程;契约是"更新在重试路径确定生效")。若 executeAt 显著晚于当前
-        // (超过一档精度窗口,覆盖桶粒度 ≤window 的前沿偏差——未被改期的在途 Intent
-        // 不可能超出该偏差),说明用户已改期:按新时间重排程,而非用 backoff 覆写——
-        // 否则改期被静默丢弃,Intent 在数秒内被重投,与用户意图相悖。
+        // false 不重排程;契约是"更新在重试路径确定生效")。判据:任何"将来时刻"都必是
+        // 用户改期——未被改期的在途 Intent 的 executeAt 恒 ≤ now(scanDue 只摘到期条目),
+        // 无需精度窗口裕量;窗口只会制造死区:改期到 (now, now+window] 的 Intent 被
+        // backoff 覆写(持久性丢失,重启按 max-revision 取 backoff 时刻)。
         Instant now = Instant.now();
-        long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
-        if (intent.getExecuteAt().isAfter(now.plusMillis(precisionWindowMs))) {
+        if (intent.getExecuteAt().isAfter(now)) {
             intent.transitionTo(IntentStatus.SCHEDULED);
             intentStore.update(intent);
             // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,

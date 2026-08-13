@@ -48,6 +48,21 @@ class PrecisionSchedulerTest {
         }
     }
 
+    // ========== Lifecycle ==========
+
+    @Test
+    void pauseMustNotSurviveRestart() {
+        DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
+        scheduler = new PrecisionScheduler(intentStore, handler, null);
+        scheduler.start();
+        scheduler.pause();
+        assertTrue(scheduler.isPaused(), "precondition: paused");
+        scheduler.stop();
+        scheduler.start();
+        assertFalse(scheduler.isPaused(),
+            "start() must reset paused — restart means fresh service, not silent suspension");
+    }
+
     // ========== Construction ==========
 
     @Test
@@ -642,11 +657,14 @@ class PrecisionSchedulerTest {
         scheduler = new PrecisionScheduler(intentStore, handler, null);
 
         Intent intent = new Intent("test-null-ex");
-        // executeAt is null — schedule() will compute Duration.between(now, null) → NPE
+        // executeAt is null — schedule() must reject with a clear contract error (create 入口
+        // 由 IntentValidator 拦截,此处兜底直连 API 调用——不再裸 NPE 无上下文)。
         intent.transitionTo(IntentStatus.SCHEDULED);
         intentStore.save(intent);
-        // NPE is the expected failure mode for missing executeAt
-        assertThrows(NullPointerException.class, () -> scheduler.schedule(intent));
+        IllegalArgumentException ex =
+            assertThrows(IllegalArgumentException.class, () -> scheduler.schedule(intent));
+        assertTrue(ex.getMessage().contains("executeAt must not be null"),
+            "rejection must name the violated contract, was: " + ex.getMessage());
     }
 
     // ========== Phase 7.2: Backpressure Observable ==========
