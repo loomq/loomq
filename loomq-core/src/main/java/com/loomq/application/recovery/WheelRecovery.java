@@ -123,6 +123,10 @@ public final class WheelRecovery {
                 try {
                     intent.transitionTo(terminal);
                     intent.incrementRevision();
+                    // R10: 终态化 +1 后同步推进 maxRevisions——否则报告仍记旧 revision,
+                    // 同进程重建会种子到与终态墓碑平票的 revision,重启去重(严格 >,平票
+                    // 先扫到者胜)被过去时刻的终态槽遮蔽。
+                    maxRevisions.put(id, intent.getRevision());
                     // 终态原地覆写,不分配新槽:原实现 store.put 会为过期 executeAt 分配新槽,
                     // 旧 SCHEDULED 槽残留(stale 兄弟),同 id 槽数恒为 2 → 终态槽因 count>1
                     // 永不回收,只能等桶文件过期(31 天)被 BucketReclaimer 删除;tail 来源的
