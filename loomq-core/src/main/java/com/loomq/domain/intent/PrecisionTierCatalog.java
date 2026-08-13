@@ -90,16 +90,25 @@ public final class PrecisionTierCatalog {
     public int maxBuckets(PrecisionTier tier) { return profile(tier).maxBuckets(); }
 
     /**
-     * 按 ordinal 位置解码精度档位(仅存活档 0..3)。越界回退默认档。
+     * 按枚举 ordinal 解码精度档位(持久化格式写入 {@code tier.ordinal()})。越界或该档不在
+     * 本目录内则回退默认档。
+     *
+     * <p><b>R13 修正</b>:旧实现用 {@code supportedTiers.get(ordinal)} 按"列表下标"取档,与
+     * "枚举 ordinal"混淆——当自定义目录为枚举的非连续子集(如仅 {ULTRA, MILLI})时,
+     * ordinal 1 被错读成列表第 1 项(MILLI)而非 FAST、ordinal 3(MILLI)被误判越界回退。
+     * 改为 {@code PrecisionTier.values()[ordinal]} 直接映射枚举 ordinal,再校验是否受支持。</p>
+     *
      * 【边界】此处不应用 PrecisionTier.LEGACY_REMAPS:新格式 ordinal 2 是 STANDARD,旧 HIGH
      * 也是 ordinal 2(碰撞),重映射会窜改合法新数据。remap 仅对 fromString 的 runtime/config
      * 输入生效;旧 wheel 数据按 v0.9.x ordinal 断裂契约清库,不做兼容读取。
      */
     public PrecisionTier tierByOrdinal(int ordinal) {
-        if (ordinal < 0 || ordinal >= supportedTiers.size()) {
+        PrecisionTier[] all = PrecisionTier.values();
+        if (ordinal < 0 || ordinal >= all.length) {
             return defaultTier;
         }
-        return supportedTiers.get(ordinal);
+        PrecisionTier tier = all[ordinal];
+        return profiles.containsKey(tier) ? tier : defaultTier;
     }
 
     public List<PrecisionTier> supportedTiers() {

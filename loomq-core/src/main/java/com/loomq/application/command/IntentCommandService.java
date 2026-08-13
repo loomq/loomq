@@ -306,6 +306,7 @@ public final class IntentCommandService {
         int written = 0;
         long[] oldRevisions = new long[intents.size()];
         IntentStatus[] oldStatuses = new IntentStatus[intents.size()];
+        java.time.Instant[] oldUpdatedAts = new java.time.Instant[intents.size()];
 
         try {
             for (int i = 0; i < intents.size(); i++) {
@@ -317,6 +318,7 @@ public final class IntentCommandService {
                 }
                 oldStatuses[i] = intent.getStatus();
                 oldRevisions[i] = intent.getRevision();
+                oldUpdatedAts[i] = intent.getUpdatedAt();
                 intent.transitionTo(IntentStatus.SCHEDULED);
                 // R8: 同 createIntent——重建同 intentId 时种子 revision 到历史最高值之上,
                 // 否则 recovery max-revision 去重会遮蔽新 Intent。
@@ -339,7 +341,10 @@ public final class IntentCommandService {
             }
             for (int i = written; i < intents.size(); i++) {
                 Intent intent = intents.get(i);
-                intent.rollbackStatus(oldStatuses[i], intent.getUpdatedAt(), oldRevisions[i]);
+                // R14: 回滚 updatedAt 须用原始值,而非变异后的 intent.getUpdatedAt()——
+                // 否则非持久化 intent 回滚后 updatedAt 残留 transitionTo/incrementRevision
+                // 的时间戳,与已还原的 status/revision 不一致。
+                intent.rollbackStatus(oldStatuses[i], oldUpdatedAts[i], oldRevisions[i]);
             }
             throw new RuntimeException("Batch createIntent persistence failed; " + written + " intents compensated", e);
         }
@@ -866,6 +871,10 @@ public final class IntentCommandService {
             locationIndex.remove(intentId);            // 先清索引，再回收槽（对齐热取消顺序）
             if (pr != null && pr.singleSlot() && !pr.loc().inTail()) {
                 wheelStore.freeSlot(pr.loc());
+                // R15: 单槽终态被释放后磁盘上不再有该 intentId 的竞争槽,可安全移除历史
+                // revision 映射——否则 maxRevisions 按 distinct intentId 无界累积(内存泄漏)。
+                // 多槽墓碑仍保留(其槽参与 max-revision 去重),映射须随之保留。
+                maxRevisions.remove(intentId);
                 logger.debug("Reclaimed terminal slot {} for intent {}", pr.loc(), intentId);
             }
         } catch (Exception e) {

@@ -6,6 +6,7 @@ import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.spi.DefaultRedeliveryDecider;
+import com.loomq.spi.DeliveryContext;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
@@ -163,7 +164,32 @@ public class PrecisionScheduler {
         } else {
             logger.error("Delivery exception for intent {}: {}", intent.getIntentId(), ex.getMessage(), ex);
         }
-        handleDeliveryFailure(intent);
+        // R12: RedeliveryDecider 实际参与重投决策——decider 判定不可重投(永久失败,如业务
+        // 4xx/非法请求)→ 直接终态 DEAD_LETTERED,不再按 maxAttempts 反复重试;可重投 →
+        // 走既有重试链(attempts >= maxAttempts 终态)。decider 默认(DefaultRedeliveryDecider)
+        // 对异常恒可重投,行为与修复前一致。
+        handleDeliveryFailure(intent, !shouldRedeliver(intent, ex));
+    }
+
+    /**
+     * 用 RedeliveryDecider 判定异常是否值得重投。
+     *
+     * <p>decider 抛异常时保守按"可重投"处理(与无 decider 的既有行为一致),不因用户 SPI
+     * 异常阻断调度链。deliveryId 用 lastDeliveryId(缺省回退 intentId)仅作上下文标识。</p>
+     */
+    private boolean shouldRedeliver(Intent intent, Throwable ex) {
+        DeliveryContext ctx = new DeliveryContext(
+            intent.getLastDeliveryId() != null ? intent.getLastDeliveryId() : intent.getIntentId(),
+            intent.getIntentId(),
+            intent.getAttempts());
+        ctx.markFailure(ex);
+        try {
+            return redeliveryDecider.shouldRedeliver(ctx);
+        } catch (Exception deciderEx) {
+            logger.error("RedeliveryDecider threw for intent {}; defaulting to redeliver",
+                intent.getIntentId(), deciderEx);
+            return true;
+        }
     }
 
     // Permit timing diagnostics
@@ -1039,6 +1065,20 @@ public class PrecisionScheduler {
                 queue.drainTo(batch, batchSize - batch.size());
             }
 
+            // R15: 批量窗口——未满批次等待至多 batchWindowMs 累计更多 intent,提升批量吞吐
+            // (契合 batchSize>1 档的聚合语义)。用 parkNanos(可被 offer→unpark 立即唤醒)而非
+            // poll(timeout)(后者阻塞在 Condition,unpark 无法唤醒,破坏事件驱动快速路径)。
+            // 已满批(batch.size()==batchSize)或单发档(batchWindowMs<=0)跳过,零额外延迟。
+            if (batch.size() < batchSize && batchWindowMs > 0) {
+                long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(batchWindowMs);
+                while (batch.size() < batchSize) {
+                    long remainingNs = deadlineNs - System.nanoTime();
+                    if (remainingNs <= 0) break;
+                    LockSupport.parkNanos(remainingNs);
+                    queue.drainTo(batch, batchSize - batch.size());
+                }
+            }
+
             // I5: 派发即快照--在 synchronized(intent) 内原子完成终态复查 + 防御性拷贝。
             // 构建 liveBatch（结算用活对象）和 snapshotBatch（SPI 用快照）并行列表。
             // 许可获取在 synchronized(intent) 终态复查 + copy 之后，
@@ -1657,9 +1697,11 @@ public class PrecisionScheduler {
     /**
      * 处理投递失败
      *
+     * @param permanent true 表示 RedeliveryDecider 判定不可重投(永久失败),直接终态,
+     *                  不再按 maxAttempts 反复重试
      * @implNote 维护 I2/I3：死信终态落盘；重试路径 persistStateChange 递增 revision。
      */
-    private void handleDeliveryFailure(Intent intent) {
+    private void handleDeliveryFailure(Intent intent, boolean permanent) {
         // I5: collect-then-defer -- 锁内取快照 + 收集 deferred action，锁外派发
         java.util.function.Consumer<IntentObserver> deferredNotify = null;
         boolean needReschedule = false;
@@ -1684,7 +1726,7 @@ public class PrecisionScheduler {
             intent.transitionTo(IntentStatus.DISPATCHING);
             intent.incrementAttempts();
 
-            if (intent.getAttempts() >= maxAttempts) {
+            if (permanent || intent.getAttempts() >= maxAttempts) {
                 intent.transitionTo(IntentStatus.DEAD_LETTERED);
                 intentStore.update(intent);
                 persistTerminal(intent);              // 终态原地覆写（不追加）
