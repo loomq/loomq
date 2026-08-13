@@ -7,6 +7,7 @@ import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.spi.DeliveryHandler;
+import com.loomq.testutil.TestEngines;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -38,7 +39,7 @@ class TerminalStateCrashRecoveryTest {
             engine.createIntent(intent, AckMode.DURABLE).get();
 
             // Wait for delivery to reach terminal state
-            awaitTerminal(engine, intentId, Duration.ofSeconds(10));
+            TestEngines.awaitTerminal(engine, intentId, Duration.ofSeconds(10));
             Optional<Intent> live = engine.getIntent(intentId);
             assertTrue(live.isPresent());
             assertEquals(IntentStatus.ACKED, live.get().getStatus(),
@@ -74,7 +75,7 @@ class TerminalStateCrashRecoveryTest {
             intent.setPrecisionTier(PrecisionTier.STANDARD);
             engine.createIntent(intent, AckMode.DURABLE).get();
 
-            awaitTerminal(engine, intentId, Duration.ofSeconds(10));
+            TestEngines.awaitTerminal(engine, intentId, Duration.ofSeconds(10));
             Optional<Intent> live = engine.getIntent(intentId);
             assertTrue(live.isPresent());
             assertEquals(IntentStatus.DEAD_LETTERED, live.get().getStatus(),
@@ -107,7 +108,7 @@ class TerminalStateCrashRecoveryTest {
         intent.setPrecisionTier(PrecisionTier.STANDARD);
         engine.createIntent(intent, AckMode.DURABLE).get();
 
-        awaitTerminal(engine, intentId, Duration.ofSeconds(10));
+        TestEngines.awaitTerminal(engine, intentId, Duration.ofSeconds(10));
         Optional<Intent> live = engine.getIntent(intentId);
         assertTrue(live.isPresent());
         assertEquals(IntentStatus.ACKED, live.get().getStatus(),
@@ -134,16 +135,4 @@ class TerminalStateCrashRecoveryTest {
         }
     }
 
-    private void awaitTerminal(LoomqEngine engine, String intentId, Duration timeout)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            Optional<Intent> opt = engine.getIntent(intentId);
-            if (opt.isPresent() && opt.get().getStatus().isTerminal()) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        fail("Intent " + intentId + " did not reach terminal state within " + timeout);
-    }
 }

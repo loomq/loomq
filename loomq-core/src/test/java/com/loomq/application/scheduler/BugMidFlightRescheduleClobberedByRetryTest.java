@@ -15,6 +15,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.Test;
  * ≤window 的前沿偏差——未被改期的在途 Intent 不可能超出该偏差）时，尊重用户改期，
  * 按新 executeAt 重排程而非套用 backoff。</p>
  */
+@Tag("slow")
 class BugMidFlightRescheduleClobberedByRetryTest {
 
     /** 固定 1s 无抖动退避：若无修复，失败后 ~1s 内就会重投，便于断言区分。 */

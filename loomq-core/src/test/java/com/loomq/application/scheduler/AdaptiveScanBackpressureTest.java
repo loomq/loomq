@@ -17,6 +17,7 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -27,6 +28,7 @@ import org.junit.jupiter.api.Test;
  * 的扫描次数有上界——修复前每 cycle 仅 2 次 1ms offer 重试 park（≈3ms/cycle），修复后
  * 每 cycle ≥ scanIntervalMs=10ms park（≈12.5ms/cycle），2.5s 窗口内 300 次上界可区分。</p>
  */
+@Tag("slow")
 class AdaptiveScanBackpressureTest {
 
     private PrecisionScheduler scheduler;

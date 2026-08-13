@@ -7,12 +7,12 @@ import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.spi.DeliveryHandler;
+import com.loomq.testutil.TestEngines;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -115,7 +115,7 @@ class UpdateContentDeterminismTest {
 
             // Wait for second delivery (redelivery) + terminal state
             awaitCalls(handler, 2, Duration.ofSeconds(15));
-            awaitTerminal(engine, id, Duration.ofSeconds(10));
+            TestEngines.awaitTerminal(engine, id, Duration.ofSeconds(10));
 
             // Assertions
             assertEquals(2, handler.calls.get(),
@@ -143,16 +143,4 @@ class UpdateContentDeterminismTest {
             "expected " + expected + " deliveries within " + timeout);
     }
 
-    private void awaitTerminal(LoomqEngine engine, String id, Duration timeout)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            Optional<Intent> cur = engine.getIntent(id);
-            if (cur.isPresent() && cur.get().getStatus().isTerminal()) {
-                return;
-            }
-            Thread.sleep(20);
-        }
-        throw new AssertionError("intent " + id + " did not reach terminal within " + timeout);
-    }
 }
