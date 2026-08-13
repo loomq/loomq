@@ -87,11 +87,16 @@ public final class IntentCommandService {
     public record PendingReclaim(SlotLocation loc, boolean singleSlot) {}
 
     /**
-     * 磁盘历史最高 revision(恢复期由 WheelRecovery 注入)。createIntent 重建同 intentId 时
-     * 需把新 Intent 的 revision 种子到历史最高值之上——否则新 Intent 从 0 起步,recovery 按
+     * intentId → 磁盘历史最高 revision 的活映射。createIntent 重建同 intentId 时需把新
+     * Intent 的 revision 种子到历史最高值之上——否则新 Intent 从 0 起步,recovery 按
      * max revision 去重会被旧终态墓碑(更高 revision,multiSlot 保留)遮蔽,新 Intent 静默丢失。
+     *
+     * <p>来源有二:(1) 恢复期由 WheelRecovery 注入({@link #markMaxRevisions});(2) 本进程
+     * 内每次持久化写(append/原地覆写)后 merge 当前 revision——覆盖"同进程内 create→cancel→
+     * 重建同 id→重启"的路径,此时重建前无恢复注入,须靠写路径持续维护。</p>
      */
-    private volatile java.util.Map<String, Long> recoveredMaxRevisions = java.util.Map.of();
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> maxRevisions =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     public IntentCommandService(
         IntentStore intentStore,
@@ -177,7 +182,7 @@ public final class IntentCommandService {
             // R8: 重建同 intentId 时种子 revision 到磁盘历史最高值之上——否则新 Intent 从 0
             // 起步,recovery 按 max revision 去重会被旧终态墓碑(更高 revision,multiSlot 保留)
             // 遮蔽,新 Intent 静默丢失。种子后 incrementRevision 使新槽 revision 严格大于历史最高。
-            Long histMax = recoveredMaxRevisions.get(intent.getIntentId());
+            Long histMax = maxRevisions.get(intent.getIntentId());
             if (histMax != null && histMax >= intent.getRevision()) {
                 intent.setRevision(histMax);
             }
@@ -315,7 +320,7 @@ public final class IntentCommandService {
                 intent.transitionTo(IntentStatus.SCHEDULED);
                 // R8: 同 createIntent——重建同 intentId 时种子 revision 到历史最高值之上,
                 // 否则 recovery max-revision 去重会遮蔽新 Intent。
-                Long histMax = recoveredMaxRevisions.get(intent.getIntentId());
+                Long histMax = maxRevisions.get(intent.getIntentId());
                 if (histMax != null && histMax >= intent.getRevision()) {
                     intent.setRevision(histMax);
                 }
@@ -652,6 +657,7 @@ public final class IntentCommandService {
                     // 读到新槽也是 CANCELED(terminal)→ 跳过。两路均杜绝复活。
                     SlotLocation canceledLoc = wheelStore.put(cold);
                     locationIndex.put(intentId, canceledLoc);
+                    trackMaxRevision(cold);      // R9: 冷取消墓碑同样推进历史最高 revision
                     commitBarrier.awaitCommit();            // cancel 恒 DURABLE
                 } finally {
                     // 只移除自己放入的锁对象,避免误删后到者的锁(computeIfPresent + identity)。
@@ -800,6 +806,7 @@ public final class IntentCommandService {
             multiSlotIntents.add(id);          // 2nd+ 写入 → 多槽（重排程/改期/取消）
         }
         locationIndex.put(id, loc);
+        trackMaxRevision(intent);              // R9: 维持活映射,同进程重建时种子 revision
         if (durable) {
             commitBarrier.awaitCommit();
         }
@@ -828,6 +835,7 @@ public final class IntentCommandService {
             return;
         }
         wheelStore.overwriteSlot(loc, SlotCodec.encode(intent));
+        trackMaxRevision(intent);              // R9: 终态原地覆写同样推进历史最高 revision
         pendingReclaims.put(id, new PendingReclaim(loc, !multiSlotIntents.contains(id)));
     }
 
@@ -858,7 +866,12 @@ public final class IntentCommandService {
 
     /** 恢复期由 WheelRecovery 注入:intentId → 磁盘历史最高 revision(含终态墓碑与跨视界 tail)。 */
     public void markMaxRevisions(java.util.Map<String, Long> revisions) {
-        this.recoveredMaxRevisions = java.util.Map.copyOf(revisions);
+        revisions.forEach((id, rev) -> maxRevisions.merge(id, rev, Math::max));
+    }
+
+    /** 记录某 intentId 的最新持久化 revision(写路径调用,维持活映射)。 */
+    private void trackMaxRevision(Intent intent) {
+        maxRevisions.merge(intent.getIntentId(), intent.getRevision(), Math::max);
     }
 
     /**
