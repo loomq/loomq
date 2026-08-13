@@ -74,13 +74,11 @@ public final class WheelRecovery {
         var tailIt = tail.scanFrom(0);
         while (tailIt.hasNext()) {
             TailEntry te = tailIt.next();
-            Intent intent;
-            try {
-                // P1-6: tail 条目无 isTorn 预检(wheel 槽有)。一条 CRC 损坏即让 decode 抛异常
-                // 中断 recover、引擎起不来。防御性解码,损坏条目跳过并告警。
-                intent = SlotCodec.decode(te.encodedSlot());
-            } catch (RuntimeException dex) {
-                log.warn("Recovery: skipping corrupt tail entry (decode failed)", dex);
+            // P1-6: tail 条目无 isTorn 预检(wheel 槽有)。一条 CRC 损坏即让 decode 抛异常
+            // 中断 recover、引擎起不来。防御性解码,损坏条目跳过并告警。
+            Intent intent = SlotCodec.decodeSafe(te.encodedSlot());
+            if (intent == null) {
+                log.warn("Recovery: skipping corrupt tail entry (decode failed)");
                 continue;
             }
             slotCounts.merge(intent.getIntentId(), 1, Integer::sum);

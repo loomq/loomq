@@ -19,7 +19,6 @@ import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
-import com.loomq.tracing.IntentTrace;
 import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -104,43 +103,47 @@ public final class IntentCommandService {
     private final java.util.concurrent.ConcurrentHashMap<String, Long> maxRevisions =
         new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * PHTW 持久化栈(构造器归并组 1):时间轮/尾部/组提交/索引/提升 daemon。
+     * 与 LoomqEngine 的字段组同构,新增依赖不再动 17 实参组装点。
+     */
+    public record PhtwStack(WheelStore wheelStore, TailIndex tailIndex, GroupCommitBarrier commitBarrier,
+                            IntentLocationIndex locationIndex, PromotionDaemon promotionDaemon) {}
+
+    /** 配置组(构造器归并组 2):默认档/组提交间隔/热边界/档位目录。 */
+    public record CommandConfig(PrecisionTier defaultTier, long groupCommitIntervalMs, long hotBoundaryMs,
+                                PrecisionTierCatalog precisionTierCatalog) {}
+
     public IntentCommandService(
         IntentStore intentStore,
         PrecisionScheduler scheduler,
-        WheelStore wheelStore,
-        TailIndex tailIndex,
-        GroupCommitBarrier commitBarrier,
-        IntentLocationIndex locationIndex,
-        PromotionDaemon promotionDaemon,
+        PhtwStack phtw,
         MetricsCollector metricsCollector,
         Executor callbackExecutor,
         AtomicBoolean running,
         AtomicLong sequenceNumber,
         CallbackHandler callbackHandler,
-        PrecisionTier defaultTier,
-        long groupCommitIntervalMs,
-        long hotBoundaryMs,
-        PrecisionTierCatalog precisionTierCatalog,
+        CommandConfig config,
         IntentTraceStore traceStore
     ) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
-        this.wheelStore = wheelStore;
-        this.tailIndex = tailIndex;
-        this.commitBarrier = commitBarrier;
-        this.locationIndex = locationIndex;
-        this.promotionDaemon = promotionDaemon;
+        this.wheelStore = phtw.wheelStore();
+        this.tailIndex = phtw.tailIndex();
+        this.commitBarrier = phtw.commitBarrier();
+        this.locationIndex = phtw.locationIndex();
+        this.promotionDaemon = phtw.promotionDaemon();
         this.metricsCollector = metricsCollector;
         this.callbackExecutor = callbackExecutor;
         this.running = running;
         this.sequenceNumber = sequenceNumber;
         this.callbackHandler = callbackHandler;
-        this.defaultTier = defaultTier;
-        this.groupCommitIntervalMs = groupCommitIntervalMs;
-        this.hotBoundaryMs = hotBoundaryMs;
+        this.defaultTier = config.defaultTier();
+        this.groupCommitIntervalMs = config.groupCommitIntervalMs();
+        this.hotBoundaryMs = config.hotBoundaryMs();
         // R21: 注入 catalog(自定义目录的 walMode 默认必须被尊重)与 traceStore
         // (冷 create/取消/fireNow 的 trace 生命周期归命令服务管)
-        this.precisionTierCatalog = precisionTierCatalog;
+        this.precisionTierCatalog = config.precisionTierCatalog();
         this.traceStore = traceStore;
     }
 
@@ -227,14 +230,11 @@ public final class IntentCommandService {
             } else {
                 promotionDaemon.register(intent.getIntentId(), loc, intent.getExecuteAt().toEpochMilli());
                 // R21: 冷 create 从未 schedule,补 trace 条目——否则冷 intent 排查无迹可循
-                // (recordCreated 幂等:同 incarnation 已存在则跳过)
+                // (recordCreatedIfNew 幂等:同 incarnation 已存在则跳过)
                 long createdAtMs = intent.getCreatedAt() != null
                     ? intent.getCreatedAt().toEpochMilli() : System.currentTimeMillis();
-                IntentTrace existing = traceStore.get(intent.getIntentId());
-                if (existing == null || existing.createdAtMs() != createdAtMs) {
-                    traceStore.recordCreated(intent.getIntentId(), intent.getTraceId(),
-                        intent.getPrecisionTier(), createdAtMs);
-                }
+                traceStore.recordCreatedIfNew(intent.getIntentId(), intent.getTraceId(),
+                    intent.getPrecisionTier(), createdAtMs);
             }
 
             metricsCollector.incrementIntentsCreated();
@@ -386,11 +386,8 @@ public final class IntentCommandService {
                     // R21: 冷 create 补 trace 条目(同 createIntent 单条路径)
                     long createdAtMs = intent.getCreatedAt() != null
                         ? intent.getCreatedAt().toEpochMilli() : System.currentTimeMillis();
-                    IntentTrace existing = traceStore.get(intent.getIntentId());
-                    if (existing == null || existing.createdAtMs() != createdAtMs) {
-                        traceStore.recordCreated(intent.getIntentId(), intent.getTraceId(),
-                            intent.getPrecisionTier(), createdAtMs);
-                    }
+                    traceStore.recordCreatedIfNew(intent.getIntentId(), intent.getTraceId(),
+                        intent.getPrecisionTier(), createdAtMs);
                 }
                 metricsCollector.incrementIntentsCreated();
                 // R21: intent_total 按 tier 统计创建数(同 createIntent 单条路径)
@@ -461,20 +458,11 @@ public final class IntentCommandService {
                     // P1-5: 只对可调度状态(SCHEDULED/DUE)执行 removeFromSchedule。
                     // DISPATCHING/DELIVERED 在途投递,removeFromSchedule 已执行而 schedule/restore
                     // 会拒收(只认 CREATED/SCHEDULED)→ Intent 从调度结构消失直到重启。
-                    IntentStatus st = intent.getStatus();
-                    if (st == IntentStatus.SCHEDULED || st == IntentStatus.DUE) {
-                        boolean wasScheduled = scheduler.removeFromSchedule(intent);
-                        if (!wasScheduled) {
-                            // 已被 scanDue CAS 认领，在途投递正在执行。
-                            // updater 的变更随后仍会持久化，但不重排--在途投递可能携带
-                            // 旧内容，更新仅在重试/崩溃恢复路径确定生效（见方法 javadoc）。
-                            logger.warn(CLAIMED_SKIP_WARN, intentId);
-                            reschedule = false;
-                        } else {
-                            removedForReschedule = true;
-                        }
-                    } else {
-                        logger.warn("Cannot reschedule intent {} in {} state; keeping original schedule", intentId, st);
+                    removedForReschedule =
+                        tryDetachForReschedule(intent, null,
+                            "Cannot reschedule intent {} in {} state; keeping original schedule")
+                            == DetachResult.DETACHED;
+                    if (!removedForReschedule) {
                         reschedule = false;
                     }
                 }
@@ -528,19 +516,13 @@ public final class IntentCommandService {
                 if (!reschedule) {
                     Instant actualExecuteAt = intent.getExecuteAt();
                     if (actualExecuteAt != null && !actualExecuteAt.equals(oldExecuteAt)) {
-                        IntentStatus st = intent.getStatus();
-                        if (st == IntentStatus.SCHEDULED || st == IntentStatus.DUE) {
-                            // 必须在 updater 已修改 executeAt 之后、重新调度之前,
-                            // 用旧的 executeAt 清理索引(removeFromSchedule 内部用的是当前 executeAt)
-                            boolean wasScheduled = scheduler.removeFromSchedule(intent, oldExecuteAt);
-                            if (wasScheduled) {
-                                reschedule = true;
-                                removedForReschedule = true;
-                            } else {
-                                logger.warn(CLAIMED_SKIP_WARN, intentId);
-                            }
-                        } else {
-                            logger.warn("Cannot reschedule intent {} in {} state after updater; keeping original", intentId, st);
+                        // 必须在 updater 已修改 executeAt 之后、重新调度之前,
+                        // 用旧的 executeAt 清理索引(removeFromSchedule 内部用的是当前 executeAt)
+                        if (tryDetachForReschedule(intent, oldExecuteAt,
+                                "Cannot reschedule intent {} in {} state after updater; keeping original")
+                            == DetachResult.DETACHED) {
+                            reschedule = true;
+                            removedForReschedule = true;
                         }
                     }
                 }
@@ -592,6 +574,39 @@ public final class IntentCommandService {
             }
             throw e;
         }
+    }
+
+    /** 重排程摘除结果(updateIntent 两分支共用)。 */
+    private enum DetachResult {
+        /** 已从调度结构摘除,可安全重排。 */
+        DETACHED,
+        /** 已被 scanDue CAS 认领,在途投递正在执行——变更仍持久化但不重排。 */
+        CLAIMED,
+        /** 状态不可调度(DISPATCHING/DELIVERED 等),保持原调度。 */
+        UNSUPPORTED
+    }
+
+    /**
+     * 重排程摘除收口:状态白名单校验 + removeFromSchedule(claimed 判别)+ 告警。
+     * 收敛 updateIntent 两处孪生分支(状态白名单→摘除→CLAIMED_SKIP_WARN 逻辑曾各自漂移)。
+     */
+    private DetachResult tryDetachForReschedule(Intent intent, Instant oldExecuteAt, String unsupportedWarn) {
+        IntentStatus st = intent.getStatus();
+        if (st != IntentStatus.SCHEDULED && st != IntentStatus.DUE) {
+            logger.warn(unsupportedWarn, intent.getIntentId(), st);
+            return DetachResult.UNSUPPORTED;
+        }
+        boolean wasScheduled = oldExecuteAt != null
+            ? scheduler.removeFromSchedule(intent, oldExecuteAt)
+            : scheduler.removeFromSchedule(intent);
+        if (!wasScheduled) {
+            // 已被 scanDue CAS 认领，在途投递正在执行。
+            // updater 的变更随后仍会持久化，但不重排--在途投递可能携带
+            // 旧内容，更新仅在重试/崩溃恢复路径确定生效（见方法 javadoc）。
+            logger.warn(CLAIMED_SKIP_WARN, intent.getIntentId());
+            return DetachResult.CLAIMED;
+        }
+        return DetachResult.DETACHED;
     }
 
     /**
@@ -1017,14 +1032,12 @@ public final class IntentCommandService {
         if (loc.inTail()) {
             var it = tailIndex.scanFrom(loc.bucketKey());
             while (it.hasNext()) {
-                Intent cur;
-                try {
-                    // R21: 防御解码(与 R4/P1-6 恢复路径同款)——tail 记录"结构完整但槽
-                    // 字节损坏"(bit rot)时裸 decode 抛 CRC ISE 穿透 createIntent;
-                    // 损坏条目按不存在跳过(恢复侧同样跳过,索引本就不该引用它)。
-                    cur = SlotCodec.decode(it.next().encodedSlot());
-                } catch (RuntimeException dex) {
-                    logger.warn("hasActiveDuplicate: skipping corrupt tail entry for id {}", intentId, dex);
+                // R21: 防御解码(与 R4/P1-6 恢复路径同款)——tail 记录"结构完整但槽
+                // 字节损坏"(bit rot)时裸 decode 抛 CRC ISE 穿透 createIntent;
+                // 损坏条目按不存在跳过(恢复侧同样跳过,索引本就不该引用它)。
+                Intent cur = SlotCodec.decodeSafe(it.next().encodedSlot());
+                if (cur == null) {
+                    logger.warn("hasActiveDuplicate: skipping corrupt tail entry for id {}", intentId);
                     continue;
                 }
                 if (intentId.equals(cur.getIntentId()) && !cur.getStatus().isTerminal()) {

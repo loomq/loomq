@@ -168,14 +168,12 @@ public final class TailIndex implements AutoCloseable {
                     TailRecord r = byId.get(intentId);
                     if (r == null) continue; // 并发 remove 已摘除
                     if (r.executeAtMs() > horizon) continue; // 并发 re-PUT 到更远的 ms
-                    Intent it;
-                    try {
-                        // P1-6 同款防御:tail 记录无 isTorn 预检(wheel 槽有),一条 CRC 损坏即让
-                        // decode 抛异常中断整个 promoteInto(recover 第一步)→ 引擎起不来。
-                        // 损坏条目跳过并告警,与 WheelRecovery 尾部扫描的防御解码保持一致。
-                        it = SlotCodec.decode(r.encodedSlot());
-                    } catch (RuntimeException dex) {
-                        log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId, dex);
+                    // P1-6 同款防御:tail 记录无 isTorn 预检(wheel 槽有),一条 CRC 损坏即让
+                    // decode 抛异常中断整个 promoteInto(recover 第一步)→ 引擎起不来。
+                    // 损坏条目跳过并告警,与 WheelRecovery 尾部扫描的防御解码保持一致。
+                    Intent it = SlotCodec.decodeSafe(r.encodedSlot());
+                    if (it == null) {
+                        log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId);
                         continue;
                     }
                     try {
@@ -249,11 +247,7 @@ public final class TailIndex implements AutoCloseable {
                             while (buf.hasRemaining()) ch.write(buf);
                             buf.clear();
                         }
-                        buf.put(TYPE_PUT);
-                        buf.putLong(execMs);
-                        buf.put((byte) idBytes.length);
-                        buf.put(idBytes);
-                        buf.put(r.encodedSlot());
+                        putRecord(buf, TYPE_PUT, intentId, execMs, r.encodedSlot());
                     }
                 }
                 buf.flip();
@@ -369,18 +363,24 @@ public final class TailIndex implements AutoCloseable {
 
     // ===== run 文件追加 =====
 
-    private void appendRecord(byte type, String intentId, long execMs, byte[] encodedSlot) {
+    /** 序列化单条 run 记录到 buf(type+execMs+idLen+id+slot)。append 与 compact 共用,格式演进只改一处。 */
+    private static void putRecord(ByteBuffer buf, byte type, String intentId, long execMs, byte[] encodedSlot) {
         byte[] idBytes = intentId.getBytes(StandardCharsets.UTF_8);
         if (idBytes.length > 0xFF) {
             throw new IllegalArgumentException("intentId too long for run record: " + idBytes.length);
         }
-        int slotLen = (type == TYPE_PUT) ? SlotCodec.SLOT_SIZE : 0;
-        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 1 + idBytes.length + slotLen).order(ByteOrder.BIG_ENDIAN);
         buf.put(type);
         buf.putLong(execMs);
         buf.put((byte) idBytes.length);
         buf.put(idBytes);
         if (type == TYPE_PUT) buf.put(encodedSlot);
+    }
+
+    private void appendRecord(byte type, String intentId, long execMs, byte[] encodedSlot) {
+        byte[] idBytes = intentId.getBytes(StandardCharsets.UTF_8);
+        int slotLen = (type == TYPE_PUT) ? SlotCodec.SLOT_SIZE : 0;
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 1 + idBytes.length + slotLen).order(ByteOrder.BIG_ENDIAN);
+        putRecord(buf, type, intentId, execMs, encodedSlot);
         buf.flip();
         try {
             while (buf.hasRemaining()) runChannel.write(buf);

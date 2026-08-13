@@ -93,6 +93,19 @@ public final class SlotCodec {
         return decodePayload(payload, intentId, statusOrd, revision, executeAtPacked);
     }
 
+    /**
+     * 防御性解码:CRC/格式/未知状态码等任何异常一律返回 null(调用方按"损坏条目跳过"处理)。
+     * 收敛 IntentCommandService.hasActiveDuplicate / TailIndex.promoteInto / WheelRecovery
+     * 三处手写 try/catch(损坏 tail 记录中断启动/创建的历史故障点)。
+     */
+    public static Intent decodeSafe(byte[] slot) {
+        try {
+            return decode(slot);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     public static boolean isOccupied(byte[] slot) {
         return slot != null && slot.length == SLOT_SIZE && slot[OFF_STATUS] != 0;
     }

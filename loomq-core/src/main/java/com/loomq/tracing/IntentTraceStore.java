@@ -27,6 +27,19 @@ public final class IntentTraceStore {
     }
 
     /**
+     * 仅当 trace 缺失或 createdAt 不匹配时记录创建(幂等)。
+     *
+     * <p>收敛 createIntent/批量 create/schedule 三处复制的守卫(R21 语义:同 id 重建是
+     * 新 incarnation,旧 trace 不得继承);recordCreated 整体替换 trace,误调会清空投递历史。</p>
+     */
+    public void recordCreatedIfNew(String intentId, String traceId, PrecisionTier tier, long createdAtMs) {
+        IntentTrace existing = traces.get(intentId);
+        if (existing == null || existing.createdAtMs() != createdAtMs) {
+            recordCreated(intentId, traceId, tier, createdAtMs);
+        }
+    }
+
+    /**
      * Record intent creation with the intent's own createdAt.
      *
      * <p>R21: 同 id 重建(R8 支持路径)是新 incarnation——调度器据此比较 trace 的

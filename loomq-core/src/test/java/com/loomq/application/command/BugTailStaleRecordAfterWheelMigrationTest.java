@@ -62,9 +62,12 @@ class BugTailStaleRecordAfterWheelMigrationTest {
             PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> {}, 60_000L);
             ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
             IntentCommandService svc = new IntentCommandService(
-                memStore, scheduler, store, tail, barrier, idx, daemon,
-                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L,
-                PrecisionTierCatalog.defaultCatalog(), new com.loomq.tracing.IntentTraceStore());
+                memStore, scheduler,
+                new IntentCommandService.PhtwStack(store, tail, barrier, idx, daemon),
+                mc, cb, running, seq, null,
+                new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, 60L * 60_000L,
+                    PrecisionTierCatalog.defaultCatalog()),
+                new com.loomq.tracing.IntentTraceStore());
             barrier.start();
             daemon.start();
             scheduler.start();

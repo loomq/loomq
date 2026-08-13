@@ -13,7 +13,6 @@ import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
 import com.loomq.spi.RedeliveryDecider;
 import com.loomq.store.IntentStore;
-import com.loomq.tracing.IntentTrace;
 import com.loomq.tracing.IntentTraceStore;
 import java.time.Duration;
 import java.time.Instant;
@@ -612,14 +611,11 @@ public class PrecisionScheduler {
         // intent 的 createdAt 不匹配时须刷新,否则新 intent 继承旧 createdAt/status
         // (如 ACKED),enqueueLag/totalLag 按旧值错算。记录 intent 自身的 createdAt
         // (而非调度时刻),使同一 incarnation 的后续重排程与 trace 恒等、不误刷新。
-        IntentTrace existingTrace = traceStore.get(intent.getIntentId());
         long createdAtMs = intent.getCreatedAt() != null
             ? intent.getCreatedAt().toEpochMilli()
             : System.currentTimeMillis();
-        if (existingTrace == null || existingTrace.createdAtMs() != createdAtMs) {
-            traceStore.recordCreated(
-                intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier(), createdAtMs);
-        }
+        traceStore.recordCreatedIfNew(
+            intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier(), createdAtMs);
 
         // I5: synchronized 内完成状态迁移 + 索引 + 路由 + 快照；
         // onScheduled 在锁外派发（不持有 intent 锁），但仍同步执行于调用线程。
@@ -650,11 +646,7 @@ public class PrecisionScheduler {
                 if (precisionTierCatalog.isDirectBucket(tier)) {
                     // MILLI：cohort 旁路直插桶（1ms 窗口下交接链延迟吃预算，整条消除）。
                     // 内存高水位降级 → 回退 cohort（精度劣化，指标计数）。
-                    BucketGroup.AddResult r = bucketGroupManager.add(intent);
-                    if (r == BucketGroup.AddResult.FALLBACK_TO_COHORT) {
-                        cohortManager.register(intent);
-                        metrics.incrementMilliFallback(tier);
-                    }
+                    addToBucketWithFallback(intent, tier);
                 } else if (delayMs <= 0) {
                     addToBucketAndDispatch(intent);
                 } else if (delayMs > precisionWindowMs) {
@@ -684,12 +676,16 @@ public class PrecisionScheduler {
      * 添加到桶并等待调度
      */
     private void addToBucketAndDispatch(Intent intent) {
+        addToBucketWithFallback(intent, intent.getPrecisionTier());
+    }
+
+    /** 入桶收口:高水位 FALLBACK_TO_COHORT 时回退 cohort 并计数(收敛 4 处复制)。
+     *  降级结果不能丢弃——否则 intent 既不在桶也不在 cohort,静默丢失直到重启恢复。 */
+    private void addToBucketWithFallback(Intent intent, PrecisionTier tier) {
         BucketGroup.AddResult r = bucketGroupManager.add(intent);
         if (r == BucketGroup.AddResult.FALLBACK_TO_COHORT) {
-            // 高水位降级：新桶未建、旧桶条目已摘、索引已清（intent 现归 cohort 管）。
-            // 结果不能丢弃——否则 intent 既不在桶也不在 cohort，静默丢失直到重启恢复。
             cohortManager.register(intent);
-            metrics.incrementMilliFallback(intent.getPrecisionTier());
+            metrics.incrementMilliFallback(tier);
         }
     }
 
@@ -725,20 +721,11 @@ public class PrecisionScheduler {
             long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
 
             if (precisionTierCatalog.isDirectBucket(tier)) {
-                BucketGroup.AddResult r = bucketGroupManager.add(intent);
-                if (r == BucketGroup.AddResult.FALLBACK_TO_COHORT) {
-                    cohortManager.register(intent);
-                    metrics.incrementMilliFallback(tier);
-                }
+                addToBucketWithFallback(intent, tier);
             } else if (delayMs > precisionWindowMs) {
                 cohortManager.register(intent);
             } else {
-                BucketGroup.AddResult r = bucketGroupManager.add(intent);
-                if (r == BucketGroup.AddResult.FALLBACK_TO_COHORT) {
-                    // 高水位降级：结果不能丢弃（同 addToBucketAndDispatch 说明）
-                    cohortManager.register(intent);
-                    metrics.incrementMilliFallback(tier);
-                }
+                addToBucketWithFallback(intent, tier);
             }
             indexIntent(intent);
         }
@@ -1340,6 +1327,56 @@ public class PrecisionScheduler {
         }
     }
 
+    /** 终态落盘样板:transition+store 更新+原地覆写+trace(收敛过期/死信 3 处重复)。
+     *  索引清理/日志/observers 派发由调用方按上下文处理(快照语义与 unindex 时机不同)。 */
+    private void settleTerminal(Intent intent, IntentStatus status) {
+        intent.transitionTo(status);
+        intentStore.update(intent);
+        persistTerminal(intent);              // 终态原地覆写（不追加）
+        // R19: 终态须反映到 trace,否则死信/过期 Intent 的 trace 停在 CREATED
+        traceStore.updateStatus(intent.getIntentId(), status);
+    }
+
+    /**
+     * 重试/改期结算收口:在途改期尊重 + backoff 重排程。
+     * 收敛 finalizeIntent RETRY 与 handleDeliveryFailure 两处 ~32 行孪生(R19 语义,
+     * 曾因复制各自漂移)。调用方须持 intent 锁,并在返回后置 needReschedule/persisted。
+     */
+    private void scheduleRetryOrHonorReschedule(Intent intent, PrecisionTier tier, long oldExecuteAtMs) {
+        // R19: 在途改期尊重——updateIntent(newExecuteAt) 在投递期间会把共享活对象的
+        // executeAt 改为用户新值并 DURABLE 持久化(claimed 后 removeFromSchedule 返回
+        // false 不重排程;契约是"更新在重试路径确定生效")。若 executeAt 显著晚于当前
+        // (超过一档精度窗口,覆盖桶粒度 ≤window 的前沿偏差——未被改期的在途 Intent
+        // 不可能超出该偏差),说明用户已改期:按新时间重排程,而非用 backoff 覆写——
+        // 否则改期被静默丢弃,Intent 在数秒内被重投,与用户意图相悖。
+        Instant now = Instant.now();
+        long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
+        if (intent.getExecuteAt().isAfter(now.plusMillis(precisionWindowMs))) {
+            intent.transitionTo(IntentStatus.SCHEDULED);
+            intentStore.update(intent);
+            // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
+            // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
+            // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
+            // (I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
+            persistStateChange(intent);
+            unindexIntent(intent.getIntentId(), oldExecuteAtMs);
+            logger.info("Honoring mid-flight reschedule for intent={}, executeAt={} (no backoff)",
+                intent.getIntentId(), intent.getExecuteAt());
+            return;
+        }
+        long delayMs = intent.getRedelivery() != null
+            ? intent.getRedelivery().calculateDelay(intent.getAttempts())
+            : 5000;
+        logger.info("Scheduling redelivery for intent={}, attempt={}, delay={}ms",
+            intent.getIntentId(), intent.getAttempts(), delayMs);
+        intent.setExecuteAt(Instant.now().plusMillis(delayMs));
+        intent.transitionTo(IntentStatus.SCHEDULED);
+        intentStore.update(intent);
+        // Fix 6: 同上——重排程必须 DURABLE 落盘
+        persistStateChange(intent);
+        unindexIntent(intent.getIntentId(), oldExecuteAtMs);
+    }
+
     /** 终态原地覆写（I6 容错镜像 persistStateChange）：revision 递增 + 非阻塞原地覆写。 */
     private void persistTerminal(Intent intent) {
         intent.incrementRevision();
@@ -1488,20 +1525,14 @@ public class PrecisionScheduler {
             // switch(null) 抛 NPE——consumer 路径无 try/catch 会杀死消费者 VT(固定数组无监督,
             // 档位容量永久退化),scanner 路径吞异常反复重试致 intent 永不终态化。防御性默认
             // DISCARD(与 Intent 构造器/解码路径的默认语义一致)。
-            switch (intent.getExpiredAction() != null ? intent.getExpiredAction() : ExpiredAction.DISCARD) {
-                case DISCARD:
-                    intent.transitionTo(IntentStatus.EXPIRED);
-                    break;
-                case DEAD_LETTER:
-                    intent.transitionTo(IntentStatus.DEAD_LETTERED);
-                    break;
-            }
-            intentStore.update(intent);
-            persistTerminal(intent);              // 终态原地覆写（不追加）
+            IntentStatus terminalStatus = switch (intent.getExpiredAction() != null
+                ? intent.getExpiredAction() : ExpiredAction.DISCARD) {
+                case DISCARD -> IntentStatus.EXPIRED;
+                case DEAD_LETTER -> IntentStatus.DEAD_LETTERED;
+            };
+            settleTerminal(intent, terminalStatus);
             terminalId = intent.getIntentId();
             persisted = true;
-            // R19: 终态须反映到 trace
-            traceStore.updateStatus(intent.getIntentId(), intent.getStatus());
 
             if (!observers.isEmpty()) {
                 final Intent snapshot = intent.copy();
@@ -1595,16 +1626,12 @@ public class PrecisionScheduler {
                             ? intent.getRedelivery().getMaxAttempts()
                             : 5;
                         if (intent.getAttempts() >= maxAttempts) {
-                            intent.transitionTo(IntentStatus.DEAD_LETTERED);
-                            intentStore.update(intent);
-                            persistTerminal(intent);              // 终态原地覆写(不追加)
+                            settleTerminal(intent, IntentStatus.DEAD_LETTERED);
                             terminalId = intent.getIntentId();
                             persisted = true;
                             unindexIntent(intent.getIntentId(), executeAtMs(intent));
                             logger.warn("Intent dead-lettered after max attempts (RETRY result): id={}",
                                 intent.getIntentId());
-                            // R19: 终态须反映到 trace,否则死信 Intent 的 trace 停在 CREATED
-                            traceStore.updateStatus(intent.getIntentId(), IntentStatus.DEAD_LETTERED);
                             if (!observers.isEmpty()) {
                                 final Intent snapshot = intent.copy();
                                 deferredNotify = o -> o.onDeadLettered(snapshot);
@@ -1612,59 +1639,19 @@ public class PrecisionScheduler {
                             break;
                         }
                         long oldExecuteAtMs = executeAtMs(intent);
-                        // R19: 在途改期尊重——updateIntent(newExecuteAt) 在投递期间会把共享
-                        // 活对象的 executeAt 改为用户新值并 DURABLE 持久化(claimed 后
-                        // removeFromSchedule 返回 false 不重排程;契约是"更新在重试路径确定
-                        // 生效")。若 executeAt 显著晚于当前(超过一档精度窗口,覆盖桶粒度
-                        // ≤window 的前沿偏差——未被改期的在途 Intent 不可能超出该偏差),说明
-                        // 用户已改期:按新时间重排程,而非用 backoff 覆写——否则改期被静默
-                        // 丢弃,Intent 在数秒内被重投,与用户意图相悖。
-                        Instant now = Instant.now();
-                        long precisionWindowMs = precisionTierCatalog.precisionWindowMs(tier);
-                        if (intent.getExecuteAt().isAfter(now.plusMillis(precisionWindowMs))) {
-                            intent.transitionTo(IntentStatus.SCHEDULED);
-                            intentStore.update(intent);
-                            // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
-                            // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
-                            // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
-                            persistStateChange(intent);
-                            persisted = true;
-                            unindexIntent(intent.getIntentId(), oldExecuteAtMs);
-                            // I5: schedule() 移到锁外 (deferred)
-                            needReschedule = true;
-                            logger.info("Honoring mid-flight reschedule for intent={}, executeAt={} (no backoff)",
-                                intent.getIntentId(), intent.getExecuteAt());
-                            break;
-                        }
-                        long delayMs = intent.getRedelivery() != null
-                            ? intent.getRedelivery().calculateDelay(intent.getAttempts())
-                            : 5000;
-                        logger.info("Scheduling redelivery for intent={}, attempt={}, delay={}ms",
-                            intent.getIntentId(), intent.getAttempts(), delayMs);
-                        intent.setExecuteAt(Instant.now().plusMillis(delayMs));
-                        intent.transitionTo(IntentStatus.SCHEDULED);
-                        intentStore.update(intent);
-                        // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
-                        // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
-                        // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
-                        persistStateChange(intent);
-                        persisted = true;
-                        unindexIntent(intent.getIntentId(), oldExecuteAtMs);
+                        scheduleRetryOrHonorReschedule(intent, tier, oldExecuteAtMs);
                         // I5: schedule() 移到锁外 (deferred)
                         needReschedule = true;
+                        persisted = true;
                         break;
                     }
 
                     case DEAD_LETTER:
-                        intent.transitionTo(IntentStatus.DEAD_LETTERED);
-                        intentStore.update(intent);
-                        persistTerminal(intent);              // 终态原地覆写（不追加）
+                        settleTerminal(intent, IntentStatus.DEAD_LETTERED);
                         terminalId = intent.getIntentId();
                         persisted = true;
                         unindexIntent(intent.getIntentId(), executeAtMs(intent));
                         logger.warn("Intent {} dead-lettered", intent.getIntentId());
-                        // R19: 终态须反映到 trace
-                        traceStore.updateStatus(intent.getIntentId(), IntentStatus.DEAD_LETTERED);
                         if (!observers.isEmpty()) {
                             final Intent snapshot = intent.copy();
                             deferredNotify = o -> o.onDeadLettered(snapshot);
@@ -1760,38 +1747,10 @@ public class PrecisionScheduler {
                 }
             } else {
                 long oldExecuteAtMs = executeAtMs(intent);
-                // R19: 在途改期尊重(同 finalizeIntent RETRY 分支)——用户改期后的
-                // executeAt 显著晚于当前时,按新时间重排程而非用 backoff 覆写。
-                Instant now = Instant.now();
-                long precisionWindowMs =
-                    precisionTierCatalog.precisionWindowMs(intent.getPrecisionTier());
-                if (intent.getExecuteAt().isAfter(now.plusMillis(precisionWindowMs))) {
-                    intent.transitionTo(IntentStatus.SCHEDULED);
-                    intentStore.update(intent);
-                    // Fix 6: 重排程落盘,见 finalizeIntent RETRY 分支同款说明
-                    persistStateChange(intent);
-                    persisted = true;
-                    unindexIntent(intent.getIntentId(), oldExecuteAtMs);
-                    // I5: schedule() 移到锁外 (deferred)
-                    needReschedule = true;
-                    logger.info("Honoring mid-flight reschedule for intent={}, executeAt={} (no backoff)",
-                        intent.getIntentId(), intent.getExecuteAt());
-                } else {
-                    long delayMs = intent.getRedelivery() != null
-                        ? intent.getRedelivery().calculateDelay(intent.getAttempts())
-                        : 5000;
-                    logger.info("Scheduling redelivery for intent={} after failure, attempt={}, delay={}ms",
-                        intent.getIntentId(), intent.getAttempts(), delayMs);
-                    intent.setExecuteAt(Instant.now().plusMillis(delayMs));
-                    intent.transitionTo(IntentStatus.SCHEDULED);
-                    intentStore.update(intent);
-                    // Fix 6: 重排程落盘,见 finalizeIntent RETRY 分支同款说明
-                    persistStateChange(intent);
-                    persisted = true;
-                    unindexIntent(intent.getIntentId(), oldExecuteAtMs);
-                    // I5: schedule() 移到锁外 (deferred)
-                    needReschedule = true;
-                }
+                scheduleRetryOrHonorReschedule(intent, intent.getPrecisionTier(), oldExecuteAtMs);
+                // I5: schedule() 移到锁外 (deferred)
+                needReschedule = true;
+                persisted = true;
             }
         }
         // 持久化等待移到锁外：VT 在此正常 unmount，避免在 synchronized 内 park 而 pin carrier。

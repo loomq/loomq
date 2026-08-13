@@ -176,11 +176,13 @@ public class LoomqEngine implements AutoCloseable {
             this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex, wheelConfig.hotBoundaryMs(), metricsCollector);
 
             this.commandService = new IntentCommandService(
-                intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
-                locationIndex, promotionDaemon,
+                intentStore, scheduler,
+                new IntentCommandService.PhtwStack(wheelStore, tailIndex, commitBarrier, locationIndex, promotionDaemon),
                 metricsCollector, callbackExecutor, running, sequenceNumber,
-                builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs(),
-                wheelConfig.hotBoundaryMs(), builder.precisionTierCatalog, traceStore);
+                builder.callbackHandler,
+                new IntentCommandService.CommandConfig(defaultTier, wheelConfig.groupCommitIntervalMs(),
+                    wheelConfig.hotBoundaryMs(), builder.precisionTierCatalog),
+                traceStore);
 
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
             scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
