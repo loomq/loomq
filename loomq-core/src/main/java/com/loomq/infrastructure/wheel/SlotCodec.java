@@ -5,6 +5,7 @@ import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
+import com.loomq.domain.intent.RedeliveryPolicy;
 import com.loomq.domain.intent.WalMode;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -125,6 +126,18 @@ public final class SlotCodec {
         // ADAPTATION: brief 原始 encodePayload 未编码 tags,但 shouldRejectOversizedPayload
         // 依赖 tags 作为业务负载触发溢出。补齐 tags 的 TLV 编解码(0x0E)。
         putTags(b, (byte) 0x0E, intent.getTags());
+        // R20: redelivery 策略必须随槽持久化——重试语义是 Intent 的耐久契约,崩溃恢复后
+        // 丢失会静默回退默认(5000ms/5 次),maxAttempts=2 变 5 次(超契约投递)或
+        // maxAttempts=100 提前死信。仅非 null 时写入(默认 Intent 无策略,零额外体积)。
+        RedeliveryPolicy rp = intent.getRedelivery();
+        if (rp != null) {
+            putInt(b, (byte) 0x0F, rp.getMaxAttempts());
+            putStr(b, (byte) 0x10, rp.getBackoff());
+            putLong(b, (byte) 0x11, rp.getInitialDelayMs());
+            putLong(b, (byte) 0x12, rp.getMaxDelayMs());
+            putDouble(b, (byte) 0x13, rp.getMultiplier());
+            putByte(b, (byte) 0x14, (byte) (rp.isJitter() ? 1 : 0));
+        }
         byte[] result = new byte[b.position()];
         System.arraycopy(b.array(), 0, result, 0, result.length);
         return result;
@@ -137,6 +150,9 @@ public final class SlotCodec {
         String shardKey = null, shardId = null;
         int attempts = 0; String lastDeliveryId = null, idempotencyKey = null;
         Map<String, String> tags = null; // ADAPTATION: 支持 tags 回读
+        boolean hasRedelivery = false;
+        int maxAttempts = 0; String backoff = null;
+        long initialDelayMs = 0, maxDelayMs = 0; double multiplier = 0; boolean jitter = false;
 
         while (b.hasRemaining()) {
             byte type = b.get();
@@ -160,6 +176,12 @@ public final class SlotCodec {
                 case 0x0C -> lastDeliveryId = getStr(b, len);
                 case 0x0D -> idempotencyKey = getStr(b, len);
                 case 0x0E -> tags = getTags(b, len); // ADAPTATION: tags 回读
+                case 0x0F -> { maxAttempts = b.getInt(); hasRedelivery = true; }
+                case 0x10 -> backoff = getStr(b, len);
+                case 0x11 -> initialDelayMs = b.getLong();
+                case 0x12 -> maxDelayMs = b.getLong();
+                case 0x13 -> multiplier = b.getDouble();
+                case 0x14 -> jitter = b.get() != 0;
                 default -> b.position(start + len);
             }
             if (b.position() != start + len) b.position(start + len); // safety
@@ -171,7 +193,10 @@ public final class SlotCodec {
             unpackExecuteAt(executeAtPacked),
             deadline == 0 ? null : Instant.ofEpochMilli(deadline),
             expiredAction, tier, walMode, shardKey, shardId,
-            null, null, idempotencyKey, tags, attempts, lastDeliveryId, revision);
+            null,
+            hasRedelivery ? new RedeliveryPolicy(maxAttempts, backoff, initialDelayMs, maxDelayMs,
+                multiplier, jitter) : null,
+            idempotencyKey, tags, attempts, lastDeliveryId, revision);
     }
 
     /**
@@ -195,6 +220,7 @@ public final class SlotCodec {
     private static void putLong(ByteBuffer b, byte type, long v) { b.put(type); b.putInt(8); b.putLong(v); }
     private static void putInt(ByteBuffer b, byte type, int v) { b.put(type); b.putInt(4); b.putInt(v); }
     private static void putByte(ByteBuffer b, byte type, byte v) { b.put(type); b.putInt(1); b.put(v); }
+    private static void putDouble(ByteBuffer b, byte type, double v) { b.put(type); b.putInt(8); b.putDouble(v); }
     private static String getStr(ByteBuffer b, int len) {
         short sl = b.getShort();
         byte[] bs = new byte[sl]; b.get(bs);
@@ -252,6 +278,15 @@ public final class SlotCodec {
                 t += 2 + utf8Len(e.getKey()) + 2 + utf8Len(e.getValue());
             }
             n += 5 + t; // type(1) + len(4) + value
+        }
+        RedeliveryPolicy rp = intent.getRedelivery();
+        if (rp != null) {
+            n += 9;  // maxAttempts int
+            n += rp.getBackoff() == null ? 0 : 7 + utf8Len(rp.getBackoff());
+            n += 13; // initialDelayMs
+            n += 13; // maxDelayMs
+            n += 13; // multiplier double
+            n += 6;  // jitter byte
         }
         return n;
     }
