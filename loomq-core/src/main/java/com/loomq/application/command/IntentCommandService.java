@@ -434,7 +434,23 @@ public final class IntentCommandService {
                     }
                 }
 
+                // R11: 捕获 updater 前的状态，用于终态转换拒绝时回滚（终态经 append 持久化
+                // 会绕过 removeFromSchedule/locationIndex.remove/reclaimTerminal 清理）。
+                IntentStatus statusBeforeUpdater = intent.getStatus();
+                Instant updatedAtBeforeUpdater = intent.getUpdatedAt();
+
                 updater.accept(intent);
+
+                // R11: 生命周期变更(取消/过期/死信)须走 cancelIntent/finalize/handleExpired 专用
+                // 路径——updater 直接 transitionTo(终态) 会绕过调度结构摘除、locationIndex 清理、
+                // 终态槽回收，遗留 locationIndex/intentExpiryIndex/multiSlot 泄漏直到重启。
+                // 拒绝并回滚状态，指引调用方使用 cancelIntent。
+                if (intent.getStatus().isTerminal()) {
+                    intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    throw new IllegalArgumentException(
+                        "updater must not transition intent " + intentId + " to terminal state "
+                            + intent.getStatus() + "; use cancelIntent");
+                }
 
                 // 安全网：updater 可能直接通过 intent.setExecuteAt() 修改了执行时间，
                 // 此时 newExecuteAt 为 null 导致 reschedule 初始为 false，需要补检。
