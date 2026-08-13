@@ -1,6 +1,7 @@
 package com.loomq.application.scheduler;
 
 import com.loomq.common.MetricsCollector;
+import com.loomq.domain.intent.ExpiredAction;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
@@ -1505,7 +1506,11 @@ public class PrecisionScheduler {
             unindexIntent(intent.getIntentId(), executeAtMs(intent));
             logger.info("Intent expired: id={}, deadline={}", intent.getIntentId(), intent.getDeadline());
 
-            switch (intent.getExpiredAction()) {
+            // R18: expiredAction 可为 null(Intent.setExpiredAction 无守卫、create 曾不校验)。
+            // switch(null) 抛 NPE——consumer 路径无 try/catch 会杀死消费者 VT(固定数组无监督,
+            // 档位容量永久退化),scanner 路径吞异常反复重试致 intent 永不终态化。防御性默认
+            // DISCARD(与 Intent 构造器/解码路径的默认语义一致)。
+            switch (intent.getExpiredAction() != null ? intent.getExpiredAction() : ExpiredAction.DISCARD) {
                 case DISCARD:
                     intent.transitionTo(IntentStatus.EXPIRED);
                     break;

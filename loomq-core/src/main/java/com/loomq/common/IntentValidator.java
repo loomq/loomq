@@ -38,6 +38,13 @@ public final class IntentValidator {
             throw new IllegalArgumentException("deadline must be after executeAt");
         }
 
+        // R18: expiredAction 语义为 DISCARD 或 DEAD_LETTER(Intent 构造器默认 DISCARD)。
+        // null 会触发调度器 handleExpired 的 switch NPE(consumer 路径杀死消费者线程),
+        // 创建入口必须拒绝。
+        if (intent.getExpiredAction() == null) {
+            throw new IllegalArgumentException("expiredAction must not be null");
+        }
+
         String intentId = intent.getIntentId();
         if (intentId != null && intentId.isBlank()) {
             throw new IllegalArgumentException("intentId must not be blank");
