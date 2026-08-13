@@ -417,6 +417,10 @@ public class PrecisionScheduler {
             ScheduledExecutorService scanScheduler = scanSchedulers.get(tier);
             if (scanScheduler != null) {
                 scanScheduler.submit(() -> { pending.set(false); scanAndDispatch(tier); });
+            } else {
+                // R21: 调度器缺失(stop 竞态/重启窗口)时复位标志——否则标志恒 true,
+                // stop→start 后该档 cohort-flush 触发式扫描永久失效(只剩固定 tick)。
+                pending.set(false);
             }
         }
     }

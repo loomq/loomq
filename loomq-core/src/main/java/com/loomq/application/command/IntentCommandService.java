@@ -469,6 +469,20 @@ public final class IntentCommandService {
                         "updater must not set executeAt to null for intent " + intentId);
                 }
 
+                // R21: updater 只允许停留在 SCHEDULED/DUE——DUE→DISPATCHING(合法迁移,
+                // R11 只拦终态、R16 只拦 executeAt=null)会把"无投递在途"的 DISPATCHING
+                // 持久化:内存态永久卡死;finalize 的 DUE 起步守卫从 DISPATCHING 转 DUE
+                // 抛 ISE 被 runFinalizeTask 吞 → ACK 不落盘/onDelivered 不通知;重启后
+                // recovery 把非终态 DISPATCHING 当活 intent 重复投递。拒绝并回滚。
+                if (intent.getStatus() != IntentStatus.SCHEDULED && intent.getStatus() != IntentStatus.DUE) {
+                    // 先捕获违规状态再回滚——rollbackStatus 会还原 status,消息须点名违规值
+                    IntentStatus offender = intent.getStatus();
+                    intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    throw new IllegalArgumentException(
+                        "updater must not move intent " + intentId + " to " + offender
+                            + "; only SCHEDULED/DUE are valid post-update states");
+                }
+
                 // 安全网：updater 可能直接通过 intent.setExecuteAt() 修改了执行时间，
                 // 此时 newExecuteAt 为 null 导致 reschedule 初始为 false，需要补检。
                 if (!reschedule) {

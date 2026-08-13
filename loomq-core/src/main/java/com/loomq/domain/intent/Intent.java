@@ -534,7 +534,11 @@ public class Intent {
     }
 
     public void setTags(Map<String, String> tags) {
-        this.tags = tags;
+        // R21: 防御性拷贝(与构造器同款)——内核不得持有用户可变引用:用户在 setTags 后
+        // 并发变异(写入 null 值/结构性修改)会让消费者快照 Map.copyOf 抛 NPE/CME,
+        // 杀死无监督的消费者 VT(固定 Thread[],投递容量永久减员 + permit 泄漏)。
+        // 非法输入(null key/value)在此边界即抛,而非在投递路径炸消费者。
+        this.tags = tags != null && !tags.isEmpty() ? Map.copyOf(tags) : null;
     }
 
     public int getAttempts() {
