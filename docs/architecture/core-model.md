@@ -154,5 +154,6 @@ The codebase already exposes shell-oriented extension points:
 - `CallbackHandler`
 - `DeliveryHandler`
 - `RedeliveryDecider`
+- `IntentObserver`
 
 That means the kernel can stay focused while higher-level products define their own behavior on top.

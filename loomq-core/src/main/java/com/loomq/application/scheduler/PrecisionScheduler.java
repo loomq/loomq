@@ -47,7 +47,7 @@ import org.slf4j.LoggerFactory;
  * 精度调度器。
  *
  * 支持多精度档位的 Intent 调度，每个档位独立的扫描线程。
- * 核心架构：虚拟线程独立休眠 + 分层 Bucket 唤醒。
+ * 核心架构：cohort 批量唤醒（CSA）+ 分层 Bucket 扫描。
  *
  * <h2>核心不变量</h2>
  * <ul>
@@ -98,7 +98,7 @@ public class PrecisionScheduler {
      */
     private volatile StateChangeSink stateChangeSink;
 
-    // 档位级有界队列（容量 = maxConcurrency × 4，满时触发 backpressure）
+    // 档位级有界队列（容量 = maxConcurrency × 16，满时触发 backpressure）
     private final Map<PrecisionTier, BlockingQueue<Intent>> tierDispatchQueues;
 
     // 按精度档位的扫描调度器
@@ -591,7 +591,7 @@ public class PrecisionScheduler {
     /**
      * 调度 Intent
      *
-     * 根据 executeAt 和 precisionTier 计算休眠时间，然后添加到对应桶。
+     * 按 executeAt 与精度档位路由到对应桶或 cohort（批次唤醒）。
      *
      * @implNote 维护 I1：将 intent 放入唯一调度结构（bucket 或 cohort）。
      * @param intent Intent 实例
@@ -883,7 +883,7 @@ public class PrecisionScheduler {
      * 投递消费者循环 (真正 fire-and-forget)。
      *
      * Semaphore 控制 in-flight 并发。消费者只负责取任务 + 调用异步投递，
-     * permit 在 Netty/异步回调中释放。消费者线程与 HTTP 往返完全解耦。
+     * permit 在异步投递完成后经 releasePermit 释放；消费者线程与投递完全解耦。
      */
     private void runBatchConsumer(PrecisionTier tier) {
         BlockingQueue<Intent> queue = tierDispatchQueues.get(tier);
@@ -1556,7 +1556,7 @@ public class PrecisionScheduler {
     /**
      * 终态处理——根据异步投递结果更新状态并持久化。
      *
-     * 在 Netty/异步回调线程中执行。单次 intentStore.update() 写入终态。
+     * 在结算执行器中执行。单次 intentStore.update() 写入终态。
      *
      * @implNote 维护 I2/I3：终态落盘（persistStateChange）确保磁盘权威记录。
      */

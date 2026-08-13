@@ -26,10 +26,9 @@ mvn test -Pfull-tests          # everything including slow/benchmark
 mvn test -Dtest=ClassName      # single test class
 mvn test -Dtest=ClassName#methodName  # single test method
 
-# Run benchmark suite (Excel + MD reports)
-benchmark\benchmark.bat                  # Windows full suite
-benchmark\benchmark.bat --quick          # quick validation
-benchmark\benchmark.bat --stress         # full + stress sweep
+# Run benchmark suite (MD reports; no Excel — scripts are self-contained)
+benchmark/scripts/benchmark.ps1          # Windows full suite
+benchmark/scripts/benchmark.ps1 -Quick   # quick validation
 ./benchmark/scripts/benchmark.sh         # Linux/macOS
 
 # Pre-push gate (same checks CI runs)
@@ -60,7 +59,7 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
     ├── WheelStore            — persistent hierarchical timing wheel (4-tier mmap: sec/min/hour/day)
     ├── TailIndex             — durable run-file for intents beyond the day-wheel horizon (>30 days)
     ├── GroupCommitBarrier    — rendezvous msync daemon; DURABLE writers awaitCommit()
-    ├── PromotionDaemon       — cold→hot cohort promotion (mirrors CohortManager; wakes at executeAt - PROMOTION_LEAD_MS, default 60s)
+    ├── PromotionDaemon       — cold→hot cohort promotion (mirrors CohortManager; wakes at executeAt - WheelConfig.promotionLeadMs(), default 60s)
     ├── IntentLocationIndex   — intentId→SlotLocation index for cold cancel/reschedule
     ├── WheelRecovery         — scan-based recovery on restart (replaces snapshot+WAL replay)
     └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, RedeliveryDecider

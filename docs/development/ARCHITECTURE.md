@@ -33,7 +33,7 @@ flowchart TB
         PS["PrecisionScheduler<br/>每档独立扫描线程 + 批量消费者"]
         Cohort["CohortManager<br/>CSA 批量唤醒 (单 platform waker)"]
         BGM["BucketGroupManager<br/>每档时间桶"]
-        Sem["ResizableSemaphore × 5 档<br/>Arrow 跨档借用 / AdapTBF"]
+        Sem["ResizableSemaphore × 4 档<br/>Arrow 跨档借用 / AdapTBF"]
         Store["IntentStore<br/>ConcurrentIntentStore (热窗口 ≤60min)"]
     end
 
@@ -129,7 +129,7 @@ stateDiagram-v2
 | STANDARD | 500 ms | 500 ms | 50 | 20 | 100 ms | 3 | 800 | DURABLE |
 | MILLI | 1 ms | 1 ms | 100 | 1（单发） | 1 ms | 8 | 1600 | DURABLE |
 
-`batchSize=1` 的档位（ULTRA/FAST）走单 Intent 消费循环；其余走 `drainTo` 批量消费循环，调用 `DeliveryHandler.deliverBatchAsync()`。
+`batchSize=1` 的档位（ULTRA/FAST/MILLI）走单 Intent 消费循环；其余走 `drainTo` 批量消费循环，调用 `DeliveryHandler.deliverBatchAsync()`。
 
 ### 3.3 冷 / 热分层
 
@@ -161,7 +161,7 @@ stateDiagram-v2
    - `RETRY` → 按 `RedeliveryPolicy.calculateDelay(attempts)`（默认 5s）退避，转回 SCHEDULED 重排；
    - `DEAD_LETTER` / `EXPIRED` → 对应终态；
    - 异常走 `handleDeliveryFailure`，达 `maxAttempts`（默认 5）进 DEAD_LETTERED，否则退避重排。
-4. `stop()` 时通过"获取全部 permit"排空在途投递（每档 5s 超时）。
+4. `stop()` 时按 per-tier 在途计数（tierInFlight）排空在途投递（10s 截止）。
 
 ### 4.4 并发控制：ResizableSemaphore + Arrow 借用 + AdapTBF
 

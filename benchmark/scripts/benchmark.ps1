@@ -195,13 +195,20 @@ foreach ($line in Get-Content $ResultFile -Encoding UTF8) {
 $report += ""
 $report | Set-Content -Path $MdFile -Encoding UTF8
 
-# ---- rotate reports (keep recent N) ----
+# ---- rotate reports + logs (keep recent N) ----
 $Keep = 10
 $rc = Get-Content $ConfigPath -Raw | ConvertFrom-Json
 if ($rc.rotation.keep_recent) { $Keep = [int]$rc.rotation.keep_recent }
 $old = Get-ChildItem -Path $ReportsDir -Filter "benchmark-report-*.md" -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep
 foreach ($f in $old) { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue }
+# logs/raw 产物同样按 keep_recent 轮转,避免 benchmark-*.log 与 raw-*.txt 无限累积
+$oldLogs = Get-ChildItem -Path $LogsDir -Filter "benchmark-*.log" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep
+foreach ($f in $oldLogs) { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue }
+$oldRaw = Get-ChildItem -Path $LogsDir -Filter "raw-*.txt" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -Skip $Keep
+foreach ($f in $oldRaw) { Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue }
 
 Write-Host ""
 Write-Host "报告已生成: $MdFile"

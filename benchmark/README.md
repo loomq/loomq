@@ -60,6 +60,8 @@ MILLI 档为 1ms 事件驱动直插桶，吞吐语义与批量档不同（单发
 | `-Scenario <name>` / `--scenario=<name>` | 场景: all / create / delivery / precision | all |
 | `-NoCompile` / `--no-compile` | 跳过编译 | false |
 | `-Compare` / `--compare` | 查看最近一次报告 | false |
+| `-SweepConsumers` / `--sweep-consumers` | 消费者数扫参 | false |
+| `-JavaHome <path>` | JDK 路径 (ps1; sh 用 LOOMQ_JAVA_HOME 环境变量) | 见各脚本默认 |
 
 ### 示例
 
