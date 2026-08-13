@@ -195,22 +195,10 @@ public class LoomqEngine implements AutoCloseable {
                 @Override public void reclaimTerminal(String intentId) { commandService.reclaimTerminal(intentId); }
             });
 
-            // Spec B: 终态 Intent 从 locationIndex 移除(桶回收依赖索引判断活跃桶)。
-            // 调度器的 finalizeIntent/handleExpired/handleDeliveryFailure 经 observer 回调清理,
-            // cancelIntent(热路径)和 cancelCold 在 IntentCommandService 内直接清理。
-            scheduler.addObserver(new IntentObserver() {
-                @Override public void onScheduled(Intent intent) { /* no-op */ }
-                @Override public void onDelivered(Intent i, com.loomq.spi.DeliveryHandler.DeliveryResult r) {
-                    locationIndex.remove(i.getIntentId());
-                }
-                @Override public void onDeadLettered(Intent i) {
-                    locationIndex.remove(i.getIntentId());
-                }
-                @Override public void onExpired(Intent i) {
-                    locationIndex.remove(i.getIntentId());
-                }
-                @Override public void onDeliveryFailed(Intent i, Throwable e) { /* no-op */ }
-            });
+            // C4-8: 不再注册构造期 observer——setObservers(observers) 在 start() 会整体清空
+            // 调度器观察器列表,该 observer 从未在运行期生效(死代码);且 onDelivered 若生效
+            // 会把非终态 DELIVERED 的索引摘除(hasActiveDuplicate 误放行同 id 重建),反而有害。
+            // 终态索引清理由 reclaimTerminal(调度器终态路径)/cancelIntent/cancelCold 覆盖。
 
             this.bucketReclaimer = new BucketReclaimer(wheelStore, locationIndex, wheelConfig.bucketRetentionMs());
 
@@ -430,7 +418,7 @@ public class LoomqEngine implements AutoCloseable {
      * @return true 如果成功取消
      */
     public boolean cancelIntent(String intentId) {
-        return commandService.cancelIntent(intentId);
+        return runDrained(() -> commandService.cancelIntent(intentId));
     }
 
     /**
@@ -440,7 +428,7 @@ public class LoomqEngine implements AutoCloseable {
      * @return true 如果成功触发
      */
     public boolean fireNow(String intentId) {
-        return commandService.fireNow(intentId);
+        return runDrained(() -> commandService.fireNow(intentId));
     }
 
     /**
@@ -453,7 +441,7 @@ public class LoomqEngine implements AutoCloseable {
      * @return 更新后的 Intent；不存在时返回 empty
      */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater) {
-        return commandService.updateIntent(intentId, updater, null);
+        return runDrained(() -> commandService.updateIntent(intentId, updater, null));
     }
 
     /**
@@ -465,7 +453,32 @@ public class LoomqEngine implements AutoCloseable {
      * @return 更新后的 Intent；不存在时返回 empty
      */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater, Instant newExecuteAt) {
-        return commandService.updateIntent(intentId, updater, newExecuteAt);
+        return runDrained(() -> commandService.updateIntent(intentId, updater, newExecuteAt));
+    }
+
+    /**
+     * 经 operationExecutor 执行命令(C4-6):cancel/update/fireNow 与 createIntent 同排空
+     * 语义——close() 先排空 operationExecutor 再停 daemon/wheel,在途命令确定性地在
+     * 组件停止前完成,消除"关闭期间直连命令命中已停调度器/已关回调执行器"的竞态
+     * (与 C4-2 的提交后失败修复叠加,关闭竞态降级为可观察的失败,无状态翻转)。
+     * 异常类型保持(ExecutionException 解包为原始 RuntimeException/Error)。
+     */
+    private <T> T runDrained(java.util.concurrent.Callable<T> command) {
+        try {
+            return operationExecutor.submit(command).get();
+        } catch (java.util.concurrent.ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            if (cause instanceof Error er) {
+                throw er;
+            }
+            throw new RuntimeException(cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
     }
 
     /**

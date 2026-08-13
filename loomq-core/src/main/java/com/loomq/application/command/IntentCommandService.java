@@ -86,6 +86,15 @@ public final class IntentCommandService {
 
     /** 曾发生第 2 次及以上槽写入的 Intent（重排程/改期/取消追加）→ 终态不回收，保留 tombstone。 */
     private final java.util.Set<String> multiSlotIntents = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * 曾保留终态墓碑的 intentId（C4-1,R15 守卫）。墓碑留在磁盘上（多槽终态不回收、冷取消
+     * 追加新槽）,参与 recovery 的 max-revision 去重——因此本进程内的 {@link #maxRevisions}
+     * 种子映射必须随之保留,不可在后续单槽 incarnation 终态回收时移除;否则同进程重建从
+     * 0 起步,重启被旧墓碑遮蔽(静默丢失)。一旦置位,进程内不清理(墓碑何时被桶文件过期
+     * 回收无从得知;重启后由 WheelRecovery 重新从磁盘扫描注入)。
+     */
+    private final java.util.Set<String> tombstoneIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** 终态原地覆写后的待回收记录：终态槽在 awaitCommit 落盘后清空。 */
     private final java.util.Map<String, PendingReclaim> pendingReclaims = new java.util.concurrent.ConcurrentHashMap<>();
     /** 待回收记录：loc 为终态槽位置；singleSlot 为 true 才清空复用。 */
@@ -445,13 +454,18 @@ public final class IntentCommandService {
         boolean reschedule = false;
         boolean persisted = false;
         boolean removedForReschedule = false;
+        // C4-5: 提升到 catch 作用域——updater 先变异后抛时,回滚须还原这些"更新前"值
+        Instant oldExecuteAt = null;
+        IntentStatus statusBeforeUpdater = null;
+        Instant updatedAtBeforeUpdater = null;
         try {
             synchronized (intent) {
                 if (intent.getStatus().isTerminal()) {
                     logger.warn("Cannot update intent {} in terminal state {}; no-op", intentId, intent.getStatus());
-                    return Optional.of(intent);
+                    // C4-4: I5 快照隔离——返回副本,调用方不得持有/变异内核活状态
+                    return Optional.of(intent.copy());
                 }
-                Instant oldExecuteAt = intent.getExecuteAt();
+                oldExecuteAt = intent.getExecuteAt();
                 reschedule = newExecuteAt != null && !newExecuteAt.equals(oldExecuteAt);
 
                 if (reschedule) {
@@ -469,8 +483,8 @@ public final class IntentCommandService {
 
                 // R11: 捕获 updater 前的状态，用于终态转换拒绝时回滚（终态经 append 持久化
                 // 会绕过 removeFromSchedule/locationIndex.remove/reclaimTerminal 清理）。
-                IntentStatus statusBeforeUpdater = intent.getStatus();
-                Instant updatedAtBeforeUpdater = intent.getUpdatedAt();
+                statusBeforeUpdater = intent.getStatus();
+                updatedAtBeforeUpdater = intent.getUpdatedAt();
 
                 updater.accept(intent);
 
@@ -551,16 +565,26 @@ public final class IntentCommandService {
                     scheduler.schedule(intent);
                 }
             }
-            return Optional.of(intent);
+            // C4-4: I5 快照隔离——返回副本,调用方不得持有/变异内核活状态(与 findById 同纪律)
+            return Optional.of(intent.copy());
         } catch (RuntimeException e) {
             logger.error("Failed to update intent: id={}", intentId, e);
-            // 回滚：更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按当前
-            // executeAt 重新调度——否则 intent 在 store 中为 SCHEDULED/DUE 却不在任何
+            // 回滚：更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按原 executeAt
+            // 重新调度——否则 intent 在 store 中为 SCHEDULED/DUE 却不在任何
             // bucket/cohort，静默永不投递直到重启恢复（投递延迟丢失）。
             // 镜像正常 reschedule 分支（见下方）：DUE 走 restore()、SCHEDULED 走 schedule()。
-            // 终态（updater 已 CANCELED/EXPIRED/DEAD_LETTERED）不重排——保持终态语义。
             if (removedForReschedule) {
                 try {
+                    // C4-5: updater 可能已变异 executeAt/status/updatedAt 后才抛异常——按"当前值"
+                    // 重排会把变异半应用(与"失败即还原"语义不符,见 BugUpdateUpdaterFailureTest)。
+                    // 先还原调度相关状态,再按原时刻重排。非调度字段(内容)的变异不可回滚
+                    // (无更新前快照),属用户 updater 契约边界。
+                    if (oldExecuteAt != null) {
+                        intent.setExecuteAt(oldExecuteAt);
+                    }
+                    if (statusBeforeUpdater != null) {
+                        intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    }
                     if (intent.getStatus() == IntentStatus.DUE) {
                         scheduler.restore(intent);
                     } else if (intent.getStatus() == IntentStatus.SCHEDULED) {
@@ -640,6 +664,9 @@ public final class IntentCommandService {
         IntentStatus oldStatus = null;
         Instant oldUpdatedAt = null;
         long oldRevision = 0;
+        // C4-2: 终态已提交标记——persistTerminalInPlace 成功(mmap)后置位,此后任何失败
+        // 不得回滚内存(磁盘/内存分歧)。仅终态写入前的失败才走回滚分支。
+        boolean terminalPersisted = false;
         try {
             Intent callbackSnapshot = null;
             synchronized (intent) {
@@ -659,9 +686,10 @@ public final class IntentCommandService {
                 scheduler.removeFromSchedule(intent);
                 intent.incrementRevision();
                 persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
+                terminalPersisted = true;         // 终态已提交(mmap):此后失败不回滚
                 intentStore.update(intent);
-                locationIndex.remove(intentId);  // 终态 Intent 不保留索引(桶回收依赖)
-                // R21: 取消须反映到 trace——否则取消后 trace 恒显 SCHEDULED/DUE
+                // 索引清理移交 reclaimTerminal 的定向移除(C2-1):终态提交后、awaitCommit 窗口内
+                // 并发重建可能已把索引指向新槽,此处无条件移除会抹掉新 incarnation 的索引。
                 traceStore.updateStatus(intentId, IntentStatus.CANCELED);
                 // I5: 锁内取快照，锁外派发
                 callbackSnapshot = intent.copy();
@@ -683,6 +711,14 @@ public final class IntentCommandService {
             return true;
         } catch (RuntimeException e) {
             logger.error("Failed to cancel intent: id={}", intentId, e);
+            if (terminalPersisted) {
+                // C4-2: 提交后失败(awaitCommit 超时/回调 REE/指标/store 更新)——磁盘已 CANCELED
+                // (或 mmap 中,由 group-commit daemon 落盘)。回滚内存会让磁盘/内存分歧:
+                // 重启按 max-revision 取 CANCELED,调用方却按"失败"处理(重试/按活态重排)。
+                // 提交即生效:告警 + 返回成功,不做回滚。
+                logger.warn("Cancel committed; ignoring post-commit failure: id={}", intentId);
+                return true;
+            }
             // 回滚：清理待回收记录（不 free 槽——intent 回滚为活态，槽仍是其 tombstone）
             pendingReclaims.remove(intentId);
             multiSlotIntents.remove(intentId);
@@ -716,7 +752,7 @@ public final class IntentCommandService {
         if (loc == null) {
             return false;                                   // 不存在(无索引项)
         }
-
+        SlotLocation terminalLoc = null;
         if (loc.inTail()) {
             // tail 路径:TailIndex.remove 返回 false 表示该 intent 已被并发取消者移除(已追加 tombstone)。
             // 此时不可谎报成功或重复计数 —— 直接返回 false(镜像 wheel 路径第二取消者行为)。
@@ -725,6 +761,11 @@ public final class IntentCommandService {
                 return false;
             }
             commitBarrier.awaitCommit();                    // cancel 恒 DURABLE:确保 tombstone 落盘
+            terminalLoc = loc;
+            // 冷取消 = 追加 TOMBSTONE:run 文件中残留到 compaction。按多槽墓碑语义保护
+            // revision 种子映射(C4-1)——磁盘痕迹未清,同 id 重建须抬升到历史最高之上。
+            multiSlotIntents.add(intentId);
+            tombstoneIds.add(intentId);
         } else {
             // wheel 路径:readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient 副本,
             // 并发取消互不阻塞 → double-write + double 计数。按 intentId 串行化:第二个取消者
@@ -762,6 +803,10 @@ public final class IntentCommandService {
                     SlotLocation canceledLoc = wheelStore.put(cold);
                     locationIndex.put(intentId, canceledLoc);
                     trackMaxRevision(cold);      // R9: 冷取消墓碑同样推进历史最高 revision
+                    // 冷取消 = 新槽 + 旧槽残留 → 多槽墓碑语义:终态回收保留墓碑、种子映射保留(C4-1)
+                    multiSlotIntents.add(intentId);
+                    tombstoneIds.add(intentId);
+                    terminalLoc = canceledLoc;
                     commitBarrier.awaitCommit();            // cancel 恒 DURABLE
                 } finally {
                     // 只移除自己放入的锁对象,避免误删后到者的锁(computeIfPresent + identity)。
@@ -773,7 +818,9 @@ public final class IntentCommandService {
         }
 
         promotionDaemon.remove(intentId);                   // 取消提升 cohort
-        locationIndex.remove(intentId);
+        // C2-1: 定向移除——并发重建(磁盘终态允许同 id 重建)已把索引指向新槽时不得抹除,
+        // 否则冷 intent 到点不被 promote,静默不投递直到重启。
+        locationIndex.remove(intentId, terminalLoc);
         // R21: 冷取消同样反映到 trace(computeIfPresent:无 trace 则 no-op,如从未被冷 create 记录的旧数据)
         traceStore.updateStatus(intentId, IntentStatus.CANCELED);
         // P1-2: 与 promote 竞态收口——取消生效期间 intent 可能被 PromotionDaemon 并发提升入内存。
@@ -849,7 +896,21 @@ public final class IntentCommandService {
             return true;
         } catch (RuntimeException e) {
             logger.error("Failed to fire intent: id={}", intentId, e);
-            // 回滚：恢复 executeAt 和 revision，重新加入调度
+            if (persisted) {
+                // C4-3: 提交后失败(SCHEDULED@now 已入 mmap,索引已指向新槽)——回滚 executeAt/
+                // revision 会造成"内存旧时刻 vs 磁盘 now"分歧:重启 recovery 见 @now 槽已过期,
+                // 按 overdue 终态化,未来投递静默丢失。磁盘/索引/内存已一致(@now):直接 restore
+                // 让其在途按 now 投递,不再回滚。
+                try {
+                    if (wasScheduled) {
+                        scheduler.restore(intent);
+                    }
+                } catch (Exception re) {
+                    logger.error("Failed to restore intent {} after committed fireNow", intentId, re);
+                }
+                return true;
+            }
+            // 仅持久化前失败：恢复 executeAt 和 revision，重新加入调度
             if (oldExecuteAt != null) {
                 intent.setExecuteAt(oldExecuteAt);
                 intent.rollbackRevision(oldRevision);
@@ -955,12 +1016,22 @@ public final class IntentCommandService {
         String id = intent.getIntentId();
         SlotLocation loc = locationIndex.get(id);
         if (loc == null || loc.inTail()) {
+            if (loc != null && loc.inTail()) {
+                // tail 终态:记录残留 run 文件(不回收,C3-3)→ 按墓碑语义保护种子映射
+                tombstoneIds.add(id);
+                pendingReclaims.put(id, new PendingReclaim(loc, false));
+            }
             persistToWheel(intent, false);     // 回退追加；awaitCommit 由调用方在锁外完成
             return;
         }
         wheelStore.overwriteSlot(loc, SlotCodec.encode(intent));
         trackMaxRevision(intent);              // R9: 终态原地覆写同样推进历史最高 revision
-        pendingReclaims.put(id, new PendingReclaim(loc, !multiSlotIntents.contains(id)));
+        boolean singleSlot = !multiSlotIntents.contains(id);
+        if (!singleSlot) {
+            // 多槽终态 → 磁盘保留墓碑(不回收),revision 种子映射须随之保留(C4-1)
+            tombstoneIds.add(id);
+        }
+        pendingReclaims.put(id, new PendingReclaim(loc, singleSlot));
     }
 
     /**
@@ -971,14 +1042,28 @@ public final class IntentCommandService {
     public void reclaimTerminal(String intentId) {
         PendingReclaim pr = pendingReclaims.remove(intentId);
         try {
-            locationIndex.remove(intentId);            // 先清索引，再回收槽（对齐热取消顺序）
+            // C2-1: 定向移除——只清"自己终态化的槽"的索引。并发重建(磁盘终态允许同 id
+            // 重建)已把索引指向新槽时,无条件按 intentId 移除会抹掉新 incarnation 的索引
+            // (冷 intent 到点不被 promote,静默不投递直到重启)。
+            boolean indexRemoved;
+            if (pr != null) {
+                indexRemoved = locationIndex.remove(intentId, pr.loc());
+            } else {
+                // 无待回收记录(补偿等回退追加路径):维持无条件清理
+                locationIndex.remove(intentId);
+                indexRemoved = true;
+            }
             if (pr != null && pr.singleSlot() && !pr.loc().inTail()) {
                 wheelStore.freeSlot(pr.loc());
-                // R15: 单槽终态被释放后磁盘上不再有该 intentId 的竞争槽,可安全移除历史
+                // R15: 单槽终态被释放后磁盘上通常不再有该 intentId 的竞争槽,可安全移除历史
                 // revision 映射——否则 maxRevisions 按 distinct intentId 无界累积(内存泄漏)。
-                // 多槽墓碑仍保留(其槽参与 max-revision 去重),映射须随之保留。
-                maxRevisions.remove(intentId);
-                logger.debug("Reclaimed terminal slot {} for intent {}", pr.loc(), intentId);
+                // C4-1 守卫:曾保留终态墓碑(历史多槽墓碑/冷取消墓碑仍留磁盘,参与 max-revision
+                // 去重)或索引被并发重建移动(indexRemoved=false)时不可移除——否则同进程重建
+                // 从 0 起步,重启被墓碑遮蔽(静默丢失)。
+                if (indexRemoved && !tombstoneIds.contains(intentId)) {
+                    maxRevisions.remove(intentId);
+                    logger.debug("Reclaimed terminal slot {} for intent {}", pr.loc(), intentId);
+                }
             }
         } catch (Exception e) {
             logger.warn("reclaimTerminal failed for intent {}: {}", intentId, e);
