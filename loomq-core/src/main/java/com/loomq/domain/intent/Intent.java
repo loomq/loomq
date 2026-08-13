@@ -505,6 +505,15 @@ public class Intent {
         this.shardId = shardId;
     }
 
+    /**
+     * 返回内存态回调配置。注意:
+     * <ul>
+     *   <li><b>不持久化</b>:SlotCodec 无 callback TLV——重启/恢复/冷路径载入后恒为 null,
+     *       跨重启一致的回调数据需由 embedder 自行存储,或经全局 {@code CallbackHandler} SPI 携带。</li>
+     *   <li><b>内核不派发</b>:loomq-core 零 HTTP 依赖,不执行该 URL;它只是传给
+     *       {@code CallbackHandler.onIntentEvent(intent, ...)} 的 intent 元数据。</li>
+     * </ul>
+     */
     public Callback getCallback() {
         return callback;
     }

@@ -436,6 +436,12 @@ public final class IntentCommandService {
 
         Intent intent = intentStore.findByIdInternal(intentId);
         if (intent == null) {
+            // 冷意图尚在磁盘(未提升入内存),无法更新;与 fireNow 同模式——区分"不存在"与"冷",
+            // 避免调用方把冷 intent 误判为不存在(静默 no-op)
+            if (locationIndex.get(intentId) != null) {
+                logger.warn("Cannot update a cold intent (not yet promoted into memory): id={}; "
+                    + "cold update not implemented (AGENTS.md)", intentId);
+            }
             return Optional.empty();
         }
 
