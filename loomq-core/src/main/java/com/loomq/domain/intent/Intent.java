@@ -331,6 +331,17 @@ public class Intent {
     }
 
     /**
+     * 设置修订号(用于重建 Intent 时把 revision 种子到磁盘历史最高值之上)。
+     *
+     * <p>仅限命令服务在 {@code createIntent} 重建路径使用:同 intentId 终态后重建的新
+     * Intent 若从 0 起步,recovery 按 max revision 去重时会被旧终态墓碑(更高 revision)
+     * 遮蔽,新 Intent 静默丢失。重建前需把 revision 抬升到历史最高值之上。</p>
+     */
+    public void setRevision(long revision) {
+        this.revision = revision;
+    }
+
+    /**
      * 验证状态转换是否合法
      */
     private void validateTransition(IntentStatus from, IntentStatus to) {

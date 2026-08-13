@@ -86,6 +86,13 @@ public final class IntentCommandService {
     /** 待回收记录：loc 为终态槽位置；singleSlot 为 true 才清空复用。 */
     public record PendingReclaim(SlotLocation loc, boolean singleSlot) {}
 
+    /**
+     * 磁盘历史最高 revision(恢复期由 WheelRecovery 注入)。createIntent 重建同 intentId 时
+     * 需把新 Intent 的 revision 种子到历史最高值之上——否则新 Intent 从 0 起步,recovery 按
+     * max revision 去重会被旧终态墓碑(更高 revision,multiSlot 保留)遮蔽,新 Intent 静默丢失。
+     */
+    private volatile java.util.Map<String, Long> recoveredMaxRevisions = java.util.Map.of();
+
     public IntentCommandService(
         IntentStore intentStore,
         PrecisionScheduler scheduler,
@@ -167,6 +174,13 @@ public final class IntentCommandService {
             }
 
             intent.transitionTo(IntentStatus.SCHEDULED);
+            // R8: 重建同 intentId 时种子 revision 到磁盘历史最高值之上——否则新 Intent 从 0
+            // 起步,recovery 按 max revision 去重会被旧终态墓碑(更高 revision,multiSlot 保留)
+            // 遮蔽,新 Intent 静默丢失。种子后 incrementRevision 使新槽 revision 严格大于历史最高。
+            Long histMax = recoveredMaxRevisions.get(intent.getIntentId());
+            if (histMax != null && histMax >= intent.getRevision()) {
+                intent.setRevision(histMax);
+            }
             intent.incrementRevision();
 
             WalMode effectiveMode = resolveWalMode(intent, ackMode);
@@ -299,6 +313,12 @@ public final class IntentCommandService {
                 oldStatuses[i] = intent.getStatus();
                 oldRevisions[i] = intent.getRevision();
                 intent.transitionTo(IntentStatus.SCHEDULED);
+                // R8: 同 createIntent——重建同 intentId 时种子 revision 到历史最高值之上,
+                // 否则 recovery max-revision 去重会遮蔽新 Intent。
+                Long histMax = recoveredMaxRevisions.get(intent.getIntentId());
+                if (histMax != null && histMax >= intent.getRevision()) {
+                    intent.setRevision(histMax);
+                }
                 intent.incrementRevision();
                 SlotLocation loc = persistToWheel(intent, false);
                 locs.add(loc);
@@ -834,6 +854,11 @@ public final class IntentCommandService {
     /** 恢复期由 WheelRecovery 注入:磁盘上幸存槽数 >1 的 Intent 视为多槽(终态保留墓碑不回收)。 */
     public void markMultiSlot(java.util.Set<String> ids) {
         multiSlotIntents.addAll(ids);
+    }
+
+    /** 恢复期由 WheelRecovery 注入:intentId → 磁盘历史最高 revision(含终态墓碑与跨视界 tail)。 */
+    public void markMaxRevisions(java.util.Map<String, Long> revisions) {
+        this.recoveredMaxRevisions = java.util.Map.copyOf(revisions);
     }
 
     /**

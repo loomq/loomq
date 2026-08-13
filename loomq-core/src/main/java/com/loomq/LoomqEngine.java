@@ -252,6 +252,13 @@ public class LoomqEngine implements AutoCloseable {
                 commandService.markMultiSlot(recoveryReport.multiSlotIntentIds());
             }
 
+            // R8:恢复期注入磁盘历史最高 revision,使 createIntent 重建同 intentId 时能把新
+            // Intent 的 revision 抬升到旧终态墓碑之上——否则 recovery max-revision 去重会
+            // 遮蔽重建的新 Intent(静默丢失)。
+            if (!recoveryReport.maxRevisions().isEmpty()) {
+                commandService.markMaxRevisions(recoveryReport.maxRevisions());
+            }
+
             // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
             commitBarrier.start();
 

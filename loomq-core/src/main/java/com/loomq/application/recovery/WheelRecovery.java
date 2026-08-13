@@ -94,6 +94,12 @@ public final class WheelRecovery {
         // 3. Process only the max-revision winner per intentId
         int hot = 0, cold = 0;
         Set<String> multiSlot = new HashSet<>();
+        // 每个 intentId 的磁盘历史最高 revision(供 createIntent 重建路径种子 revision,
+        // 避免重建的新 Intent 从 0 起步被旧终态墓碑遮蔽)。含终态/非终态/跨视界 tail。
+        Map<String, Long> maxRevisions = new HashMap<>();
+        for (Map.Entry<String, SlotEntry> en : latest.entrySet()) {
+            maxRevisions.put(en.getKey(), en.getValue().intent().getRevision());
+        }
         for (SlotEntry e : latest.values()) {
             Intent intent = e.intent();
             String id = intent.getIntentId();
@@ -148,6 +154,6 @@ public final class WheelRecovery {
         }
 
         log.info("WheelRecovery: hotRestored={}, coldRegistered={}, multiSlot={}", hot, cold, multiSlot.size());
-        return new WheelRecoveryReport(hot, cold, multiSlot);
+        return new WheelRecoveryReport(hot, cold, multiSlot, maxRevisions);
     }
 }
