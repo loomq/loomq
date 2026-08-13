@@ -181,7 +181,9 @@ public class PrecisionScheduler {
         DeliveryContext ctx = new DeliveryContext(
             intent.getLastDeliveryId() != null ? intent.getLastDeliveryId() : intent.getIntentId(),
             intent.getIntentId(),
-            intent.getAttempts());
+            // attempt 语义为"本次失败投递是第几次尝试"(从 1 开始)。此时 incrementAttempts()
+            // 尚未执行(它在 handleDeliveryFailure 内),故当前 attempts 是上一次的值,需 +1。
+            intent.getAttempts() + 1);
         ctx.markFailure(ex);
         try {
             return redeliveryDecider.shouldRedeliver(ctx);
