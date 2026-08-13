@@ -167,7 +167,14 @@ public final class SlotCodec {
                 case 0x02 -> createdAt = b.getLong();
                 case 0x03 -> updatedAt = b.getLong();
                 case 0x04 -> deadline = b.getLong();
-                case 0x05 -> expiredAction = ExpiredAction.values()[b.get()];
+                case 0x05 -> {
+                    // R21: ordinal 有界守卫(同 decodeWalMode/tierByOrdinal 约定)——
+                    // 未来版本新增枚举值后降级运行旧版本,越界会裸 AIOOBE。未知值按
+                    // null 回退(构造器默认 DISCARD),与其余枚举回退语义一致。
+                    int ordinal = b.get() & 0xFF;
+                    expiredAction = ordinal < ExpiredAction.values().length
+                        ? ExpiredAction.values()[ordinal] : null;
+                }
                 case 0x06 -> tier = PrecisionTierCatalog.defaultCatalog().tierByOrdinal(b.get() & 0xFF);
                 case 0x07 -> walMode = decodeWalMode(b.get() & 0xFF);
                 case 0x08 -> shardKey = getStr(b, len);
@@ -187,6 +194,12 @@ public final class SlotCodec {
             if (b.position() != start + len) b.position(start + len); // safety
         }
 
+        // R21: statusOrd 有界守卫——未来版本新增 IntentStatus 后降级运行旧版本,越界
+        // 会裸 AIOOBE 且恢复扫描路径无 try/catch(引擎启动失败且原因不明)。
+        // 状态无合理回退值,明确 fail-loudly(与"格式不匹配即响亮失败"契约一致)。
+        if (statusOrd < 1 || statusOrd > IntentStatus.values().length) {
+            throw new IllegalStateException("unknown intent status ordinal: " + statusOrd);
+        }
         IntentStatus status = IntentStatus.values()[statusOrd - 1];
         return Intent.restore(traceId, intentId, status,
             Instant.ofEpochMilli(createdAt), Instant.ofEpochMilli(updatedAt),

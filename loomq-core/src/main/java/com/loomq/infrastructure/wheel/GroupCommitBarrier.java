@@ -112,6 +112,12 @@ public final class GroupCommitBarrier implements AutoCloseable {
                 inlineForceFallbacks.incrementAndGet();
                 try {
                     inlineForceExecutor.submit(() -> doInlineForce(pending)).get();
+                } catch (java.util.concurrent.RejectedExecutionException ree) {
+                    // R21: close() 已关执行器(stop/close 交错)——写者字节已在 mmap,若按
+                    // 失败回滚而字节已持久化,重启后 SCHEDULED 槽复活 = 幽灵投递(正是段 2
+                    // 兜底要防的窗口)。shutdown 期间在调用线程同步 force(接受短暂 pin,
+                    // 正确性优先);force 成功即发布 frontier,写者按成功返回。
+                    doInlineForce(pending);
                 } catch (java.util.concurrent.ExecutionException ee) {
                     Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
                     throw new RuntimeException("inline force fallback failed, ticket=" + myTicket, cause);

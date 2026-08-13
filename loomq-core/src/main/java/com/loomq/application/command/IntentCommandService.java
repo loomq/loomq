@@ -844,13 +844,21 @@ public final class IntentCommandService {
     private SlotLocation persistToWheel(Intent intent, boolean durable) {
         String id = intent.getIntentId();
         SlotLocation loc = wheelStore.locate(intent.getExecuteAt());
+        SlotLocation prevLoc = locationIndex.get(id);
         if (loc.inTail()) {
             tailIndex.put(intent);
         } else {
             loc = wheelStore.put(intent);                   // 捕获分配的真实槽位
+            // R21: tail→wheel 迁移(提升后 fireNow/改期/取消)必须清除旧 tail 记录——
+            // 否则残留 SCHEDULED 旧记录:恢复 slotCounts 虚增使终态墓碑永不回收,
+            // 且 wheel 桶文件过期(31 天)后该记录成为唯一幸存者,重启被当活 intent
+            // 复活投递(幽灵)。tail tombstone 与 wheel 槽同批 awaitCommit 落盘,无崩溃窗口。
+            if (prevLoc != null && prevLoc.inTail()) {
+                tailIndex.remove(id);
+            }
         }
-        if (locationIndex.get(id) != null) {
-            multiSlotIntents.add(id);          // 2nd+ 写入 → 多槽（重排程/改期/取消）
+        if (prevLoc != null) {
+            multiSlotIntents.add(id);          // 2nd+ 写入 → 多槽(重排程/改期/取消)
         }
         locationIndex.put(id, loc);
         trackMaxRevision(intent);              // R9: 维持活映射,同进程重建时种子 revision
@@ -955,7 +963,16 @@ public final class IntentCommandService {
         if (loc.inTail()) {
             var it = tailIndex.scanFrom(loc.bucketKey());
             while (it.hasNext()) {
-                Intent cur = SlotCodec.decode(it.next().encodedSlot());
+                Intent cur;
+                try {
+                    // R21: 防御解码(与 R4/P1-6 恢复路径同款)——tail 记录"结构完整但槽
+                    // 字节损坏"(bit rot)时裸 decode 抛 CRC ISE 穿透 createIntent;
+                    // 损坏条目按不存在跳过(恢复侧同样跳过,索引本就不该引用它)。
+                    cur = SlotCodec.decode(it.next().encodedSlot());
+                } catch (RuntimeException dex) {
+                    logger.warn("hasActiveDuplicate: skipping corrupt tail entry for id {}", intentId, dex);
+                    continue;
+                }
                 if (intentId.equals(cur.getIntentId()) && !cur.getStatus().isTerminal()) {
                     return true;
                 }
