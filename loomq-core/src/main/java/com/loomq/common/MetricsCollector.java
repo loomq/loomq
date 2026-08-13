@@ -246,6 +246,11 @@ public class MetricsCollector {
         return tierMetrics.getDispatchQueueSize(tier);
     }
 
+    /** 获取 due→dispatch lag 的 P95(毫秒)。 */
+    public long getDispatchQueueLagP95(PrecisionTier tier) {
+        return tierMetrics.getDispatchQueueLagP95(tier);
+    }
+
     /**
      * 获取完整的延迟快照（所有分位数），用于压测报告展示。
      */

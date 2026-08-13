@@ -17,6 +17,10 @@ final class PrecisionTierMetricsRegistry {
     // Microsecond buckets: 0, 10, 25, 50, 100, 500, 1ms, 2.5ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s
     private static final int[] LATENCY_BOUNDS = {0, 10, 25, 50, 100, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000, 250000, 500000, 1000000};
 
+    // due→dispatch lag 使用毫秒边界(与导出指标名 loomq_dispatch_queue_lag_ms_p95 一致),
+    // 区别于 wakeup 延迟的微秒边界(LATENCY_BOUNDS)。调度器 recordDispatchQueueLag 传入毫秒。
+    private static final int[] LAG_BOUNDS_MS = {0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+
     private final PrecisionTierCatalog precisionTierCatalog;
     private final Map<PrecisionTier, AtomicLong> intentByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> intentDueByTier = new EnumMap<>(PrecisionTier.class);
@@ -73,7 +77,7 @@ final class PrecisionTierMetricsRegistry {
             }
 
             ConcurrentHashMap<Integer, AtomicLong> lagBuckets = dispatchQueueLagByTier.get(tier);
-            for (int i = 0; i < LATENCY_BOUNDS.length; i++) {
+            for (int i = 0; i < LAG_BOUNDS_MS.length; i++) {
                 lagBuckets.put(i, new AtomicLong(0));
             }
         }
@@ -144,7 +148,7 @@ final class PrecisionTierMetricsRegistry {
     void recordDispatchQueueLagByTier(PrecisionTier tier, long lagMs) {
         PrecisionTier resolvedTier = resolveTier(tier);
         dispatchQueueLagSampleCountByTier.get(resolvedTier).incrementAndGet();
-        int bucketIndex = findBucket(lagMs);
+        int bucketIndex = findLagBucket(lagMs);
         dispatchQueueLagByTier.get(resolvedTier).get(bucketIndex).incrementAndGet();
     }
 
@@ -248,7 +252,12 @@ final class PrecisionTierMetricsRegistry {
         PrecisionTier resolvedTier = resolveTier(tier);
         ConcurrentHashMap<Integer, AtomicLong> buckets = dispatchQueueLagByTier.get(resolvedTier);
         long totalSamples = dispatchQueueLagSampleCountByTier.get(resolvedTier).get();
-        return calculateP95(buckets, totalSamples);
+        return calculatePercentile(buckets, totalSamples, 0.95, LAG_BOUNDS_MS);
+    }
+
+    /** 供 MetricsCollector 暴露 due→dispatch lag P95(毫秒)。 */
+    long getDispatchQueueLagP95(PrecisionTier tier) {
+        return calculateP95DispatchQueueLagByTier(tier);
     }
 
     Map<PrecisionTier, Long> getIntentCountsByTier() {
@@ -424,6 +433,15 @@ final class PrecisionTierMetricsRegistry {
         return 0;
     }
 
+    private int findLagBucket(long lagMs) {
+        for (int i = LAG_BOUNDS_MS.length - 1; i >= 0; i--) {
+            if (lagMs >= LAG_BOUNDS_MS[i]) {
+                return i;
+            }
+        }
+        return 0;
+    }
+
     private long calculateP95(ConcurrentHashMap<Integer, AtomicLong> buckets, long totalSamples) {
         return calculatePercentile(buckets, totalSamples, 0.95);
     }
@@ -431,6 +449,13 @@ final class PrecisionTierMetricsRegistry {
     private long calculatePercentile(ConcurrentHashMap<Integer, AtomicLong> buckets,
                                      long totalSamples,
                                      double percentile) {
+        return calculatePercentile(buckets, totalSamples, percentile, LATENCY_BOUNDS);
+    }
+
+    private long calculatePercentile(ConcurrentHashMap<Integer, AtomicLong> buckets,
+                                     long totalSamples,
+                                     double percentile,
+                                     int[] bounds) {
         if (totalSamples == 0) {
             return 0;
         }
@@ -438,13 +463,13 @@ final class PrecisionTierMetricsRegistry {
         long target = (long) Math.ceil(totalSamples * percentile);
         long cumulative = 0;
 
-        for (int i = 0; i < LATENCY_BOUNDS.length; i++) {
+        for (int i = 0; i < bounds.length; i++) {
             cumulative += buckets.get(i).get();
             if (cumulative >= target) {
-                return LATENCY_BOUNDS[i];
+                return bounds[i];
             }
         }
 
-        return LATENCY_BOUNDS[LATENCY_BOUNDS.length - 1];
+        return bounds[bounds.length - 1];
     }
 }
