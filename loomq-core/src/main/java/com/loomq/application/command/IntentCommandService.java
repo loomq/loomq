@@ -457,6 +457,16 @@ public final class IntentCommandService {
                             + intent.getStatus() + "; use cancelIntent");
                 }
 
+                // R16: updater 置空 executeAt 会污染调度器——persistToWheel.locate(null) NPE,
+                // 且 scanDue 的 intent.getExecuteAt().isAfter(now) 持续 NPE 使该档扫描永久卡死。
+                // 拒绝并回滚 executeAt/updatedAt,维持内核不变量(executeAt 恒非空)。
+                if (intent.getExecuteAt() == null) {
+                    intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    intent.setExecuteAt(oldExecuteAt);
+                    throw new IllegalArgumentException(
+                        "updater must not set executeAt to null for intent " + intentId);
+                }
+
                 // 安全网：updater 可能直接通过 intent.setExecuteAt() 修改了执行时间，
                 // 此时 newExecuteAt 为 null 导致 reschedule 初始为 false，需要补检。
                 if (!reschedule) {
