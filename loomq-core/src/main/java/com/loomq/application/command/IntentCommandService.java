@@ -461,11 +461,17 @@ public final class IntentCommandService {
         } catch (RuntimeException e) {
             logger.error("Failed to update intent: id={}", intentId, e);
             // 回滚：更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按当前
-            // executeAt 重新调度——否则 intent 在 store 中为 SCHEDULED 却不在任何
+            // executeAt 重新调度——否则 intent 在 store 中为 SCHEDULED/DUE 却不在任何
             // bucket/cohort，静默永不投递直到重启恢复（投递延迟丢失）。
-            if (removedForReschedule && intent.getStatus() == IntentStatus.SCHEDULED) {
+            // 镜像正常 reschedule 分支（见下方）：DUE 走 restore()、SCHEDULED 走 schedule()。
+            // 终态（updater 已 CANCELED/EXPIRED/DEAD_LETTERED）不重排——保持终态语义。
+            if (removedForReschedule) {
                 try {
-                    scheduler.schedule(intent);
+                    if (intent.getStatus() == IntentStatus.DUE) {
+                        scheduler.restore(intent);
+                    } else if (intent.getStatus() == IntentStatus.SCHEDULED) {
+                        scheduler.schedule(intent);
+                    }
                 } catch (Exception re) {
                     logger.error(
                         "Failed to re-schedule intent {} after update failure; it will not be delivered until restart",
