@@ -156,28 +156,32 @@ class GroupCommitBarrierTest {
      * <p>doInlineForce 的 forceDirty()/flush() 抛异常（ENOSPC/EIO/段已关闭）时字节并未落盘；
      * 若仍推进 flushedTicket，其他在兜底分支等待的写者会看到 flushedTicket >= myTicket 而返回
      * 成功——DURABLE 假阳：崩溃即丢数据，正是本类 javadoc 声称要杜绝的 under-wait。
-     * daemon 循环只在 force 成功后发布，内联兜底必须一致。</p>
+     * 内联兜底必须与 daemon 一致：仅成功后发布。</p>
      *
-     * <p>构造：put 制造脏桶 → 关闭 store（arena 关闭 → 后续 seg.force() 抛 ISE）→ 并发写者
-     * awaitCommit。daemon 循环每次 force 失败且不发布；写者超时后走内联 force → 同样失败 →
-     * 两个写者都必须抛错（frontier 保持 0），而非返回成功。</p>
+     * <p>构造：put 制造脏桶 + tail.put 制造脏 tail → daemon 首轮 force 成功后 park 60s(测试期间
+     * 不再自然 force,消除 put→close 与 daemon 轮次的竞争) → 关闭 store/tail(forceIfDirty 对
+     * 已关闭桶是 closed 检查跳过;tail.flush() 只在 dirty 时触碰通道——关闭前再 put 一次使
+     * tail 保持 dirty) → 写者超时走内联 force:flush() 对已关闭通道抛 NonWritableChannelException
+     * → 不发布 frontier → 两个写者都必须抛错(frontier 保持 0),而非返回成功。</p>
      */
     @Test
     void inlineForceFailureMustNotPublishFrontier() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1L, 200L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 60_000L, 200L, 60L * 60_000L, 60_000L, null);
         WheelStore store = new WheelStore(cfg, clock::get);
         TailIndex tail = new TailIndex(tmp, clock::get);
-        GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 200);
+        GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 60_000, 200);
 
         Intent it = new Intent("intent_flf00000001");
         it.setExecuteAt(Instant.ofEpochMilli(clock.get() + 1_000));
         it.transitionTo(IntentStatus.SCHEDULED);
         store.put(it); // 脏桶：forceDirty 有内容可刷
+        tail.put(it);  // 脏 tail：flush() 有内容可刷
 
         barrier.start();
-        // 让 daemon 跑过初始轮次，然后关闭 store → 所有桶段不活 → 后续 forceDirty 抛 ISE。
+        // 让 daemon 跑完首轮（force 成功、dirty 清除）并 park 60s，然后关闭 store/tail。
         Thread.sleep(50);
+        tail.put(it);  // 重新弄脏 tail：关闭通道后 flush() 将触碰已关闭通道并抛错
         store.close();
         tail.close();
 

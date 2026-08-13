@@ -99,6 +99,8 @@ public class LoomqEngine implements AutoCloseable {
     private final String nodeId;
     private final PrecisionTier defaultTier;
     private final boolean deliveryHandlerConfigured;
+    /** tail run 文件 compaction 阈值(close 时触发,见 {@link #close()})。 */
+    private final long compactionThresholdBytes;
 
     private LoomqEngine(Builder builder) {
         this.nodeId = builder.nodeId != null ? builder.nodeId : "default-node";
@@ -122,6 +124,7 @@ public class LoomqEngine implements AutoCloseable {
                 wheelConfig = WheelConfig.defaultConfig().withDataDir(dir.toString());
             }
             this.dataDir = Path.of(wheelConfig.dataDir());
+            this.compactionThresholdBytes = wheelConfig.compactionThresholdBytes();
             Files.createDirectories(dataDir);
 
             // 初始化组件
@@ -335,6 +338,15 @@ public class LoomqEngine implements AutoCloseable {
 
         // 关闭时间轮(强制脏桶落盘)
         wheelStore.close();
+
+        // C3-9: 关闭期压缩 tail run 文件(javadoc 承诺的"优雅关闭时(所有写入已停止)"时机)。
+        // 长运行进程中 run 文件只增不减(PUT+TOMBSTONE 累积),若不压缩只能等下次启动;
+        // 此时所有写入已停止(operationExecutor 已排空、daemon 已停),compaction 安全。
+        try {
+            tailIndex.compactIfNeeded(compactionThresholdBytes);
+        } catch (Exception e) {
+            logger.error("Tail compaction on close failed; run file left uncompacted", e);
+        }
 
         // 关闭 tail run 文件
         tailIndex.close();

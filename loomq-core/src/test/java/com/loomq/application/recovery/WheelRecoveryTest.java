@@ -16,7 +16,9 @@ import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
 import com.loomq.testutil.TestWheelConfigs;
 import com.loomq.tracing.IntentTraceStore;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -74,6 +76,41 @@ class WheelRecoveryTest {
             WheelRecoveryReport rpt = rec.recover(mem, scheduler, idx, daemon);
             verifier.accept(new Recovered(rpt, mem, idx, daemon));
         }
+    }
+
+    /**
+     * C3-2: 恢复期 overdue 判定必须带时钟回拨守卫。桶文件 mtime 是"引擎最后写入时刻"的
+     * 磁盘证据;重启时钟若早于该证据(停机期间回拨),按 overdue 终态化会把回拨窗口内
+     * 实际未到期的 Intent 不可逆杀掉——与运行时"回拨仅延迟不杀"(ClockRollbackTest)的
+     * 立场不一致。修复:检测到回拨时跳过 overdue 终态化,按正常路径恢复(延迟投递而非杀)。
+     */
+    @Test
+    void shouldNotTerminalizeOverdueWhenClockRolledBack() throws Exception {
+        AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
+        try (WheelStore store = new WheelStore(cfg, clock::get);
+             TailIndex tail = new TailIndex(tmp, clock::get)) {
+            // 1 小时前到期:正常时钟下恢复期会被 overdue 终态化(EXPIRED)
+            Intent overdue = new Intent("intent_rollback0001");
+            overdue.setExecuteAt(Instant.ofEpochMilli(clock.get() - 3_600_000));
+            overdue.transitionTo(IntentStatus.SCHEDULED);
+            store.put(overdue);
+        }
+        // 模拟停机期间时钟回拨:把桶文件 mtime 前拨到 2 小时后(磁盘证据:最后写入时刻 > 重启 now)
+        long futureMtime = System.currentTimeMillis() + 2L * 3_600_000L;
+        for (Path p : Files.walk(tmp).filter(Files::isRegularFile)
+                .filter(p -> p.toString().endsWith(".bin")).toList()) {
+            Files.setLastModifiedTime(p, FileTime.fromMillis(futureMtime));
+        }
+
+        reopenAndRecover(cfg, clock::get, r -> {
+            assertEquals(1, r.report().hotRestored(),
+                "rolled-back clock must not kill the overdue intent: restore instead of terminalize");
+            Intent restored = r.mem().findById("intent_rollback0001");
+            assertNotNull(restored, "overdue intent must be loaded into memory under rollback guard");
+            assertEquals(IntentStatus.SCHEDULED, restored.getStatus(),
+                "must stay SCHEDULED, not flipped to EXPIRED by a rolled-back clock");
+        });
     }
 
     @Test

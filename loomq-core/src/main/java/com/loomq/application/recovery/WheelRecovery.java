@@ -35,6 +35,12 @@ import org.slf4j.LoggerFactory;
 public final class WheelRecovery {
     private static final Logger log = LoggerFactory.getLogger(WheelRecovery.class);
 
+    /**
+     * 时钟回拨守卫裕量:重启时钟比"最新桶文件 mtime"还早超过该值,判定停机期间时钟回拨。
+     * 吸收 mtime 粒度(部分文件系统为秒级)与时钟抖动。
+     */
+    private static final long CLOCK_ROLLBACK_MARGIN_MS = 5 * 60_000L;
+
     private final WheelStore store;
     private final TailIndex tail;
     private final long hotBoundaryMs;
@@ -49,6 +55,21 @@ public final class WheelRecovery {
                                        IntentLocationIndex idx, PromotionDaemon daemon) {
         long nowMs = System.currentTimeMillis();
         long hotBoundary = nowMs + hotBoundaryMs;
+
+        // C3-2: 时钟回拨守卫。桶文件 mtime 是"引擎最后写入时刻"的磁盘证据(写入/force 推进
+        // mtime);若重启时钟早于该证据(停机期间 NTP 校时回拨/运维改时钟),overdue 判定
+        // (execMs < nowMs)会把回拨窗口内实际未到期的 Intent 不可逆终态化——与运行时
+        // "回拨仅延迟不杀"(ClockRollbackTest)的立场不一致。检测到回拨时跳过 overdue
+        // 终态化,按正常路径恢复(延迟投递而非杀)。无桶(无证据)时守卫不生效。
+        boolean clockRolledBack = false;
+        long newestWriteMs = store.newestBucketWriteTimeMs();
+        if (newestWriteMs > 0 && nowMs + CLOCK_ROLLBACK_MARGIN_MS < newestWriteMs) {
+            clockRolledBack = true;
+            log.error("System clock appears rolled back: now={} < last bucket write={} (margin {}ms); "
+                    + "skipping overdue terminalization — intents due during downtime will be restored "
+                    + "and delivered late instead of killed",
+                nowMs, newestWriteMs, CLOCK_ROLLBACK_MARGIN_MS);
+        }
 
         // 1. tail → day (cold→cold disk reorg, once)
         tail.promoteInto(store);
@@ -95,9 +116,6 @@ public final class WheelRecovery {
         // 每个 intentId 的磁盘历史最高 revision(供 createIntent 重建路径种子 revision,
         // 避免重建的新 Intent 从 0 起步被旧终态墓碑遮蔽)。含终态/非终态/跨视界 tail。
         Map<String, Long> maxRevisions = new HashMap<>();
-        for (Map.Entry<String, SlotEntry> en : latest.entrySet()) {
-            maxRevisions.put(en.getKey(), en.getValue().intent().getRevision());
-        }
         for (SlotEntry e : latest.values()) {
             Intent intent = e.intent();
             String id = intent.getIntentId();
@@ -105,14 +123,19 @@ public final class WheelRecovery {
             if (intent.getStatus().isTerminal()) {
                 // F3:唯一幸存且为终态 → 崩溃窗口泄漏的单槽终态墓碑(overwrite 与 reclaim 之间崩溃),
                 // 无兄弟槽可复活,恢复期回收清空,桶容量自愈(wheel 槽;tail 内终态不在此回收)。count>1 的合法多槽墓碑保留(参与去重)。
-                if (count == 1) {
+                if (count == 1 && !e.loc().inTail()) {
                     store.freeSlot(e.loc());
                     log.info("Recovery: reclaimed leaked terminal slot {} for intent {}", e.loc(), id);
+                    // C3-4: 单槽 wheel 终态已回收 → 磁盘不再有该 id 的任何记录 → 无需注入
+                    // maxRevisions(注入即无清理路径的内存泄漏)。tail 终态与多槽墓碑保留在
+                    // 磁盘上(参与 max-revision 去重),种子映射必须随之保留。
+                } else {
+                    maxRevisions.put(id, intent.getRevision());
                 }
                 continue;
             }
             long execMs = intent.getExecuteAt().toEpochMilli();
-            if (execMs < nowMs) {
+            if (!clockRolledBack && execMs < nowMs) {
                 // P0-2: 停机窗口到期的 Intent 不再静默丢弃。按 ExpiredAction 补终态
                 // 并持久化终态 revision,使下次重启恢复时被 terminal 跳过(避免每次重启重复处理)。
                 // 不补投——投递窗口已过,补投对下游往往是过时事件;留终态痕迹与告警即可。
@@ -144,6 +167,7 @@ public final class WheelRecovery {
                 continue;
             }
             if (count > 1) multiSlot.add(id);    // F1: 磁盘上幸存兄弟 >1 → 终态须保留墓碑不回收
+            maxRevisions.put(id, intent.getRevision());   // R8 种子:非终态活记录保留在磁盘,重建须抬升其上
             idx.put(id, e.loc());                // rebuild index: only non-terminal, non-overdue
             if (execMs <= hotBoundary) {
                 memStore.upsert(intent);

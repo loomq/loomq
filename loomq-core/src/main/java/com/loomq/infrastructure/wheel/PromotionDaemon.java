@@ -103,7 +103,14 @@ public final class PromotionDaemon implements AutoCloseable {
                 intent = null;
                 while (it.hasNext()) {
                     var te = it.next();
-                    Intent decoded = SlotCodec.decode(te.encodedSlot());
+                    // C3-6: 防御解码(与 hasActiveDuplicate/promoteInto/WheelRecovery 同款)——
+                    // 损坏 tail 条目裸 decode 抛 CRC ISE 会被外层 catch 吞掉,该 intent 本进程
+                    // 内永不提升、不投递、不终态化,且 cohort 条目已摘除无重试。
+                    Intent decoded = SlotCodec.decodeSafe(te.encodedSlot());
+                    if (decoded == null) {
+                        log.warn("PromotionDaemon: skipping corrupt tail entry for intent {}", h.intentId());
+                        continue;
+                    }
                     if (h.intentId().equals(decoded.getIntentId())) { intent = decoded; break; }
                 }
             } else {

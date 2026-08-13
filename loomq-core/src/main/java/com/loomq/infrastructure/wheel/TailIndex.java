@@ -60,6 +60,17 @@ public final class TailIndex implements AutoCloseable {
     /** 序列化 put/remove(内存变更 + run 追加)以保证重放顺序与内存顺序一致、记录不撕裂。 */
     private final Object appendLock = new Object();
 
+    /**
+     * 自上次 flush 起是否有新 append。GroupCommitBarrier 每周期无条件调 flush():
+     * 无写时跳过 syscall(消除每周期空 force),有写时 force(true)——append-only 增长
+     * 文件的长度元数据必须随字节一起落盘(force(false)=fdatasync 语义不保证 size,
+     * 非 Linux/延迟分配文件系统上 DURABLE 的 tail 记录可能因文件短于预期而丢失)。
+     */
+    private volatile boolean dirty = false;
+
+    /** 上次 loadRun 是否遇到中段结构损坏(未知 type 字节)。true 时禁止截断尾部。 */
+    private boolean lastLoadCorrupted = false;
+
     public TailIndex(Path dataDir, LongSupplier clock) {
         this.clock = clock;
         this.runFile = dataDir.resolve("tail").resolve("tail.log");
@@ -72,7 +83,10 @@ public final class TailIndex implements AutoCloseable {
             long validLen = loadRun();
             // 截断撕裂的尾部字节:若不截断,后续 APPEND 写入会落在撕裂字节之后,下次重启时
             // loadRun 会把撕裂头 + 后续合法字节误解析为一条垃圾 PUT(幻影条目 + 丢失真实条目)。
-            truncateTornTail(validLen);
+            // 中段结构损坏(非物理尾部撕裂)不截断——见 loadRun 注释。
+            if (!lastLoadCorrupted) {
+                truncateTornTail(validLen);
+            }
             this.runChannel = FileChannel.open(
                 runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
         } catch (IOException e) {
@@ -199,8 +213,10 @@ public final class TailIndex implements AutoCloseable {
 
     /** 强制 run 文件缓冲写落盘(GroupCommitBarrier 在 ack DURABLE 写者前调用)。 */
     public void flush() {
+        if (!dirty) return;   // 无 tail 写:跳过 syscall(barrier 每周期都会调用)
         try {
-            runChannel.force(false);
+            runChannel.force(true);
+            dirty = false;
         } catch (IOException e) {
             throw new RuntimeException("flush tail run file failed: " + runFile, e);
         }
@@ -252,7 +268,7 @@ public final class TailIndex implements AutoCloseable {
                 }
                 buf.flip();
                 while (buf.hasRemaining()) ch.write(buf);
-                ch.force(false);
+                ch.force(true);   // 新文件长度元数据一并落盘(与 flush() 的 force(true) 同旨)
             }
 
             // 2. Atomic replace: close old channel -> move -> reopen
@@ -261,6 +277,7 @@ public final class TailIndex implements AutoCloseable {
             Files.move(compactFile, runFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             runChannel = FileChannel.open(runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
             channelClosed = false;
+            dirty = false;   // 新通道无缓冲写
 
             log.info("Tail compaction: {} bytes -> {} bytes ({} live entries)",
                 fileSize, Files.size(runFile), byId.size());
@@ -296,8 +313,14 @@ public final class TailIndex implements AutoCloseable {
      * 从 run 文件起始逐条重放到正确终态。PUT → 入内存;TOMBSTONE → 撤内存。
      * 文件不存在或为空时 no-op。尾部撕裂记录(长度不足)按"截断"处理,停止重放。
      *
+     * <p><b>中段结构损坏(未知 type 字节)不截断</b>:撕裂只发生在崩溃 mid-append 的
+     * 物理尾部;中段损坏是位翻转(头部无 CRC 保护),截断会静默销毁损坏点之后可能仍
+     * 有效的 DURABLE 记录。中段损坏时停止重放、保留文件字节(error 日志)供取证——
+     * 解析无法继续(无记录级 CRC 无法重定位),但数据不被主动销毁。</p>
+     *
      * @return 最后一条有效记录的结束字节偏移(validLen);之后的字节(若有)是撕裂尾部,
-     *     需由调用方截断,否则下次 APPEND 会污染日志。
+     *     需由调用方截断,否则下次 APPEND 会污染日志。中段损坏时返回偏移前的长度
+     *     但标记 {@link #lastLoadCorrupted},调用方不得截断。
      */
     private long loadRun() {
         if (!Files.isRegularFile(runFile)) return 0L;
@@ -330,7 +353,13 @@ public final class TailIndex implements AutoCloseable {
                 applyRemove(intentId);
                 pos = afterId;
             } else {
-                break; // 未知记录类型,按截断停止
+                // 中段结构损坏(非物理尾部撕裂):停止重放但绝不截断——截断会静默销毁
+                // 损坏点之后可能仍有效的 DURABLE 记录。保留字节供取证与人工修复。
+                lastLoadCorrupted = true;
+                log.error("tail run file corrupted at byte {}: unknown record type {}; "
+                        + "stopping replay and PRESERVING the file ({} bytes) for forensics",
+                    pos, type & 0xFF, len);
+                break;
             }
         }
         // pos 即最后一条有效记录的结束字节偏移;之后的字节(若有)是撕裂尾部,需截断。
@@ -384,6 +413,7 @@ public final class TailIndex implements AutoCloseable {
         buf.flip();
         try {
             while (buf.hasRemaining()) runChannel.write(buf);
+            dirty = true;   // 写完成后置位:并发 flush 读到 true 即覆盖本次写入
         } catch (IOException e) {
             throw new RuntimeException("append tail run record failed: " + runFile, e);
         }

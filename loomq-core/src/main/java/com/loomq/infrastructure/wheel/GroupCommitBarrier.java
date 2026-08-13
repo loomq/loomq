@@ -190,7 +190,12 @@ public final class GroupCommitBarrier implements AutoCloseable {
                 tail.flush();                       // forces tail run file buffer (>30-day Intent writes) to disk
                 lock.lock();
                 try {
-                    flushedTicket = pending;        // publish: writes with ticket <= pending are now forced
+                    // C2-11: 单调发布守卫(镜像 doInlineForce)——daemon force 期间可能有超时
+                    // 写者走内联 force 并发布了更高 frontier;无条件回退发布会让 frontier
+                    // 非单调(违反 javadoc 表述)。守卫仅保守多等,无虚假成功。
+                    if (pending > flushedTicket) {
+                        flushedTicket = pending;    // publish: writes with ticket <= pending are now forced
+                    }
                     committed.signalAll();
                 } finally { lock.unlock(); }
             } catch (Exception e) {
@@ -215,7 +220,9 @@ public final class GroupCommitBarrier implements AutoCloseable {
             long pending = writeTicket.get();
             lock.lock();
             try {
-                flushedTicket = pending;
+                if (pending > flushedTicket) {   // C2-11: 单调发布(同 daemon loop)
+                    flushedTicket = pending;
+                }
                 committed.signalAll();
             } finally { lock.unlock(); }
         } catch (Exception e) {

@@ -712,6 +712,15 @@ public class PrecisionScheduler {
         if (intent == null || intent.getExecuteAt() == null) {
             return;
         }
+        // C3-5: 恢复/重排程恢复路径补 trace(与 schedule() 同款 recordCreatedIfNew 幂等守卫)——否则
+        // 重启恢复的热 Intent 在 IntentTraceStore 无条目,后续 recordEnqueued/recordDelivered 全是
+        // computeIfPresent no-op,与冷路径(promote 经 schedule 有 trace)行为不一致。同 incarnation
+        // 重复 restore(改期/重试)由 createdAt 匹配守卫跳过,不刷新投递历史。
+        long createdAtMs = intent.getCreatedAt() != null
+            ? intent.getCreatedAt().toEpochMilli()
+            : System.currentTimeMillis();
+        traceStore.recordCreatedIfNew(
+            intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier(), createdAtMs);
         // I5: synchronized + 终态复查 -- cancel 可能在锁释放与 restore() 之间发生。
         // 重复注册（并发 fireNow/reschedule）是良性的：BucketGroup.add() 原子覆盖，
         // scanDue CAS 去重，CohortManager.remove 的 removeIf 清理全部匹配条目。

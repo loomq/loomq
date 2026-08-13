@@ -255,6 +255,26 @@ public final class WheelStore implements AutoCloseable {
 
     public long getMinTailExecuteAt() { return clock.getAsLong() + horizonMs; }
 
+    /**
+     * 最新桶文件的最后写入时刻(mtime,毫秒):恢复期时钟回拨守卫的磁盘证据。
+     * 引擎写入/force 会推进桶文件 mtime;若重启时钟早于该证据(停机期间回拨),
+     * 恢复的 overdue 判定不可信。无桶时返回 0(无证据,守卫不生效)。
+     */
+    public long newestBucketWriteTimeMs() {
+        long max = 0;
+        for (var buckets : wheels.values()) {
+            for (Bucket b : buckets.values()) {
+                try {
+                    long m = Files.getLastModifiedTime(b.path).toMillis();
+                    if (m > max) max = m;
+                } catch (IOException ignored) {
+                    // 取证性守卫:个别文件读不到 mtime 不影响其余证据
+                }
+            }
+        }
+        return max;
+    }
+
     /** 列出指定 tier 的所有桶 key(供 BucketReclaimer 遍历)。 */
     public Set<Long> listBucketKeys(WheelTier tier) {
         return wheels.get(tier).keySet();
@@ -387,9 +407,19 @@ public final class WheelStore implements AutoCloseable {
         }
         /** 回收槽：写 status=0 空槽 + 入 free-list（供 alloc 复用）。双重 free 防护：已空槽不重复入栈。 */
         void free(int slot) {
-            if (!SlotCodec.isOccupied(read(slot))) return;  // 双重 free 防护：已空槽不重复入栈
-            write(slot, EMPTY_SLOT);
-            freeList.push(slot);
+            // C2-4: check-then-act 在 writeLock 内原子化——并发双 free 可同时通过占用检查、
+            // 双双入栈(同槽两份 → alloc 两次发出同一槽,后写者覆写先写者)。当前调用方
+            // (reclaimTerminal 单消费)不可达,防御未来并发回收路径。
+            Lock wl = forceLock.writeLock();
+            wl.lock();
+            try {
+                if (closed) return;
+                if (!SlotCodec.isOccupied(read(slot))) return;  // 双重 free 防护：已空槽不重复入栈
+                write(slot, EMPTY_SLOT);
+                freeList.push(slot);
+            } finally {
+                wl.unlock();
+            }
         }
         void write(int slot, byte[] data) {
             long off = (long) slot * SlotCodec.SLOT_SIZE;
@@ -429,11 +459,6 @@ public final class WheelStore implements AutoCloseable {
         }
         boolean hasUnflushed() { return writeCount.get() > flushedWriteCount; }
 
-        /** 桶的时间窗口是否已过期(超过保留期)。bucketWindowEnd = (bucketKey+1) * windowMs。 */
-        boolean isExpired(long retentionMs, LongSupplier clock) {
-            long windowEndMs = (bucketKey + 1) * tier.windowMs;
-            return clock.getAsLong() - windowEndMs > retentionMs;
-        }
         /** P1-4: 在 writeLock 内检查+force+更新 flushedWriteCount,与 write() 互斥。 */
         void forceIfDirty() {
             if (closed) return;
