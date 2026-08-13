@@ -5,11 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.RedeliveryPolicy;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import com.loomq.testutil.TestIntents;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -78,14 +80,6 @@ class BugMidFlightRescheduleClobberedByRetryTest {
         };
     }
 
-    private static Intent dueIntent(String id) {
-        Intent intent = new Intent(id);
-        intent.setExecuteAt(Instant.now().minusMillis(50));
-        intent.setRedelivery(FIXED_1S);
-        intent.transitionTo(IntentStatus.SCHEDULED);
-        return intent;
-    }
-
     @Test
     void midFlightRescheduleMustBeHonoredOnRetryResult() throws Exception {
         IntentStore store = new ConcurrentIntentStore();
@@ -96,7 +90,8 @@ class BugMidFlightRescheduleClobberedByRetryTest {
             store, blockingFirstThenRetry(deliveries, firstStarted, releaseFirst), null);
         scheduler.start();
         try {
-            Intent intent = dueIntent("r19-midflight-retry-0001");
+            Intent intent = TestIntents.due("r19-midflight-retry-0001", PrecisionTier.STANDARD, Instant.now().minusMillis(50));
+            intent.setRedelivery(FIXED_1S);
             store.save(intent);
             scheduler.schedule(intent);
 
@@ -137,7 +132,8 @@ class BugMidFlightRescheduleClobberedByRetryTest {
             store, blockingFirstThenThrow(deliveries, firstStarted, releaseFirst), null);
         scheduler.start();
         try {
-            Intent intent = dueIntent("r19-midflight-ex-0001");
+            Intent intent = TestIntents.due("r19-midflight-ex-0001", PrecisionTier.STANDARD, Instant.now().minusMillis(50));
+            intent.setRedelivery(FIXED_1S);
             store.save(intent);
             scheduler.schedule(intent);
 

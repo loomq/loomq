@@ -1,9 +1,9 @@
 package com.loomq.infrastructure.wheel;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.testutil.TestWheelConfigs;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
@@ -34,7 +34,7 @@ class TailIndexTest {
     @Test
     void shouldPromoteEntriesEnteringHorizon() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             long execAt = clock.get() + 40L * 86_400_000L; // +40d, 在 tail
@@ -129,7 +129,7 @@ class TailIndexTest {
     @Test
     void shouldSkipCorruptRecordOnPromoteInsteadOfAborting() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (TailIndex tail = new TailIndex(tmp, clock::get)) {
             tail.put(make("intent_good00000001", clock.get() + 10L * 86_400_000L));
             tail.put(make("intent_bad0000000002", clock.get() + 20L * 86_400_000L));

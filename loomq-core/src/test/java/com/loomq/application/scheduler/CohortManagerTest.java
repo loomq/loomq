@@ -1,5 +1,4 @@
 package com.loomq.application.scheduler;
-
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -11,6 +10,7 @@ import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
+import com.loomq.testutil.TestIntents;
 import java.lang.reflect.Field;
 import java.time.Duration;
 import java.time.Instant;
@@ -43,18 +43,6 @@ class CohortManagerTest {
         Intent intent = new Intent(id);
         intent.setExecuteAt(Instant.now().plusSeconds(delaySeconds));
         intent.setDeadline(Instant.now().plusSeconds(delaySeconds + 3600));
-        intent.setPrecisionTier(tier);
-        intent.transitionTo(IntentStatus.SCHEDULED);
-        return intent;
-    }
-
-    /**
-     * 创建一个 executeAt 已过期的 intent，用于触发即时 flush。
-     */
-    private static Intent pastIntent(String id, PrecisionTier tier) {
-        Intent intent = new Intent(id);
-        intent.setExecuteAt(Instant.now().minusMillis(100));
-        intent.setDeadline(Instant.now().plusSeconds(3600));
         intent.setPrecisionTier(tier);
         intent.transitionTo(IntentStatus.SCHEDULED);
         return intent;
@@ -243,7 +231,7 @@ class CohortManagerTest {
             CohortManager cm = createCohortManager(intents -> callCount.incrementAndGet());
             cm.start();
             try {
-                Intent terminal = pastIntent("terminal-1", PrecisionTier.STANDARD);
+                Intent terminal = TestIntents.past("terminal-1", PrecisionTier.STANDARD, 100);
                 terminal.transitionTo(IntentStatus.CANCELED);
                 cm.register(terminal);
 
@@ -262,7 +250,7 @@ class CohortManagerTest {
             cm.start();
             try {
                 assertDoesNotThrow(() -> {
-                    cm.register(pastIntent("null-trigger-1", PrecisionTier.STANDARD));
+                    cm.register(TestIntents.past("null-trigger-1", PrecisionTier.STANDARD, 100));
                     Thread.sleep(500);
                 });
             } finally {
@@ -297,7 +285,7 @@ class CohortManagerTest {
             cm.start();
             Thread oldWakeThread = wakeThreadOf(cm);
             try {
-                cm.register(pastIntent("zombie-1", PrecisionTier.STANDARD));
+                cm.register(TestIntents.past("zombie-1", PrecisionTier.STANDARD, 100));
                 assertTrue(flushEntered.await(5, TimeUnit.SECONDS),
                     "flush must be stuck inside scanTrigger");
                 cm.stop();   // join(2000) 超时——旧线程仍卡在 scanTrigger 内

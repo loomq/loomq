@@ -1,11 +1,11 @@
 package com.loomq.infrastructure.wheel;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.testutil.TestWheelConfigs;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -27,7 +27,7 @@ class BucketReclaimerTest {
     private static final long RETENTION_MS = 31L * 24 * 60 * 60_000L;  // 与 WheelStoreTest 一致
 
     private WheelStore newStore(AtomicLong clock) {
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         return new WheelStore(cfg, clock::get);
     }
 

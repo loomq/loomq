@@ -1,10 +1,8 @@
 package com.loomq.application.scheduler;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loomq.domain.intent.Intent;
-import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.domain.intent.PrecisionTierProfile;
@@ -13,6 +11,7 @@ import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import com.loomq.testutil.TestIntents;
 import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -56,14 +55,6 @@ class BatchWindowAggregationTest {
         return PrecisionTierCatalog.of(profiles, PrecisionTier.STANDARD);
     }
 
-    private static Intent dueIntent(String id) {
-        Intent intent = new Intent(id);
-        intent.setExecuteAt(Instant.now().minusMillis(5));
-        intent.setPrecisionTier(PrecisionTier.STANDARD);
-        intent.transitionTo(IntentStatus.SCHEDULED);
-        return intent;
-    }
-
     /** 经反射直达 STANDARD dispatch 队列,绕过 scanner(消除扫描时序的不确定性)。 */
     private void offerToDispatchQueue(List<Intent> intents) throws Exception {
         Field qf = PrecisionScheduler.class.getDeclaredField("tierDispatchQueues");
@@ -104,7 +95,7 @@ class BatchWindowAggregationTest {
         scheduler.start();
 
         List<Intent> intents = new ArrayList<>(8);
-        for (int i = 0; i < 8; i++) intents.add(dueIntent("batch-full-" + i));
+        for (int i = 0; i < 8; i++) intents.add(TestIntents.due("batch-full-" + i, PrecisionTier.STANDARD, Instant.now().minusMillis(5)));
         offerToDispatchQueue(intents);
 
         assertTrue(delivered.await(5, TimeUnit.SECONDS), "all 8 intents delivered");
@@ -139,7 +130,7 @@ class BatchWindowAggregationTest {
         scheduler.start();
 
         List<Intent> intents = new ArrayList<>(3);
-        for (int i = 0; i < 3; i++) intents.add(dueIntent("batch-partial-" + i));
+        for (int i = 0; i < 3; i++) intents.add(TestIntents.due("batch-partial-" + i, PrecisionTier.STANDARD, Instant.now().minusMillis(5)));
         offerToDispatchQueue(intents);
 
         // 未满批(3 < 4)须在窗口到期后仍派发,而非因等待窗口而卡死。

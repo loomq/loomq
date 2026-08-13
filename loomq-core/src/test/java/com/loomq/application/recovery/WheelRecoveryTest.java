@@ -1,5 +1,4 @@
 package com.loomq.application.recovery;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
@@ -15,6 +14,7 @@ import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import com.loomq.testutil.TestWheelConfigs;
 import com.loomq.tracing.IntentTraceStore;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -79,7 +79,7 @@ class WheelRecoveryTest {
     @Test
     void shouldLoadHotAndRegisterColdForPromotion() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // hot: +5s(在 60min 热窗口内)
@@ -107,7 +107,7 @@ class WheelRecoveryTest {
     @Test
     void shouldSkipTerminalIntentAndNotIndexIt() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // CANCELED (terminal) intent sitting in the day wheel
@@ -129,7 +129,7 @@ class WheelRecoveryTest {
     @Test
     void shouldSkipExpiredIntentAndNotIndexIt() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // executeAt in the past (< now) → expired at recover time
@@ -151,7 +151,7 @@ class WheelRecoveryTest {
     @Test
     void shouldDedupByMaxRevisionWithinDayWheel() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // rev 1: SCHEDULED at +5min (within hot window) → day-wheel slot
@@ -180,7 +180,7 @@ class WheelRecoveryTest {
     @Test
     void shouldNotGhostLoadWhenRescheduledAcrossHorizon() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // rev 1: within horizon (+2min, hot) → day-wheel slot (stale after reschedule)
@@ -216,7 +216,7 @@ class WheelRecoveryTest {
     @Test
     void shouldMarkOverdueIntentAndIncrementMetric() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // executeAt in the past (< now) -> overdue at recover time
@@ -249,7 +249,7 @@ class WheelRecoveryTest {
     @Test
     void shouldRebuildMultiSlotMarkersAndReclaimLeakedTerminalOnRecovery() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         SlotLocation leakedLoc;
         SlotLocation tombLoc;
         String multiId = "intent_multislot0001";
@@ -313,7 +313,7 @@ class WheelRecoveryTest {
     @Test
     void shouldTerminalizeOverdueIntentInPlaceWithoutLeakingStaleSlot() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             // 停机窗口期间到期的 Intent:execMs < now,磁盘上为 SCHEDULED 单槽(rev=1,对齐真实创建语义)

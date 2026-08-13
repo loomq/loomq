@@ -1,5 +1,4 @@
 package com.loomq.infrastructure.wheel;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -13,6 +12,7 @@ import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.RedeliveryPolicy;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.testutil.TestWheelConfigs;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -51,7 +51,7 @@ class SlotCodecRedeliveryPersistenceTest {
     @Test
     void redeliveryPolicyMustSurviveWheelRecovery() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         String id = "r20-recover-rd-0001";
 
         try (WheelStore store = new WheelStore(cfg, clock::get);

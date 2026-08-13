@@ -1,5 +1,4 @@
 package com.loomq.application.scheduler;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -13,6 +12,7 @@ import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import com.loomq.testutil.TestIntents;
 import java.lang.reflect.Field;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -78,14 +78,6 @@ class SignalDrivenConsumerTest {
         return PrecisionTierCatalog.of(profiles, PrecisionTier.STANDARD);
     }
 
-    private static Intent dueIntent(String id, PrecisionTier tier, Instant executeAt) {
-        Intent intent = new Intent(id);
-        intent.setExecuteAt(executeAt);
-        intent.setPrecisionTier(tier);
-        intent.transitionTo(IntentStatus.SCHEDULED);
-        return intent;
-    }
-
     @Test
     @DisplayName("offer→unpark: 消费者在 park 状态下被 unpark 立即消费(远小于 1ms cap)")
     void offerUnparkDeliversFast() throws Exception {
@@ -110,7 +102,7 @@ class SignalDrivenConsumerTest {
             long t0 = System.nanoTime();
             // 直接入桶触发 adaptive scanner 的 bucketAddListener → scan → offer → unpark 消费者。
             scheduler.getBucketGroupManager().add(
-                dueIntent("unpark-" + i, PrecisionTier.ULTRA, Instant.now().minusMillis(5)));
+                TestIntents.due("unpark-" + i, PrecisionTier.ULTRA, Instant.now().minusMillis(5)));
             awaitDelivery(deliveryTimes, expectedSize + 1);
             long elapsedUs = (deliveryTimes.get(expectedSize) - t0) / 1000;
             elapsedUsList.add(elapsedUs);
@@ -149,7 +141,7 @@ class SignalDrivenConsumerTest {
         BlockingQueue<Intent> queue = queues.get(PrecisionTier.ULTRA);
 
         long t0 = System.nanoTime();
-        queue.offer(dueIntent("fallback-1", PrecisionTier.ULTRA, Instant.now()));
+        queue.offer(TestIntents.due("fallback-1", PrecisionTier.ULTRA, Instant.now()));
         assertTrue(delivered.await(2, TimeUnit.SECONDS),
             "empty-poll fallback should deliver without unpark (1ms park cap re-poll)");
         long elapsedUs = (System.nanoTime() - t0) / 1000;
@@ -172,7 +164,7 @@ class SignalDrivenConsumerTest {
 
         List<Intent> scheduled = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            Intent intent = dueIntent("ack-single-" + i, PrecisionTier.ULTRA, Instant.now().minusMillis(5));
+            Intent intent = TestIntents.due("ack-single-" + i, PrecisionTier.ULTRA, Instant.now().minusMillis(5));
             scheduled.add(intent);
             scheduler.schedule(intent);
         }
@@ -201,7 +193,7 @@ class SignalDrivenConsumerTest {
 
         List<Intent> scheduled = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
-            Intent intent = dueIntent("ack-batch-" + i, PrecisionTier.STANDARD, Instant.now().minusMillis(5));
+            Intent intent = TestIntents.due("ack-batch-" + i, PrecisionTier.STANDARD, Instant.now().minusMillis(5));
             scheduled.add(intent);
             scheduler.schedule(intent);
         }

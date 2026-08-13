@@ -31,7 +31,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
-@Tag("slow")
 class PrecisionSchedulerTest {
 
     private IntentStore intentStore;
@@ -284,6 +283,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchSuccessShouldTransitionToAcked() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -307,6 +307,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchDeadLetterShouldTransitionToDeadLettered() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -327,6 +328,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchRetryShouldRescheduleIntent() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -350,6 +352,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchExpiredShouldTransitionToExpired() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -370,6 +373,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void shouldReleaseSemaphoreAfterDispatch() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -392,6 +396,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void semaphoreShouldBeReleasedEvenOnException() throws Exception {
         AtomicReference<Throwable> callbackError = new AtomicReference<>();
         CountDownLatch callbackFired = new CountDownLatch(1);
@@ -417,6 +422,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void shouldHandleDeliveryTimeout() throws Exception {
         CountDownLatch callbackFired = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -459,6 +465,7 @@ class PrecisionSchedulerTest {
     // ========== handleDeliveryFailure exception path (after fix) ==========
 
     @Test
+    @Tag("slow")
     void shouldDeadLetterAfterMaxAttemptsOnException() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {

@@ -1,5 +1,4 @@
 package com.loomq;
-
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +9,7 @@ import com.loomq.infrastructure.wheel.SlotLocation;
 import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.DeliveryHandler;
+import com.loomq.testutil.TestWheelConfigs;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -29,7 +29,7 @@ class HorizonBoundaryTest {
     @Test
     void exactHorizonGoesToWheel(@TempDir Path tmp) {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-07-30T12:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get)) {
             long horizonMs = cfg.horizonDays() * 24L * 60 * 60 * 1000L;
 

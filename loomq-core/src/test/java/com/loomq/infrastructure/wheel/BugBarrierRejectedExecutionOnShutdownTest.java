@@ -1,9 +1,9 @@
 package com.loomq.infrastructure.wheel;
-
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.testutil.TestWheelConfigs;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicLong;
@@ -28,7 +28,7 @@ class BugBarrierRejectedExecutionOnShutdownTest {
     @Test
     void awaitCommitMustSurviveExecutorShutdown() throws Exception {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1000, 100); // 100ms 超时

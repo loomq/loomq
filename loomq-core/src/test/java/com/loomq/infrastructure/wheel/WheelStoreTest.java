@@ -1,9 +1,9 @@
 package com.loomq.infrastructure.wheel;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.testutil.TestWheelConfigs;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
@@ -22,7 +22,7 @@ class WheelStoreTest {
     @TempDir Path tmp;
 
     private WheelStore newStore(AtomicLong clock) {
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         return new WheelStore(cfg, clock::get);
     }
 
@@ -80,7 +80,7 @@ class WheelStoreTest {
     @Test
     void shouldNotOverwriteExistingSlotsOnRestart() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         // Phase 1: write 3 intents into the same future bucket, close.
         String id1, id2, id3;
         try (WheelStore s1 = newStore(clock)) {
@@ -126,7 +126,7 @@ class WheelStoreTest {
     @Test
     void deleteBucketMustNotDeleteRecreatedBucketFile() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         // 过去 40 天的 executeAt(> retention = 31 天),SEC 桶
         long pastMs = clock.get() - 40L * 24 * 60 * 60_000L;
 

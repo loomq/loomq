@@ -1,5 +1,4 @@
 package com.loomq.application.recovery;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import com.loomq.application.scheduler.PrecisionScheduler;
@@ -13,6 +12,7 @@ import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.testutil.TestWheelConfigs;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -34,7 +34,7 @@ class WheelRecoveryMaxRevisionBumpTest {
     @Test
     void overdueTerminalizationMustBumpReportedMaxRevision() {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         String id = "r10-overdue-0001";
 
         // 停机窗口到期的 SCHEDULED 单槽,rev=1
