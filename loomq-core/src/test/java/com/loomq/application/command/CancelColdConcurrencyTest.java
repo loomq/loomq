@@ -7,6 +7,7 @@ import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
@@ -55,7 +56,8 @@ class CancelColdConcurrencyTest {
 
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
+                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L,
+                PrecisionTierCatalog.defaultCatalog(), new com.loomq.tracing.IntentTraceStore());
             barrier.start(); daemon.start(); scheduler.start();
 
             // 冷 Intent:executeAt 远超 60min → 落 wheel(非 tail),不在内存 store
@@ -129,7 +131,8 @@ class CancelColdConcurrencyTest {
 
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
+                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L,
+                PrecisionTierCatalog.defaultCatalog(), new com.loomq.tracing.IntentTraceStore());
             barrier.start(); daemon.start(); scheduler.start();
 
             // 远期冷 Intent:executeAt > 30d 视界 → 落 tail(非 wheel),不在内存 store。

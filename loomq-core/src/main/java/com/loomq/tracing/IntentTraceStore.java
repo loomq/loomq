@@ -27,13 +27,23 @@ public final class IntentTraceStore {
     }
 
     /**
-     * Record intent creation.
+     * Record intent creation (用当前时刻作 createdAt)。
      */
     public void recordCreated(String intentId, String traceId, PrecisionTier tier) {
-        long nowMs = System.currentTimeMillis();
+        recordCreated(intentId, traceId, tier, System.currentTimeMillis());
+    }
+
+    /**
+     * Record intent creation with the intent's own createdAt.
+     *
+     * <p>R21: 同 id 重建(R8 支持路径)是新 incarnation——调度器据此比较 trace 的
+     * createdAt 与 intent 的 createdAt,不匹配即刷新 trace,避免新 intent 继承旧
+     * createdAt/status(如 ACKED)导致 lag 归因全错。</p>
+     */
+    public void recordCreated(String intentId, String traceId, PrecisionTier tier, long createdAtMs) {
         IntentTrace trace = new IntentTrace(
             intentId, traceId, tier, IntentStatus.CREATED,
-            nowMs, 0, 0, 0, 0,
+            createdAtMs, 0, 0, 0, 0,
             0, 0, 0, 0,
             null, null
         );

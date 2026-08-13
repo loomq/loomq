@@ -13,6 +13,7 @@ import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
 import com.loomq.spi.RedeliveryDecider;
 import com.loomq.store.IntentStore;
+import com.loomq.tracing.IntentTrace;
 import com.loomq.tracing.IntentTraceStore;
 import java.time.Duration;
 import java.time.Instant;
@@ -619,10 +620,18 @@ public class PrecisionScheduler {
 
         // Trace: record intent creation (仅真正新建时——recordCreated 会整体替换 trace,
         // 重试重排程/改期重排程若重复调用会把投递历史清空、createdAt 改写为重排程时刻,
-        // 终态 trace 恒显 CREATED,误导"为什么死了"的排查)
-        if (!traceStore.contains(intent.getIntentId())) {
+        // 终态 trace 恒显 CREATED,误导"为什么死了"的排查)。
+        // R21: 同 id 重建(R8 支持路径)是新 incarnation——旧 trace 的 createdAt 与新
+        // intent 的 createdAt 不匹配时须刷新,否则新 intent 继承旧 createdAt/status
+        // (如 ACKED),enqueueLag/totalLag 按旧值错算。记录 intent 自身的 createdAt
+        // (而非调度时刻),使同一 incarnation 的后续重排程与 trace 恒等、不误刷新。
+        IntentTrace existingTrace = traceStore.get(intent.getIntentId());
+        long createdAtMs = intent.getCreatedAt() != null
+            ? intent.getCreatedAt().toEpochMilli()
+            : System.currentTimeMillis();
+        if (existingTrace == null || existingTrace.createdAtMs() != createdAtMs) {
             traceStore.recordCreated(
-                intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier());
+                intent.getIntentId(), intent.getTraceId(), intent.getPrecisionTier(), createdAtMs);
         }
 
         // I5: synchronized 内完成状态迁移 + 索引 + 路由 + 快照；
@@ -1745,7 +1754,8 @@ public class PrecisionScheduler {
         } finally {
             long durationMs = (System.nanoTime() - startTime) / 1_000_000;
             metrics.recordWebhookLatency(durationMs);
-            metrics.incrementIntentByTier(tier);
+            // R21: intent_total 已移到 createIntent/createIntents(统计创建数,HELP 语义)——
+            // 结算路径不再计数,重试不再虚增
         }
     }
 

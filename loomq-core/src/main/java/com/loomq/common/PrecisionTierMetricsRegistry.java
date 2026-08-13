@@ -113,10 +113,10 @@ final class PrecisionTierMetricsRegistry {
         return resolveCounter(scanCountByTier, tier).get();
     }
 
-    void recordWakeupLatencyByTier(PrecisionTier tier, long latencyMs) {
+    void recordWakeupLatencyByTier(PrecisionTier tier, long latencyUs) {
         PrecisionTier resolvedTier = resolveTier(tier);
         wakeupLatencySampleCountByTier.get(resolvedTier).incrementAndGet();
-        int bucketIndex = findBucket(latencyMs);
+        int bucketIndex = findBucket(latencyUs);
         wakeupLatencyByTier.get(resolvedTier).get(bucketIndex).incrementAndGet();
     }
 
@@ -306,10 +306,10 @@ final class PrecisionTierMetricsRegistry {
         }
         sb.append("\n");
 
-        sb.append("# HELP loomq_scheduler_wakeup_latency_ms_p95 P95 wakeup latency by precision tier\n");
-        sb.append("# TYPE loomq_scheduler_wakeup_latency_ms_p95 gauge\n");
+        sb.append("# HELP loomq_scheduler_wakeup_latency_us_p95 P95 wakeup latency (microseconds) by precision tier\n");
+        sb.append("# TYPE loomq_scheduler_wakeup_latency_us_p95 gauge\n");
         for (PrecisionTier tier : precisionTierCatalog.supportedTiers()) {
-            sb.append("loomq_scheduler_wakeup_latency_ms_p95{precision_tier=\"")
+            sb.append("loomq_scheduler_wakeup_latency_us_p95{precision_tier=\"")
               .append(tier.name().toLowerCase())
               .append("\"} ")
               .append(calculateP95WakeupLatencyByTier(tier))
@@ -317,10 +317,10 @@ final class PrecisionTierMetricsRegistry {
         }
         sb.append("\n");
 
-        sb.append("# HELP loomq_scheduler_wakeup_latency_ms_p99 P99 wakeup latency by precision tier\n");
-        sb.append("# TYPE loomq_scheduler_wakeup_latency_ms_p99 gauge\n");
+        sb.append("# HELP loomq_scheduler_wakeup_latency_us_p99 P99 wakeup latency (microseconds) by precision tier\n");
+        sb.append("# TYPE loomq_scheduler_wakeup_latency_us_p99 gauge\n");
         for (PrecisionTier tier : precisionTierCatalog.supportedTiers()) {
-            sb.append("loomq_scheduler_wakeup_latency_ms_p99{precision_tier=\"")
+            sb.append("loomq_scheduler_wakeup_latency_us_p99{precision_tier=\"")
               .append(tier.name().toLowerCase())
               .append("\"} ")
               .append(calculateP99WakeupLatencyByTier(tier))
@@ -328,10 +328,10 @@ final class PrecisionTierMetricsRegistry {
         }
         sb.append("\n");
 
-        sb.append("# HELP loomq_scheduler_wakeup_latency_ms_p999 P99.9 wakeup latency by precision tier\n");
-        sb.append("# TYPE loomq_scheduler_wakeup_latency_ms_p999 gauge\n");
+        sb.append("# HELP loomq_scheduler_wakeup_latency_us_p999 P99.9 wakeup latency (microseconds) by precision tier\n");
+        sb.append("# TYPE loomq_scheduler_wakeup_latency_us_p999 gauge\n");
         for (PrecisionTier tier : precisionTierCatalog.supportedTiers()) {
-            sb.append("loomq_scheduler_wakeup_latency_ms_p999{precision_tier=\"")
+            sb.append("loomq_scheduler_wakeup_latency_us_p999{precision_tier=\"")
               .append(tier.name().toLowerCase())
               .append("\"} ")
               .append(calculateP999WakeupLatencyByTier(tier))

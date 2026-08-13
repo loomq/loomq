@@ -19,6 +19,8 @@ import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
+import com.loomq.tracing.IntentTrace;
+import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -67,6 +69,10 @@ public final class IntentCommandService {
     private final PrecisionTier defaultTier;
     private final long groupCommitIntervalMs;
     private final long hotBoundaryMs;
+    // R21: 注入 catalog(自定义目录的 walMode 默认必须被尊重,见 resolveWalMode)与
+    // traceStore(冷 create/取消/fireNow 的 trace 生命周期归命令服务管)
+    private final PrecisionTierCatalog precisionTierCatalog;
+    private final IntentTraceStore traceStore;
 
     /**
      * 冷取消按 intentId 串行化的细粒度锁注册表。
@@ -113,7 +119,9 @@ public final class IntentCommandService {
         CallbackHandler callbackHandler,
         PrecisionTier defaultTier,
         long groupCommitIntervalMs,
-        long hotBoundaryMs
+        long hotBoundaryMs,
+        PrecisionTierCatalog precisionTierCatalog,
+        IntentTraceStore traceStore
     ) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
@@ -130,6 +138,10 @@ public final class IntentCommandService {
         this.defaultTier = defaultTier;
         this.groupCommitIntervalMs = groupCommitIntervalMs;
         this.hotBoundaryMs = hotBoundaryMs;
+        // R21: 注入 catalog(自定义目录的 walMode 默认必须被尊重)与 traceStore
+        // (冷 create/取消/fireNow 的 trace 生命周期归命令服务管)
+        this.precisionTierCatalog = precisionTierCatalog;
+        this.traceStore = traceStore;
     }
 
     public void registerCallbackHandler(CallbackHandler handler) {
@@ -214,9 +226,21 @@ public final class IntentCommandService {
                 scheduler.schedule(intent);
             } else {
                 promotionDaemon.register(intent.getIntentId(), loc, intent.getExecuteAt().toEpochMilli());
+                // R21: 冷 create 从未 schedule,补 trace 条目——否则冷 intent 排查无迹可循
+                // (recordCreated 幂等:同 incarnation 已存在则跳过)
+                long createdAtMs = intent.getCreatedAt() != null
+                    ? intent.getCreatedAt().toEpochMilli() : System.currentTimeMillis();
+                IntentTrace existing = traceStore.get(intent.getIntentId());
+                if (existing == null || existing.createdAtMs() != createdAtMs) {
+                    traceStore.recordCreated(intent.getIntentId(), intent.getTraceId(),
+                        intent.getPrecisionTier(), createdAtMs);
+                }
             }
 
             metricsCollector.incrementIntentsCreated();
+            // R21: intent_total 统计创建数(HELP 语义),按 tier 维度——旧实现在
+            // finalizeIntent 结算路径计数,重试虚增、冷 intent 不计
+            metricsCollector.incrementIntentByTier(intent.getPrecisionTier());
             logger.debug("Intent created: id={}, ackMode={}, walMode={}, seq={}",
                 intent.getIntentId(), ackMode, effectiveMode, seq);
 
@@ -359,8 +383,18 @@ public final class IntentCommandService {
                     scheduler.schedule(intent);
                 } else {
                     promotionDaemon.register(intent.getIntentId(), locs.get(i), intent.getExecuteAt().toEpochMilli());
+                    // R21: 冷 create 补 trace 条目(同 createIntent 单条路径)
+                    long createdAtMs = intent.getCreatedAt() != null
+                        ? intent.getCreatedAt().toEpochMilli() : System.currentTimeMillis();
+                    IntentTrace existing = traceStore.get(intent.getIntentId());
+                    if (existing == null || existing.createdAtMs() != createdAtMs) {
+                        traceStore.recordCreated(intent.getIntentId(), intent.getTraceId(),
+                            intent.getPrecisionTier(), createdAtMs);
+                    }
                 }
                 metricsCollector.incrementIntentsCreated();
+                // R21: intent_total 按 tier 统计创建数(同 createIntent 单条路径)
+                metricsCollector.incrementIntentByTier(intent.getPrecisionTier());
             } catch (Exception e) {
                 // 不中断循环：其余 intent 已在 phase 1 持久化（wheel/tail 磁盘权威），
                 // 跳过调度会留下"已提交但本进程不投递、仅重启后恢复"的不一致尾巴。
@@ -606,6 +640,8 @@ public final class IntentCommandService {
                 persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
                 intentStore.update(intent);
                 locationIndex.remove(intentId);  // 终态 Intent 不保留索引(桶回收依赖)
+                // R21: 取消须反映到 trace——否则取消后 trace 恒显 SCHEDULED/DUE
+                traceStore.updateStatus(intentId, IntentStatus.CANCELED);
                 // I5: 锁内取快照，锁外派发
                 callbackSnapshot = intent.copy();
             }
@@ -717,6 +753,8 @@ public final class IntentCommandService {
 
         promotionDaemon.remove(intentId);                   // 取消提升 cohort
         locationIndex.remove(intentId);
+        // R21: 冷取消同样反映到 trace(computeIfPresent:无 trace 则 no-op,如从未被冷 create 记录的旧数据)
+        traceStore.updateStatus(intentId, IntentStatus.CANCELED);
         // P1-2: 与 promote 竞态收口——取消生效期间 intent 可能被 PromotionDaemon 并发提升入内存。
         // 若已热载,需从调度结构+store 移除,否则 ghost 投递直到重启 max-revision 纠正。
         // 与 LoomqEngine 中 promote 回调的 post-check 形成双向清理,确定性关闭竞态窗口。
@@ -815,7 +853,13 @@ public final class IntentCommandService {
         });
     }
 
-    private static WalMode resolveWalMode(Intent intent, AckMode ackMode) {
+    /**
+     * 解析持久化语义。三级优先级:显式 AckMode > intent 级 walMode > 档位默认。
+     *
+     * <p>R21: 第 3 级回退使用注入的 catalog——旧实现硬编码 defaultCatalog,自定义目录
+     * 中档位的 walMode 默认(如 ASYNC)被静默替换为 DURABLE,耐久性/性能与配置不符。</p>
+     */
+    static WalMode resolveWalMode(PrecisionTierCatalog catalog, Intent intent, AckMode ackMode) {
         // 1. Explicit AckMode wins (backward compatibility)
         if (ackMode != null) {
             return switch (ackMode) {
@@ -827,13 +871,17 @@ public final class IntentCommandService {
         if (intent.getWalMode() != null) {
             return intent.getWalMode();
         }
-        // 3. Fall back to tier default
-        return PrecisionTierCatalog.defaultCatalog().walMode(intent.getPrecisionTier());
+        // 3. Fall back to tier default (injected catalog)
+        return catalog.walMode(intent.getPrecisionTier());
+    }
+
+    private WalMode resolveWalMode(Intent intent, AckMode ackMode) {
+        return resolveWalMode(precisionTierCatalog, intent, ackMode);
     }
 
     /** 包级测试入口(同包测试断言 resolveWalMode 行为)。不作为公共 API。 */
-    static WalMode resolveWalModeForTest(Intent intent, AckMode ackMode) {
-        return resolveWalMode(intent, ackMode);
+    static WalMode resolveWalModeForTest(PrecisionTierCatalog catalog, Intent intent, AckMode ackMode) {
+        return resolveWalMode(catalog, intent, ackMode);
     }
 
     /**

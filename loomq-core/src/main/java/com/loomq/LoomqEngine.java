@@ -78,6 +78,7 @@ public class LoomqEngine implements AutoCloseable {
     private final MetricsCollector metricsCollector;
     private final PrecisionScheduler scheduler;
     private final IntentCommandService commandService;
+    private final com.loomq.tracing.IntentTraceStore traceStore;
     private final BucketReclaimer bucketReclaimer;
 
     // ========== 观察器 ==========
@@ -142,13 +143,16 @@ public class LoomqEngine implements AutoCloseable {
             DeliveryHandler deliveryHandler = builder.deliveryHandler != null
                 ? builder.deliveryHandler
                 : DEFAULT_DELIVERY_HANDLER;
+            // R21: traceStore 单实例——调度器与命令服务共享(冷 create/取消的 trace 归命令服务管)
+            this.traceStore = builder.intentTraceStore != null
+                ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore();
             this.scheduler = new PrecisionScheduler(
                 intentStore,
                 deliveryHandler,
                 builder.redeliveryDecider,
                 builder.precisionTierCatalog,
                 metricsCollector,
-                builder.intentTraceStore != null ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore()
+                traceStore
             );
 
             // 初始化冷→热提升 daemon:到点把冷 Intent 从磁盘载入内存并调度
@@ -176,7 +180,7 @@ public class LoomqEngine implements AutoCloseable {
                 locationIndex, promotionDaemon,
                 metricsCollector, callbackExecutor, running, sequenceNumber,
                 builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs(),
-                wheelConfig.hotBoundaryMs());
+                wheelConfig.hotBoundaryMs(), builder.precisionTierCatalog, traceStore);
 
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
             scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {

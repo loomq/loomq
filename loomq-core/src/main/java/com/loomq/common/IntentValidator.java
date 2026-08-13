@@ -1,6 +1,7 @@
 package com.loomq.common;
 
 import com.loomq.domain.intent.Intent;
+import com.loomq.domain.intent.RedeliveryPolicy;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Objects;
@@ -43,6 +44,29 @@ public final class IntentValidator {
         // 创建入口必须拒绝。
         if (intent.getExpiredAction() == null) {
             throw new IllegalArgumentException("expiredAction must not be null");
+        }
+
+        // R21: redelivery 配置非法会触发重试风暴——multiplier≤0 时 exponential 分支
+        // Math.pow 产生 NaN/负值,(long)NaN=0 → setExecuteAt(now+零/负延迟) 把 intent
+        // 排到过去,结算后立即重投;负 initialDelayMs 同样。创建入口拒绝。
+        RedeliveryPolicy rp = intent.getRedelivery();
+        if (rp != null) {
+            if (rp.getMaxAttempts() < 1) {
+                throw new IllegalArgumentException("redelivery.maxAttempts must be >= 1 (got "
+                    + rp.getMaxAttempts() + ")");
+            }
+            if (rp.getInitialDelayMs() < 0) {
+                throw new IllegalArgumentException("redelivery.initialDelayMs must be >= 0 (got "
+                    + rp.getInitialDelayMs() + ")");
+            }
+            if (rp.getMaxDelayMs() < 0) {
+                throw new IllegalArgumentException("redelivery.maxDelayMs must be >= 0 (got "
+                    + rp.getMaxDelayMs() + ")");
+            }
+            if (!(rp.getMultiplier() > 0)) {
+                throw new IllegalArgumentException("redelivery.multiplier must be > 0 (got "
+                    + rp.getMultiplier() + ")");
+            }
         }
 
         String intentId = intent.getIntentId();

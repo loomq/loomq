@@ -8,6 +8,7 @@ import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
@@ -62,7 +63,8 @@ class BugTailStaleRecordAfterWheelMigrationTest {
             ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
             IntentCommandService svc = new IntentCommandService(
                 memStore, scheduler, store, tail, barrier, idx, daemon,
-                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L);
+                mc, cb, running, seq, null, PrecisionTier.STANDARD, 1L, 60L * 60_000L,
+                PrecisionTierCatalog.defaultCatalog(), new com.loomq.tracing.IntentTraceStore());
             barrier.start();
             daemon.start();
             scheduler.start();
