@@ -101,6 +101,8 @@ public final class WheelStore implements AutoCloseable {
      * {@link SlotOverflowException}。溢出链 try 仅包 {@code alloc()}：payload 超 210B 的
      * {@link SlotCodec#encode} 溢出（同为 SlotOverflowException）不被误判为桶满而 spill；
      * encode 失败会将刚 alloc 的保留槽回滚（releaseReserved），避免烧槽致后续同秒 put 误 spill 降级。
+     * 桶被回收（{@link BucketClosedException}）时移除死桶引用并重试进新桶（有界 3 次），
+     * 绝不放行写入已关闭桶——否则 create 返回成功但 Intent 字节随删桶文件静默消失。
      */
     public SlotLocation put(Intent intent) {
         SlotLocation loc = locate(intent.getExecuteAt());
@@ -109,6 +111,7 @@ public final class WheelStore implements AutoCloseable {
         }
         WheelTier tier = loc.tier();
         long executeAtMs = intent.getExecuteAt().toEpochMilli();
+        int closedRetries = 0;
         while (true) {
             long bucketKey = executeAtMs / tier.windowMs;
             Bucket b = getOrCreateBucket(tier, bucketKey);
@@ -130,7 +133,18 @@ public final class WheelStore implements AutoCloseable {
                 b.releaseReserved(slot);   // 编码失败回滚保留槽，避免烧槽致后续同秒 put 误 spill
                 throw e;
             }
-            b.write(slot, encoded);
+            try {
+                b.write(slot, encoded);
+            } catch (BucketClosedException e) {
+                // deleteBucket 与在途 put 竞态:put 持有旧桶引用,桶已被回收(close)。
+                // 移除死桶引用、重试进新桶(有界);连续失败显式抛错——可见失败,不静默丢失。
+                wheels.get(tier).remove(bucketKey, b);
+                if (++closedRetries >= 3) {
+                    throw new IllegalStateException(
+                        "bucket closed repeatedly on put: " + tier + "/" + bucketKey, e);
+                }
+                continue;
+            }
             return new SlotLocation(tier, bucketKey, slot, false);
         }
     }
@@ -414,6 +428,9 @@ public final class WheelStore implements AutoCloseable {
             Lock rl = forceLock.readLock();
             rl.lock();
             try {
+                // deleteBucket 与在途 put 竞态:close() 在 writeLock 内置 closed+force,
+                // 此处 readLock 互斥——close 已完成则必抛,绝不放行写入已关闭桶(静默丢失)。
+                if (closed) throw new BucketClosedException("bucket closed: " + tier + "/" + bucketKey);
                 MemorySegment src = MemorySegment.ofArray(data);
                 MemorySegment.copy(src, 0, seg, off, data.length);
                 writeCount.incrementAndGet();
@@ -461,11 +478,19 @@ public final class WheelStore implements AutoCloseable {
             }
         }
         void close() {
-            if (closed) return;
-            closed = true;
-            try { seg.force(); } catch (Exception e) {
-                // P1-4: 不再吞异常——close 期 force 失败意味着脏数据可能未落盘,需可见。
-                log.warn("force on bucket close failed: {}/{}", tier, bucketKey, e);
+            // writeLock 内置 closed+force:与 write() 的 readLock 互斥,消除
+            // "write 检查 closed 通过 → close 执行 → write 落进已关闭段"的检查-拷贝窗口。
+            Lock wl = forceLock.writeLock();
+            wl.lock();
+            try {
+                if (closed) return;
+                closed = true;
+                try { seg.force(); } catch (Exception e) {
+                    // P1-4: 不再吞异常——close 期 force 失败意味着脏数据可能未落盘,需可见。
+                    log.warn("force on bucket close failed: {}/{}", tier, bucketKey, e);
+                }
+            } finally {
+                wl.unlock();
             }
             try { channel.close(); } catch (IOException e) {
                 log.warn("close channel failed: {}/{}", tier, bucketKey, e);

@@ -48,6 +48,13 @@ public final class CohortManager {
     private Thread wakeThread;
     private final AtomicBoolean running;
 
+    /**
+     * wakeLoop 代际令牌：stop() 时递增。旧 wakeLoop 每轮校验
+     * {@code gen == generation.get()}——即使 stop() 的 join(2000) 因巨型 flush 超时、
+     * 旧线程仍未退出,重启(start())后旧线程也在下一轮迭代退出,杜绝双 wakeLoop 僵尸线程。
+     */
+    private final AtomicLong generation = new AtomicLong();
+
     // Observability counters (CSA impact measurement)
     private final AtomicLong totalRegistered = new AtomicLong(0);
     private final AtomicLong totalFlushed = new AtomicLong(0);
@@ -75,7 +82,8 @@ public final class CohortManager {
 
     void start() {
         if (running.compareAndSet(false, true)) {
-            // stop() 后重启：旧线程已 join，重建（Java 线程不可二次 start）。
+            // stop() 后重启:旧线程可能因 join 超时仍存活,由代际令牌兜底退出(见 generation 注释);
+            // 此处仍重建新线程(Java 线程不可二次 start)。
             wakeThread = Thread.ofPlatform()
                 .name("cohort-waker")
                 .daemon(true)
@@ -87,8 +95,9 @@ public final class CohortManager {
 
     void stop() {
         running.set(false);
+        generation.incrementAndGet();
         LockSupport.unpark(wakeThread);
-        // 等旧线程退出，杜绝重启后双 wake 线程（旧线程观察到 running=true 会继续跑）
+        // 等旧线程退出;join 超时(巨型 flush)由代际令牌兜底,不阻塞重启
         try {
             wakeThread.join(2000);
         } catch (InterruptedException e) {
@@ -201,7 +210,8 @@ public final class CohortManager {
     private static final long MAX_PARK_MS = 24L * 60 * 60_000L; // 24h
 
     private void wakeLoop() {
-        while (running.get()) {
+        long gen = generation.get();
+        while (running.get() && gen == generation.get()) {
             try {
                 var firstEntry = cohorts.firstEntry();
                 if (firstEntry == null) {

@@ -2,6 +2,7 @@ package com.loomq.application.scheduler;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -10,6 +11,7 @@ import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
@@ -22,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 class CohortManagerTest {
@@ -265,6 +268,57 @@ class CohortManagerTest {
             } finally {
                 cm.stop();
             }
+        }
+    }
+
+    @Nested
+    @DisplayName("stop/start 生命周期")
+    class Lifecycle {
+
+        /**
+         * stop() 的 join(2000) 超时后旧 wakeLoop 线程仍存活;若此时 start()(同 JVM 重启/
+         * leader 切换),running 恢复 true,旧线程完成当前 flush 后继续无限循环 → 双 wakeLoop
+         * 僵尸线程。修复:代际令牌(generation),旧线程在下一轮迭代退出,与 join 是否超时无关。
+         */
+        @Test
+        @Tag("slow")
+        @DisplayName("stop join 超时后重启不留僵尸 wakeLoop")
+        void stopTimeoutThenRestartLeavesNoZombieWakeLoop() throws Exception {
+            CountDownLatch flushEntered = new CountDownLatch(1);
+            CountDownLatch releaseFlush = new CountDownLatch(1);
+            CohortManager cm = createCohortManager(intents -> {
+                flushEntered.countDown();
+                try {
+                    releaseFlush.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            cm.start();
+            Thread oldWakeThread = wakeThreadOf(cm);
+            try {
+                cm.register(pastIntent("zombie-1", PrecisionTier.STANDARD));
+                assertTrue(flushEntered.await(5, TimeUnit.SECONDS),
+                    "flush must be stuck inside scanTrigger");
+                cm.stop();   // join(2000) 超时——旧线程仍卡在 scanTrigger 内
+                cm.start();  // 重启:旧线程尚未退出时启动新 wakeLoop(双 wake 风险点)
+                releaseFlush.countDown();
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                while (oldWakeThread.isAlive() && System.nanoTime() < deadline) {
+                    Thread.sleep(20);
+                }
+                assertFalse(oldWakeThread.isAlive(),
+                    "old wakeLoop must exit after stop() even when join timed out");
+            } finally {
+                releaseFlush.countDown();
+                cm.stop();
+            }
+        }
+
+        private static Thread wakeThreadOf(CohortManager cm) throws Exception {
+            Field f = CohortManager.class.getDeclaredField("wakeThread");
+            f.setAccessible(true);
+            return (Thread) f.get(cm);
         }
     }
 }
