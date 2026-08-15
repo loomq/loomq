@@ -45,11 +45,17 @@ class BugScanDueReindexesCanceledIntentTest {
             return CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.SUCCESS);
         };
         scheduler = new PrecisionScheduler(store, handler, null);
-        // 不 start():live 扫描器会抢在断言前认领(executeAt 仅有 3ms 余量),改用
-        // 反射直接调 scanAndDispatch,时序完全确定。
+        // 不 start():live 扫描器会抢在断言前认领,改用反射直接调 scanAndDispatch,
+        // 时序完全确定(executeAt 固定在当前桶中部,见下)。
 
         Intent intent = new Intent("r21-scandue-cancel-0001");
-        intent.setExecuteAt(Instant.now().plusMillis(3)); // 仍在当前 500ms 桶内,scanDue 会扫到但未到期
+        // 桶中部:无论 now 落在 500ms 桶内哪个位置,executeAt 都与 scan 时 now 同桶
+        // (scanDue 的 headMap 必然扫到),且 now 在前半桶时未到期(覆盖重入路径)、
+        // 后半桶时已到期但终态复查仍在投递判定之前——断言对两分支都成立。
+        // 旧写法 now+3ms 在跨桶边界时会落入下一桶,scanDue 扫不到 → 偶发 flaky。
+        long nowMs = System.currentTimeMillis();
+        long bucketStart = nowMs - Math.floorMod(nowMs, 500);
+        intent.setExecuteAt(Instant.ofEpochMilli(bucketStart + 250));
         intent.transitionTo(IntentStatus.SCHEDULED);
         store.save(intent);
         scheduler.getBucketGroupManager().add(intent);

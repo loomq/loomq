@@ -28,6 +28,9 @@ public final class LoomqEngineFactory {
      */
     public static LoomqEngine createFromProperties(Properties props) {
         logger.info("Creating LoomqEngine from properties");
+        if (props == null) {
+            props = new Properties();
+        }
 
         return baseBuilder(props).build();
     }

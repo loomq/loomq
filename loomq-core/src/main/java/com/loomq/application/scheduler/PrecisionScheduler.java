@@ -155,6 +155,7 @@ public class PrecisionScheduler {
             snapshot = intent.copy();
         }
         notifyObservers(o -> o.onDeliveryFailed(snapshot, ex));
+        traceStore.recordFailure(intent.getIntentId(), ex.getMessage(), null);
         if (ex instanceof java.util.concurrent.TimeoutException) {
             logger.warn("Delivery timeout for intent {}", intent.getIntentId());
         } else {
@@ -308,6 +309,9 @@ public class PrecisionScheduler {
         // 重启 = 全新服务:暂停态不跨重启延续(否则 pause→stop→start 后静默不投递,
         // 直到显式 resume——运维无法从日志得知调度器处于暂停)。
         paused = false;
+        // 重启 = 全新服务：清空上一生命周期可能残留的触发扫描标志，避免 fixed-rate 档
+        // 的 cohort 触发式扫描永久失效。
+        pendingScanTrigger.clear();
 
         logger.info("PrecisionScheduler starting...");
 
@@ -401,7 +405,15 @@ public class PrecisionScheduler {
         if (pending.compareAndSet(false, true)) {
             ScheduledExecutorService scanScheduler = scanSchedulers.get(tier);
             if (scanScheduler != null) {
-                scanScheduler.submit(() -> { pending.set(false); scanAndDispatch(tier); });
+                try {
+                    scanScheduler.submit(() -> { pending.set(false); scanAndDispatch(tier); });
+                } catch (RejectedExecutionException e) {
+                    // R22: stop() 先 shutdown 后 clear 的窗口里，submit 会抛
+                    // RejectedExecutionException。若不复位，pending 恒 true，
+                    // restart 后该档 cohort-flush 触发式扫描永久失效。
+                    pending.set(false);
+                    logger.warn("triggerScan rejected for tier {} during shutdown; resetting pending", tier);
+                }
             } else {
                 // R21: 调度器缺失(stop 竞态/重启窗口)时复位标志——否则标志恒 true,
                 // stop→start 后该档 cohort-flush 触发式扫描永久失效(只剩固定 tick)。
@@ -1340,11 +1352,32 @@ public class PrecisionScheduler {
         }
     }
 
+    /**
+     * 内存镜像更新 best-effort（I6 同构）：IntentStore.update 只是热态镜像，不是持久化
+     * 权威；失败时不能阻断终态持久化/重排程/观察器通知，否则已投递 Intent 的 ACK 丢失、
+     * 重启后按旧 SCHEDULED 槽重复投递。
+     */
+    private void updateStoreBestEffort(Intent intent) {
+        try {
+            intentStore.update(intent);
+        } catch (Exception e) {
+            persistFailures.incrementAndGet();
+            logger.error("intentStore.update failed for intent {}: {}", intent.getIntentId(), e.getMessage(), e);
+            // 内存镜像更新失败时，用 save 做 best-effort 补偿，尽量让状态计数与 live 状态一致。
+            try {
+                intentStore.save(intent);
+            } catch (Exception saveEx) {
+                logger.warn("Fallback save after store.update failure also failed for intent {}: {}",
+                    intent.getIntentId(), saveEx.getMessage(), saveEx);
+            }
+        }
+    }
+
     /** 终态落盘样板:transition+store 更新+原地覆写+trace(收敛过期/死信 3 处重复)。
      *  索引清理/日志/observers 派发由调用方按上下文处理(快照语义与 unindex 时机不同)。 */
     private void settleTerminal(Intent intent, IntentStatus status) {
         intent.transitionTo(status);
-        intentStore.update(intent);
+        updateStoreBestEffort(intent);
         persistTerminal(intent);              // 终态原地覆写（不追加）
         // R19: 终态须反映到 trace,否则死信/过期 Intent 的 trace 停在 CREATED
         traceStore.updateStatus(intent.getIntentId(), status);
@@ -1365,7 +1398,7 @@ public class PrecisionScheduler {
         Instant now = Instant.now();
         if (intent.getExecuteAt().isAfter(now)) {
             intent.transitionTo(IntentStatus.SCHEDULED);
-            intentStore.update(intent);
+            updateStoreBestEffort(intent);
             // Fix 6: 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
             // 否则崩溃恢复看到旧 executeAt 的 SCHEDULED 槽(已过期),又被
             // WheelRecovery 的 overdue 路径丢弃,重试链静默丢失。
@@ -1383,7 +1416,7 @@ public class PrecisionScheduler {
             intent.getIntentId(), intent.getAttempts(), delayMs);
         intent.setExecuteAt(Instant.now().plusMillis(delayMs));
         intent.transitionTo(IntentStatus.SCHEDULED);
-        intentStore.update(intent);
+        updateStoreBestEffort(intent);
         // Fix 6: 同上——重排程必须 DURABLE 落盘
         persistStateChange(intent);
         unindexIntent(intent.getIntentId(), oldExecuteAtMs);
@@ -1615,7 +1648,7 @@ public class PrecisionScheduler {
                     case SUCCESS:
                         intent.transitionTo(IntentStatus.DELIVERED);
                         intent.transitionTo(IntentStatus.ACKED);
-                        intentStore.update(intent);
+                        updateStoreBestEffort(intent);
                         persistTerminal(intent);              // 终态原地覆写（不追加）
                         terminalId = intent.getIntentId();
                         persisted = true;
@@ -1638,6 +1671,7 @@ public class PrecisionScheduler {
                             ? intent.getRedelivery().getMaxAttempts()
                             : 5;
                         if (intent.getAttempts() >= maxAttempts) {
+                            traceStore.recordFailure(intent.getIntentId(), "DEAD_LETTER", null);
                             settleTerminal(intent, IntentStatus.DEAD_LETTERED);
                             terminalId = intent.getIntentId();
                             persisted = true;
@@ -1650,6 +1684,7 @@ public class PrecisionScheduler {
                             }
                             break;
                         }
+                        traceStore.recordFailure(intent.getIntentId(), "RETRY", null);
                         long oldExecuteAtMs = executeAtMs(intent);
                         scheduleRetryOrHonorReschedule(intent, tier, oldExecuteAtMs);
                         // I5: schedule() 移到锁外 (deferred)
@@ -1659,6 +1694,7 @@ public class PrecisionScheduler {
                     }
 
                     case DEAD_LETTER:
+                        traceStore.recordFailure(intent.getIntentId(), "DEAD_LETTER", null);
                         settleTerminal(intent, IntentStatus.DEAD_LETTERED);
                         terminalId = intent.getIntentId();
                         persisted = true;
@@ -1672,7 +1708,7 @@ public class PrecisionScheduler {
 
                     case EXPIRED:
                         intent.transitionTo(IntentStatus.EXPIRED);
-                        intentStore.update(intent);
+                        updateStoreBestEffort(intent);
                         persistTerminal(intent);              // 终态原地覆写（不追加）
                         terminalId = intent.getIntentId();
                         persisted = true;
@@ -1745,7 +1781,7 @@ public class PrecisionScheduler {
 
             if (permanent || intent.getAttempts() >= maxAttempts) {
                 intent.transitionTo(IntentStatus.DEAD_LETTERED);
-                intentStore.update(intent);
+                updateStoreBestEffort(intent);
                 persistTerminal(intent);              // 终态原地覆写（不追加）
                 terminalId = intent.getIntentId();
                 persisted = true;
@@ -1818,13 +1854,14 @@ public class PrecisionScheduler {
      * 检查档位是否处于背压状态
      */
     public boolean isTierUnderBackpressure(PrecisionTier tier) {
-        ResizableSemaphore semaphore = tierSemaphores.get(tier);
         BlockingQueue<Intent> queue = tierDispatchQueues.get(tier);
 
-        boolean semaphoreExhausted = semaphore.availablePermits() == 0;
+        // 真实在途数以 tierInFlight 为准（包含跨档借用），不能只看本档 semaphore。
+        boolean concurrencyExhausted =
+            tierInFlight.get(tier).get() >= precisionTierCatalog.maxConcurrency(tier);
         boolean queueBackedUp = queue.size() >= precisionTierCatalog.maxConcurrency(tier) * 2;
 
-        return semaphoreExhausted || queueBackedUp;
+        return concurrencyExhausted || queueBackedUp;
     }
 
     /**
@@ -1840,13 +1877,14 @@ public class PrecisionScheduler {
             int availablePermits = semaphore.availablePermits();
             int queueSize = queue.size();
             boolean underPressure = isTierUnderBackpressure(tier);
+            int activeDispatches = tierInFlight.get(tier).get();
 
             status.put(tier, new BackpressureInfo(
                 precisionTierCatalog.maxConcurrency(tier),
                 availablePermits,
                 queueSize,
                 underPressure,
-                precisionTierCatalog.maxConcurrency(tier) - availablePermits,
+                activeDispatches,
                 semaphore.getBorrowedCount()
             ));
         }

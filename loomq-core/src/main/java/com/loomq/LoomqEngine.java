@@ -92,6 +92,10 @@ public class LoomqEngine implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicBoolean started = new AtomicBoolean(false);
+    /** 是否有 daemon 已启动；用于 start() 失败时判断是否还能安全重试。 */
+    private boolean daemonsStarted = false;
+    /** 上次 start() 在 daemon 启动后失败，禁止再次 start()，但允许 close() 清理资源。 */
+    private volatile boolean retryUnsupported = false;
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
     // ========== 配置 ==========
@@ -219,6 +223,10 @@ public class LoomqEngine implements AutoCloseable {
         if (closed.get()) {
             throw new IllegalStateException("Engine has been closed and cannot be restarted");
         }
+        if (retryUnsupported) {
+            throw new IllegalStateException(
+                "Engine start previously failed after daemons were started; cannot restart, call close()");
+        }
         if (!started.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is already running");
         }
@@ -258,6 +266,7 @@ public class LoomqEngine implements AutoCloseable {
 
             // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
             commitBarrier.start();
+            daemonsStarted = true;
 
             // 3. 启动 promotion daemon(冷->热提升 cohort)
             promotionDaemon.start();
@@ -279,7 +288,14 @@ public class LoomqEngine implements AutoCloseable {
             try { promotionDaemon.close(); } catch (Exception ignored) {}
             try { scheduler.stop(); } catch (Exception ignored) {}
             try { bucketReclaimer.close(); } catch (Exception ignored) {}
-            started.set(false);  // 允许重试
+            // 注意：仅 recovery 阶段失败时可安全重试；若已有 daemon 启动（commitBarrier /
+            // promotionDaemon / bucketReclaimer 的 thread 均为一次性），再次 start() 会抛
+            // IllegalThreadStateException。因此这里标记 retryUnsupported，禁止重试但保留 close() 清理能力。
+            started.set(false);
+            if (daemonsStarted) {
+                retryUnsupported = true;
+                logger.error("Engine start failed after daemons were started; retry is not supported, call close()", e);
+            }
             throw e;
         }
     }

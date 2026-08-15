@@ -103,7 +103,7 @@ public record IntentTrace(
         StringBuilder sb = new StringBuilder();
         sb.append("{\"intentId\":\"").append(intentId).append("\"");
         sb.append(",\"traceId\":\"").append(traceId).append("\"");
-        sb.append(",\"tier\":\"").append(tier.name()).append("\"");
+        sb.append(",\"tier\":\"").append(tier != null ? tier.name() : "UNKNOWN").append("\"");
         sb.append(",\"status\":\"").append(status.name()).append("\"");
         sb.append(",\"createdAt\":\"").append(createdAtMs > 0 ? Instant.ofEpochMilli(createdAtMs).toString() : "null").append("\"");
         sb.append(",\"enqueuedAt\":\"").append(enqueuedAtMs > 0 ? Instant.ofEpochMilli(enqueuedAtMs).toString() : "null").append("\"");

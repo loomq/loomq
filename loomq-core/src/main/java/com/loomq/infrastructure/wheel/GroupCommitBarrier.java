@@ -207,30 +207,33 @@ public final class GroupCommitBarrier implements AutoCloseable {
     }
 
     @Override public void close() {
-        if (!running.compareAndSet(true, false)) return;
-        // Drain in-flight DURABLE writers: a final force covers all writes whose bytes are
-        // already in mmap, then publish the durability frontier so blocked awaitCommit callers
-        // return success. Without this, close() stops the loop without advancing flushedTicket;
-        // in-flight writers would each hit the configurable awaitCommit timeout and fall back to
-        // their own inline force — racing wheelStore.close()'s force during shutdown. The drain
-        // makes shutdown deterministic and fast.
-        try {
-            store.forceDirty();
-            tail.flush();
-            long pending = writeTicket.get();
-            lock.lock();
+        boolean wasRunning = running.compareAndSet(true, false);
+        if (wasRunning) {
+            // Drain in-flight DURABLE writers: a final force covers all writes whose bytes are
+            // already in mmap, then publish the durability frontier so blocked awaitCommit callers
+            // return success. Without this, close() stops the loop without advancing flushedTicket;
+            // in-flight writers would each hit the configurable awaitCommit timeout and fall back to
+            // their own inline force — racing wheelStore.close()'s force during shutdown. The drain
+            // makes shutdown deterministic and fast.
             try {
-                if (pending > flushedTicket) {   // C2-11: 单调发布(同 daemon loop)
-                    flushedTicket = pending;
-                }
-                committed.signalAll();
-            } finally { lock.unlock(); }
-        } catch (Exception e) {
-            log.error("final group-commit force on close failed", e);
+                store.forceDirty();
+                tail.flush();
+                long pending = writeTicket.get();
+                lock.lock();
+                try {
+                    if (pending > flushedTicket) {   // C2-11: 单调发布(同 daemon loop)
+                        flushedTicket = pending;
+                    }
+                    committed.signalAll();
+                } finally { lock.unlock(); }
+            } catch (Exception e) {
+                log.error("final group-commit force on close failed", e);
+            }
         }
+        // 无论是否曾启动，都尝试中断/join 线程；未启动线程的 join 会立即返回。
         thread.interrupt();
         try { thread.join(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        // 关闭内联 force 执行器(平台线程)
+        // 关闭内联 force 执行器(平台线程)。即使 barrier 从未 start，也必须释放该线程池。
         inlineForceExecutor.shutdown();
         try {
             if (!inlineForceExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {

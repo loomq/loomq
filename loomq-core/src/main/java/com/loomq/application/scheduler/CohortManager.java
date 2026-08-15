@@ -121,10 +121,18 @@ public final class CohortManager {
      * unpark the wake thread so it re-evaluates its sleep target.
      */
     void register(Intent intent) {
+        String intentId = intent.getIntentId();
         long key = cohortKey(intent);
+        Long previous = intentIdToCohortKey.put(intentId, key);
+        if (previous != null) {
+            // 同一 intent 重复注册时，先摘除旧 cohort 条目，维持单持有者不变量。
+            ConcurrentLinkedDeque<Intent> old = cohorts.get(previous);
+            if (old != null) {
+                old.removeIf(i -> intentId.equals(i.getIntentId()));
+            }
+        }
         cohorts.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>())
                .addLast(intent);
-        intentIdToCohortKey.put(intent.getIntentId(), key);
         // Signal: a new cohort may be earlier than the current sleep target
         LockSupport.unpark(wakeThread);
     }
@@ -235,7 +243,12 @@ public final class CohortManager {
 
                 List<Intent> validIntents = new ArrayList<>(cohort.size());
                 for (Intent intent : cohort) {
-                    intentIdToCohortKey.remove(intent.getIntentId());
+                    // 条件移除：仅当 mapping 仍指向当前 cohort 时才删除，避免误删并发
+                    // re-register 到新 cohort 的映射。
+                    Long currentKey = intentIdToCohortKey.get(intent.getIntentId());
+                    if (currentKey != null && currentKey == bucketKey) {
+                        intentIdToCohortKey.remove(intent.getIntentId(), currentKey);
+                    }
                     // Only skip terminal intents (cancelled/expired after registration).
                     // Timing-based filtering is handled by BucketGroup.scanDue().
                     if (intent.getStatus().isTerminal()) {

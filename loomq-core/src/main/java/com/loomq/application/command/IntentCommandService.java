@@ -152,7 +152,9 @@ public final class IntentCommandService {
         this.hotBoundaryMs = config.hotBoundaryMs();
         // R21: 注入 catalog(自定义目录的 walMode 默认必须被尊重)与 traceStore
         // (冷 create/取消/fireNow 的 trace 生命周期归命令服务管)
-        this.precisionTierCatalog = config.precisionTierCatalog();
+        this.precisionTierCatalog = config.precisionTierCatalog() != null
+            ? config.precisionTierCatalog()
+            : com.loomq.domain.intent.PrecisionTierCatalog.defaultCatalog();
         this.traceStore = traceStore;
     }
 
@@ -167,6 +169,13 @@ public final class IntentCommandService {
 
     public IdempotencyResult checkIdempotency(String idempotencyKey) {
         return intentStore.checkIdempotency(idempotencyKey);
+    }
+
+    /** 归一化 null precisionTier，避免内部 live 状态与外部 copy 不一致。 */
+    private void normalizePrecisionTier(Intent intent) {
+        if (intent.getPrecisionTier() == null) {
+            intent.setPrecisionTier(precisionTierCatalog.defaultTier());
+        }
     }
 
     /**
@@ -193,6 +202,8 @@ public final class IntentCommandService {
             throw new IllegalArgumentException(
                 "duplicate intentId: " + intent.getIntentId() + " already active");
         }
+        // 归一化放在重复检查之后，避免重复创建被拒时仍然修改调用方传入的 Intent。
+        normalizePrecisionTier(intent);
 
         long seq = sequenceNumber.incrementAndGet();
 
@@ -340,18 +351,21 @@ public final class IntentCommandService {
         long[] oldRevisions = new long[intents.size()];
         IntentStatus[] oldStatuses = new IntentStatus[intents.size()];
         java.time.Instant[] oldUpdatedAts = new java.time.Instant[intents.size()];
+        PrecisionTier[] oldTiers = new PrecisionTier[intents.size()];
 
         try {
             for (int i = 0; i < intents.size(); i++) {
                 Intent intent = intents.get(i);
                 long seq = sequenceNumber.incrementAndGet();
                 seqs.add(seq);
-                if (defaultTier != null) {
-                    intent.setPrecisionTier(defaultTier);
-                }
                 oldStatuses[i] = intent.getStatus();
                 oldRevisions[i] = intent.getRevision();
                 oldUpdatedAts[i] = intent.getUpdatedAt();
+                oldTiers[i] = intent.getPrecisionTier();
+                if (defaultTier != null) {
+                    intent.setPrecisionTier(defaultTier);
+                }
+                normalizePrecisionTier(intent);
                 intent.transitionTo(IntentStatus.SCHEDULED);
                 // R8: 同 createIntent——重建同 intentId 时种子 revision 到历史最高值之上,
                 // 否则 recovery max-revision 去重会遮蔽新 Intent。
@@ -377,6 +391,10 @@ public final class IntentCommandService {
                 // R14: 回滚 updatedAt 须用原始值,而非变异后的 intent.getUpdatedAt()——
                 // 否则非持久化 intent 回滚后 updatedAt 残留 transitionTo/incrementRevision
                 // 的时间戳,与已还原的 status/revision 不一致。
+                // R24: 回滚同样恢复 precisionTier——defaultTier 覆盖不是用户意愿。
+                // 注意：setPrecisionTier 会更新 updatedAt，因此必须在 rollbackStatus 之前执行，
+                // 由 rollbackStatus 统一还原 updatedAt。
+                intent.setPrecisionTier(oldTiers[i]);
                 intent.rollbackStatus(oldStatuses[i], oldUpdatedAts[i], oldRevisions[i]);
             }
             throw new RuntimeException("Batch createIntent persistence failed; " + written + " intents compensated", e);
@@ -431,6 +449,10 @@ public final class IntentCommandService {
      * 携带派发时刻的内容快照（更新前）；若投递失败重试，重投携带最新持久化内容
      * （更新后）。更新在重试路径或崩溃恢复（max-revision 胜者）中确定生效。</p>
      *
+     * <p><b>提交后失败语义：</b>一旦新状态已写入 PHTW mmap 与 locationIndex（即
+     * {@code persistStateChangePutOnly} 成功），后续内存镜像更新或 awaitCommit 失败
+     * <b>不会回滚</b>，本方法按成功返回；磁盘/索引为权威，重启后按新 revision 恢复。</p>
+     *
      * @param intentId     待更新 Intent ID
      * @param updater      变更消费者（在 synchronized(intent) 内执行）
      * @param newExecuteAt 新的执行时间；null 表示不改期
@@ -458,6 +480,7 @@ public final class IntentCommandService {
         Instant oldExecuteAt = null;
         IntentStatus statusBeforeUpdater = null;
         Instant updatedAtBeforeUpdater = null;
+        PrecisionTier tierBeforeUpdater = null;
         try {
             synchronized (intent) {
                 if (intent.getStatus().isTerminal()) {
@@ -485,6 +508,7 @@ public final class IntentCommandService {
                 // 会绕过 removeFromSchedule/locationIndex.remove/reclaimTerminal 清理）。
                 statusBeforeUpdater = intent.getStatus();
                 updatedAtBeforeUpdater = intent.getUpdatedAt();
+                tierBeforeUpdater = intent.getPrecisionTier();
 
                 updater.accept(intent);
 
@@ -545,6 +569,12 @@ public final class IntentCommandService {
                     intent.setExecuteAt(newExecuteAt);
                 }
 
+                // R22: updateIntent 同样执行入口校验——updater/newExecuteAt 可能把
+                // deadline/redelivery/expiredAction 改成非法值，创建路径已拦截，更新路径不能漏。
+                IntentValidator.validate(intent);
+                // 归一化放在校验之后，避免校验失败时仍然修改调用方传入的 Intent。
+                normalizePrecisionTier(intent);
+
                 intent.incrementRevision();
                 // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount，不 pin carrier）
                 persistStateChangePutOnly(intent);
@@ -568,23 +598,56 @@ public final class IntentCommandService {
             // C4-4: I5 快照隔离——返回副本,调用方不得持有/变异内核活状态(与 findById 同纪律)
             return Optional.of(intent.copy());
         } catch (RuntimeException e) {
+            if (persisted) {
+                // C4-2/C4-3 同款提交后保护：persistStateChangePutOnly 已把新状态写入 mmap +
+                // 索引，之后的 store.update/awaitCommit 失败不能回滚，否则内存旧、磁盘新，
+                // 重启后按 max-revision 恢复出新调度，调用方却以为失败。
+                logger.warn("Update committed; ignoring post-commit failure: id={}", intentId, e);
+                // 提交后失败时，内存镜像可能未更新（store.update 抛错）。用 save 做 best-effort
+                // 补偿，尽量让 ConcurrentIntentStore 的 statusCounts/pendingCount 跟上已提交状态。
+                try {
+                    intentStore.save(intent);
+                } catch (Exception saveEx) {
+                    logger.warn("Failed to refresh in-memory store after committed update: id={}", intentId, saveEx);
+                }
+                // 补做锁外调度，使内存与磁盘/索引一致（与正常成功路径同一收口）。
+                if (reschedule) {
+                    try {
+                        if (intent.getStatus() == IntentStatus.DUE) {
+                            scheduler.restore(intent);
+                        } else if (intent.getStatus() == IntentStatus.SCHEDULED) {
+                            scheduler.schedule(intent);
+                        }
+                    } catch (Exception re) {
+                        logger.error(
+                            "Failed to schedule committed update for intent {}; it will be delivered after restart",
+                            intentId, re);
+                    }
+                }
+                return Optional.of(intent.copy());
+            }
             logger.error("Failed to update intent: id={}", intentId, e);
-            // 回滚：更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按原 executeAt
+            // 回滚调度字段:executeAt/status/updatedAt/precisionTier 还原到 updater 前值。
+            // C4-5: updater 可能已变异这些字段后才抛异常——按"当前值"重排会把变异半应用
+            // (与"失败即还原"语义不符,见 BugUpdateUpdaterFailureTest)。
+            // 非调度字段(内容)的变异不可回滚(无更新前快照),属用户 updater 契约边界。
+            // 顺序:setExecuteAt/setPrecisionTier 会重写 updatedAt,须先执行,再由
+            // rollbackStatus 统一还原 status 与 updatedAt。
+            if (oldExecuteAt != null) {
+                intent.setExecuteAt(oldExecuteAt);
+            }
+            if (statusBeforeUpdater != null) {
+                // R28: precisionTier 也是调度字段(决定 cohort/桶路由),updater 污染后必须
+                // 还原,否则活对象残留 null/错误档,与磁盘(recovery 恢复值)短暂不一致。
+                intent.setPrecisionTier(tierBeforeUpdater);
+                intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+            }
+            // 更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按原 executeAt
             // 重新调度——否则 intent 在 store 中为 SCHEDULED/DUE 却不在任何
             // bucket/cohort，静默永不投递直到重启恢复（投递延迟丢失）。
             // 镜像正常 reschedule 分支（见下方）：DUE 走 restore()、SCHEDULED 走 schedule()。
             if (removedForReschedule) {
                 try {
-                    // C4-5: updater 可能已变异 executeAt/status/updatedAt 后才抛异常——按"当前值"
-                    // 重排会把变异半应用(与"失败即还原"语义不符,见 BugUpdateUpdaterFailureTest)。
-                    // 先还原调度相关状态,再按原时刻重排。非调度字段(内容)的变异不可回滚
-                    // (无更新前快照),属用户 updater 契约边界。
-                    if (oldExecuteAt != null) {
-                        intent.setExecuteAt(oldExecuteAt);
-                    }
-                    if (statusBeforeUpdater != null) {
-                        intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
-                    }
                     if (intent.getStatus() == IntentStatus.DUE) {
                         scheduler.restore(intent);
                     } else if (intent.getStatus() == IntentStatus.SCHEDULED) {

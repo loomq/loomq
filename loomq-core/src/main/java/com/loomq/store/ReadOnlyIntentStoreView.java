@@ -88,4 +88,10 @@ public final class ReadOnlyIntentStoreView implements IntentStore {
     public void shutdown() {
         throw new UnsupportedOperationException("Read-only IntentStore view");
     }
+
+    /** 只读视图不拥有资源，close 应为 no-op，避免 try-with-resources 异常。 */
+    @Override
+    public void close() {
+        // no-op
+    }
 }

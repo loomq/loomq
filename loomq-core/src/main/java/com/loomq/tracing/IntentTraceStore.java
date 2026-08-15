@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Per-intent trace store for observability.
  *
- * Stores the last N intent traces (default 100K) with LRU eviction.
+ * Stores the last N intent traces (default 100K) with FIFO eviction.
  * Used for real-time debugging: "why did intent X take so long?"
  */
 public final class IntentTraceStore {
@@ -23,7 +23,8 @@ public final class IntentTraceStore {
     public IntentTraceStore(int maxSize) {
         this.maxSize = maxSize;
         this.traces = new ConcurrentHashMap<>();
-        this.evictionQueue = new EvictionQueue();
+        // 队列容量必须大于 maxSize，避免在未达到淘汰阈值前发生环形覆盖。
+        this.evictionQueue = new EvictionQueue(Math.max(maxSize + 10_000, 1));
     }
 
     /**
@@ -137,8 +138,8 @@ public final class IntentTraceStore {
         private int tail = 0;
         private final Object lock = new Object();
 
-        EvictionQueue() {
-            this.buffer = new String[110_000]; // Slightly larger than maxSize
+        EvictionQueue(int capacity) {
+            this.buffer = new String[capacity];
         }
 
         void add(String intentId) {

@@ -54,8 +54,15 @@ public final class PromotionDaemon implements AutoCloseable {
     public void register(String intentId, SlotLocation loc, long executeAtMs) {
         long wakeAt = executeAtMs - promotionLeadMs;
         ColdHandle handle = new ColdHandle(intentId, loc);
+        Long previous = intentIdToCohortKey.put(intentId, wakeAt);
+        if (previous != null) {
+            // 同一 intent 重复注册时，先摘除旧 cohort 条目，维持单持有者不变量。
+            ConcurrentLinkedDeque<ColdHandle> old = cohorts.get(previous);
+            if (old != null) {
+                old.removeIf(h -> intentId.equals(h.intentId()));
+            }
+        }
         cohorts.computeIfAbsent(wakeAt, k -> new ConcurrentLinkedDeque<>()).addLast(handle);
-        intentIdToCohortKey.put(intentId, wakeAt);
         LockSupport.unpark(thread);
     }
 
@@ -80,7 +87,12 @@ public final class PromotionDaemon implements AutoCloseable {
             ConcurrentLinkedDeque<ColdHandle> cohort = cohorts.remove(e.getKey());
             if (cohort == null || cohort.isEmpty()) continue;
             for (ColdHandle h : cohort) {
-                intentIdToCohortKey.remove(h.intentId());
+                // 条件移除：仅当 mapping 仍指向当前 cohort 时才删除，避免误删并发
+                // re-register 到新 cohort 的映射。
+                Long currentKey = intentIdToCohortKey.get(h.intentId());
+                if (currentKey != null && currentKey.equals(e.getKey())) {
+                    intentIdToCohortKey.remove(h.intentId(), currentKey);
+                }
                 promote(h);
             }
         }
