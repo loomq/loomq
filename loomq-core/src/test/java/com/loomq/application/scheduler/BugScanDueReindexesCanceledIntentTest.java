@@ -9,6 +9,7 @@ import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -77,8 +78,11 @@ class BugScanDueReindexesCanceledIntentTest {
     }
 
     private static void invokeScan(PrecisionScheduler scheduler, PrecisionTier tier) throws Exception {
-        Method m = PrecisionScheduler.class.getDeclaredMethod("scanAndDispatch", PrecisionTier.class);
+        // scanAndDispatch 已随扫描全家迁入 ScanCoordinator(Task 5)
+        Field sf = PrecisionScheduler.class.getDeclaredField("scanCoordinator");
+        sf.setAccessible(true);
+        Method m = ScanCoordinator.class.getDeclaredMethod("scanAndDispatch", PrecisionTier.class);
         m.setAccessible(true);
-        m.invoke(scheduler, tier);
+        m.invoke(sf.get(scheduler), tier);
     }
 }

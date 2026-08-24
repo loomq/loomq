@@ -3,6 +3,7 @@ package com.loomq.application.scheduler;
 import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.PrecisionTier;
 import java.time.Instant;
+import java.util.EnumMap;
 import java.util.Map;
 
 /**
@@ -59,11 +60,11 @@ public record ChronoscopeSnapshot(
                                             BucketGroupManager bucketGroupManager,
                                             CohortManager cohortManager,
                                             MetricsCollector metrics) {
-        Map<PrecisionTier, PrecisionScheduler.BackpressureInfo> backpressure = scheduler.getBackpressureStatus();
-        Map<PrecisionTier, TierSnapshot> tierSnapshots = new java.util.EnumMap<>(PrecisionTier.class);
+        Map<PrecisionTier, DispatchPipeline.BackpressureInfo> backpressure = scheduler.getBackpressureStatus();
+        Map<PrecisionTier, TierSnapshot> tierSnapshots = new EnumMap<>(PrecisionTier.class);
 
         for (PrecisionTier tier : PrecisionTier.values()) {
-            PrecisionScheduler.BackpressureInfo bp = backpressure.get(tier);
+            DispatchPipeline.BackpressureInfo bp = backpressure.get(tier);
             int pendingCount = bucketGroupManager.getPendingCounts().getOrDefault(tier, 0);
 
             SemaphoreSnapshot sem = new SemaphoreSnapshot(
@@ -87,7 +88,7 @@ public record ChronoscopeSnapshot(
             ));
         }
 
-        PrecisionScheduler.BorrowStats borrowStats = scheduler.getBorrowStats();
+        DispatchPipeline.BorrowStats borrowStats = scheduler.getBorrowStats();
         BorrowSnapshot borrow = new BorrowSnapshot(
             borrowStats.ownAcquires.get(),
             borrowStats.ownBlockingAcquires.get(),
@@ -95,7 +96,7 @@ public record ChronoscopeSnapshot(
             borrowStats.borrowRate()
         );
 
-        PrecisionScheduler.PermitTimingStats pts = scheduler.getPermitTimingStats();
+        DispatchPipeline.PermitTimingStats pts = scheduler.getPermitTimingStats();
         PermitTimingSnapshot permitTiming = new PermitTimingSnapshot(
             pts.avgAcquireWaitMs(),
             pts.avgPermitHoldMs(),

@@ -30,18 +30,22 @@ class BugTriggerScanRejectedExecutionTest {
         scheduler.start();
 
         // 模拟 stop() 中 shutdown 后、clear 前的窗口：scanSchedulers 仍指向已终止的 executor。
+        // scanSchedulers 已随扫描全家迁入 ScanCoordinator(Task 5)。
         ScheduledExecutorService dead = Executors.newSingleThreadScheduledExecutor();
         dead.shutdown();
-        Field mapField = PrecisionScheduler.class.getDeclaredField("scanSchedulers");
+        Field sf = PrecisionScheduler.class.getDeclaredField("scanCoordinator");
+        sf.setAccessible(true);
+        Object coordinator = sf.get(scheduler);
+        Field mapField = ScanCoordinator.class.getDeclaredField("scanSchedulers");
         mapField.setAccessible(true);
         @SuppressWarnings("unchecked")
         Map<PrecisionTier, ScheduledExecutorService> map =
-            (Map<PrecisionTier, ScheduledExecutorService>) mapField.get(scheduler);
+            (Map<PrecisionTier, ScheduledExecutorService>) mapField.get(coordinator);
         map.put(PrecisionTier.STANDARD, dead);
 
-        Method m = PrecisionScheduler.class.getDeclaredMethod("triggerScan", PrecisionTier.class);
+        Method m = ScanCoordinator.class.getDeclaredMethod("triggerScan", PrecisionTier.class);
         m.setAccessible(true);
-        assertDoesNotThrow(() -> m.invoke(scheduler, PrecisionTier.STANDARD),
+        assertDoesNotThrow(() -> m.invoke(coordinator, PrecisionTier.STANDARD),
             "triggerScan must not throw when submit is rejected; it should reset pending and return");
 
         AtomicBoolean pending = pendingFlag(scheduler, PrecisionTier.STANDARD);
@@ -53,9 +57,11 @@ class BugTriggerScanRejectedExecutionTest {
 
     @SuppressWarnings("unchecked")
     private static AtomicBoolean pendingFlag(PrecisionScheduler scheduler, PrecisionTier tier) throws Exception {
-        Field f = PrecisionScheduler.class.getDeclaredField("pendingScanTrigger");
+        Field sf = PrecisionScheduler.class.getDeclaredField("scanCoordinator");
+        sf.setAccessible(true);
+        Field f = ScanCoordinator.class.getDeclaredField("pendingScanTrigger");
         f.setAccessible(true);
-        Map<PrecisionTier, AtomicBoolean> map = (Map<PrecisionTier, AtomicBoolean>) f.get(scheduler);
+        Map<PrecisionTier, AtomicBoolean> map = (Map<PrecisionTier, AtomicBoolean>) f.get(sf.get(scheduler));
         AtomicBoolean flag = map.get(tier);
         if (flag == null) {
             throw new IllegalStateException("no pending flag for " + tier);

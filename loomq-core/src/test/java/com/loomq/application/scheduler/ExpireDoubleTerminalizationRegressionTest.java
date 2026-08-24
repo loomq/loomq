@@ -8,6 +8,7 @@ import com.loomq.domain.intent.IntentStatus;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
@@ -38,16 +39,20 @@ class ExpireDoubleTerminalizationRegressionTest {
             store.save(intent);
             scheduler.schedule(intent);
 
-            Method m = PrecisionScheduler.class.getDeclaredMethod("handleExpired", Intent.class);
+            // Task 3 重构后 handleExpired 迁入 SettlementEngine(经 scheduler 私有字段取实例)
+            Field engineField = PrecisionScheduler.class.getDeclaredField("settlementEngine");
+            engineField.setAccessible(true);
+            SettlementEngine engine = (SettlementEngine) engineField.get(scheduler);
+            Method m = SettlementEngine.class.getDeclaredMethod("handleExpired", Intent.class);
             m.setAccessible(true);
 
             // 第一次终态化：EXPIRED 落内存（sink 为 null 时持久化跳过，语义不变）
-            m.invoke(scheduler, intent);
+            m.invoke(engine, intent);
             assertEquals(IntentStatus.EXPIRED, intent.getStatus());
 
             // 第二次（双路径竞态的败者）：必须幂等跳过，不得从终态二次 transitionTo 抛 ISE。
             // 修复前：transitionTo(EXPIRED) 从 EXPIRED → IllegalStateException 穿透调用栈。
-            assertDoesNotThrow(() -> m.invoke(scheduler, intent));
+            assertDoesNotThrow(() -> m.invoke(engine, intent));
             assertEquals(IntentStatus.EXPIRED, intent.getStatus());
         } finally {
             scheduler.stop();

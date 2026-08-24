@@ -31,25 +31,29 @@ class BugBackpressureIgnoresBorrowedTest {
             i -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS), null, catalog);
         scheduler.start();
 
-        Field semField = PrecisionScheduler.class.getDeclaredField("tierSemaphores");
+        // 信号量/借用方法已随 Task 4 迁入 DispatchPipeline，经 scheduler.pipeline 反射取得。
+        Field pipelineField = PrecisionScheduler.class.getDeclaredField("pipeline");
+        pipelineField.setAccessible(true);
+        Object pipeline = pipelineField.get(scheduler);
+
+        Field semField = DispatchPipeline.class.getDeclaredField("tierSemaphores");
         semField.setAccessible(true);
         @SuppressWarnings("unchecked")
-        Map<PrecisionTier, ResizableSemaphore> sems = (Map<PrecisionTier, ResizableSemaphore>) semField.get(scheduler);
+        Map<PrecisionTier, ResizableSemaphore> sems = (Map<PrecisionTier, ResizableSemaphore>) semField.get(pipeline);
         ResizableSemaphore ultra = sems.get(PrecisionTier.ULTRA);
         ultra.acquire(); // 占用 ULTRA 唯一 own permit
 
-        Method m = PrecisionScheduler.class.getDeclaredMethod("acquireWithBorrow", PrecisionTier.class);
+        Method m = DispatchPipeline.class.getDeclaredMethod("acquireWithBorrow", PrecisionTier.class);
         m.setAccessible(true);
         ResizableSemaphore borrowed =
-            (ResizableSemaphore) m.invoke(scheduler, PrecisionTier.ULTRA); // 从 FAST 借用第二个 permit
+            (ResizableSemaphore) m.invoke(pipeline, PrecisionTier.ULTRA); // 从 FAST 借用第二个 permit
 
         // 模拟真实在途：两个 permit 都对应 in-flight delivery
-        Field inflightField = PrecisionScheduler.class.getDeclaredField("tierInFlight");
+        Field inflightField = PrecisionScheduler.class.getDeclaredField("inFlightCounters");
         inflightField.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        Map<PrecisionTier, java.util.concurrent.atomic.AtomicInteger> inflight =
-            (Map<PrecisionTier, java.util.concurrent.atomic.AtomicInteger>) inflightField.get(scheduler);
-        inflight.get(PrecisionTier.ULTRA).addAndGet(2);
+        InFlightCounters inflight = (InFlightCounters) inflightField.get(scheduler);
+        inflight.increment(PrecisionTier.ULTRA);
+        inflight.increment(PrecisionTier.ULTRA);
 
         var status = scheduler.getBackpressureStatus().get(PrecisionTier.ULTRA);
         assertEquals(2, status.activeDispatches(),
@@ -57,7 +61,8 @@ class BugBackpressureIgnoresBorrowedTest {
 
         // 清理测试占用：还原在途计数并释放 permit(借用须配对 decrementBorrowed)——
         // 否则 stop() 的 in-flight 排空(上限 10s)会等满 drain 超时,测试耗时 ~10s。
-        inflight.get(PrecisionTier.ULTRA).addAndGet(-2);
+        inflight.decrement(PrecisionTier.ULTRA);
+        inflight.decrement(PrecisionTier.ULTRA);
         if (borrowed != ultra) {
             borrowed.decrementBorrowed();
             borrowed.release();

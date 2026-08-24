@@ -55,13 +55,17 @@ class BatchWindowAggregationTest {
         return PrecisionTierCatalog.of(profiles, PrecisionTier.STANDARD);
     }
 
-    /** 经反射直达 STANDARD dispatch 队列,绕过 scanner(消除扫描时序的不确定性)。 */
+    /** 经反射直达 STANDARD dispatch 队列,绕过 scanner(消除扫描时序的不确定性)。
+     *  队列已随 Task 4 迁入 DispatchPipeline,经 scheduler.pipeline 反射取得。 */
     private void offerToDispatchQueue(List<Intent> intents) throws Exception {
-        Field qf = PrecisionScheduler.class.getDeclaredField("tierDispatchQueues");
+        Field pf = PrecisionScheduler.class.getDeclaredField("pipeline");
+        pf.setAccessible(true);
+        Object pipeline = pf.get(scheduler);
+        Field qf = DispatchPipeline.class.getDeclaredField("tierDispatchQueues");
         qf.setAccessible(true);
         @SuppressWarnings("unchecked")
         Map<PrecisionTier, BlockingQueue<Intent>> queues =
-            (Map<PrecisionTier, BlockingQueue<Intent>>) qf.get(scheduler);
+            (Map<PrecisionTier, BlockingQueue<Intent>>) qf.get(pipeline);
         BlockingQueue<Intent> queue = queues.get(PrecisionTier.STANDARD);
         for (Intent intent : intents) {
             store.save(intent);

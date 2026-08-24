@@ -18,7 +18,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Issue B 回归：终态持久化失败不得吞掉 onDelivered / 不得死锁。
  *
- * <p>根因（见 docs/development/issue-b-rootcause-2026-08-07.md）：SEC 轮桶容量溢出时，
+ * <p>根因：SEC 轮桶容量溢出时，
  * finalizeIntent 的 persistStateChange 抛 SlotOverflowException，异常在 synchronized 块内
  * 传播、跳过 notifyObservers(onDelivered)，导致已投递 intent 的通知被吞、基准槽位永久
  * 泄漏、引擎停摆死锁。</p>
@@ -45,7 +45,7 @@ class FinalizePersistFailureRegressionTest {
         scheduler = new PrecisionScheduler(intentStore, handler, null);
 
         // 注入恒失败的终态持久化（模拟 SEC 桶 SlotOverflowException）。
-        scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
+        scheduler.setStateChangeSink(new StateChangeSink() {
             @Override public void persist(Intent intent) {
                 throw new IllegalStateException("bucket overflow: SEC/x (slotsPerBucket=65536)");
             }

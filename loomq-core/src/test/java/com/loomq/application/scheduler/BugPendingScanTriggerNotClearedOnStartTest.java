@@ -25,11 +25,14 @@ class BugPendingScanTriggerNotClearedOnStartTest {
         scheduler.start();
         scheduler.stop();
 
-        // 模拟上一生命周期残留的 pending=true
-        Field f = PrecisionScheduler.class.getDeclaredField("pendingScanTrigger");
+        // 模拟上一生命周期残留的 pending=true（pendingScanTrigger 已随扫描全家迁入
+        // ScanCoordinator,Task 5）
+        Field sf = PrecisionScheduler.class.getDeclaredField("scanCoordinator");
+        sf.setAccessible(true);
+        Field f = ScanCoordinator.class.getDeclaredField("pendingScanTrigger");
         f.setAccessible(true);
         @SuppressWarnings("unchecked")
-        Map<PrecisionTier, AtomicBoolean> map = (Map<PrecisionTier, AtomicBoolean>) f.get(scheduler);
+        Map<PrecisionTier, AtomicBoolean> map = (Map<PrecisionTier, AtomicBoolean>) f.get(sf.get(scheduler));
         map.computeIfAbsent(PrecisionTier.STANDARD, k -> new AtomicBoolean(false)).set(true);
 
         scheduler.start();

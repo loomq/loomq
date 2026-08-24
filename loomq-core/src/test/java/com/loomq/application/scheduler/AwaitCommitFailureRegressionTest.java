@@ -16,7 +16,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Issue B 残留死锁路径回归:awaitStateChangeCommit 失败(慢盘双超时)不得吞 onDelivered / 泄漏槽位。
+ * Issue B 残留死锁路径回归:awaitCommit 失败(慢盘双超时)不得吞 onDelivered / 泄漏槽位。
  *
  * <p>I6 只包住了非阻塞 put(persist/persistTerminalInPlace);若锁外的 awaitCommit 抛异常,
  * reclaimTerminal 与 notifyObservers 会被跳过 → 复现 Issue B 死锁症状。本测试断言 awaitCommit
@@ -41,7 +41,7 @@ class AwaitCommitFailureRegressionTest {
         scheduler = new PrecisionScheduler(intentStore, handler, null);
 
         // 注入 awaitCommit 恒抛的 sink(模拟慢盘双超时)。
-        scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
+        scheduler.setStateChangeSink(new StateChangeSink() {
             @Override public void persist(Intent intent) {}
             @Override public void persistTerminalInPlace(Intent intent) {}
             @Override public void awaitCommit() {

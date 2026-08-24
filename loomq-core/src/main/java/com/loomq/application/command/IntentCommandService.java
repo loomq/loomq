@@ -22,8 +22,11 @@ import com.loomq.store.IntentStore;
 import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -85,7 +88,7 @@ public final class IntentCommandService {
     private final ConcurrentHashMap<String, Object> coldCancelLocks = new ConcurrentHashMap<>();
 
     /** 曾发生第 2 次及以上槽写入的 Intent（重排程/改期/取消追加）→ 终态不回收，保留 tombstone。 */
-    private final java.util.Set<String> multiSlotIntents = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<String> multiSlotIntents = ConcurrentHashMap.newKeySet();
 
     /**
      * 曾保留终态墓碑的 intentId（C4-1,R15 守卫）。墓碑留在磁盘上（多槽终态不回收、冷取消
@@ -94,9 +97,9 @@ public final class IntentCommandService {
      * 0 起步,重启被旧墓碑遮蔽(静默丢失)。一旦置位,进程内不清理(墓碑何时被桶文件过期
      * 回收无从得知;重启后由 WheelRecovery 重新从磁盘扫描注入)。
      */
-    private final java.util.Set<String> tombstoneIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<String> tombstoneIds = ConcurrentHashMap.newKeySet();
     /** 终态原地覆写后的待回收记录：终态槽在 awaitCommit 落盘后清空。 */
-    private final java.util.Map<String, PendingReclaim> pendingReclaims = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<String, PendingReclaim> pendingReclaims = new ConcurrentHashMap<>();
     /** 待回收记录：loc 为终态槽位置；singleSlot 为 true 才清空复用。 */
     public record PendingReclaim(SlotLocation loc, boolean singleSlot) {}
 
@@ -109,8 +112,8 @@ public final class IntentCommandService {
      * 内每次持久化写(append/原地覆写)后 merge 当前 revision——覆盖"同进程内 create→cancel→
      * 重建同 id→重启"的路径,此时重建前无恢复注入,须靠写路径持续维护。</p>
      */
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> maxRevisions =
-        new java.util.concurrent.ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> maxRevisions =
+        new ConcurrentHashMap<>();
 
     /**
      * PHTW 持久化栈(构造器归并组 1):时间轮/尾部/组提交/索引/提升 daemon。
@@ -154,7 +157,7 @@ public final class IntentCommandService {
         // (冷 create/取消/fireNow 的 trace 生命周期归命令服务管)
         this.precisionTierCatalog = config.precisionTierCatalog() != null
             ? config.precisionTierCatalog()
-            : com.loomq.domain.intent.PrecisionTierCatalog.defaultCatalog();
+            : PrecisionTierCatalog.defaultCatalog();
         this.traceStore = traceStore;
     }
 
@@ -326,7 +329,7 @@ public final class IntentCommandService {
         // R6: 批量创建预检——与已有活 intent 冲突或批内重复 intentId → 写盘前整体拒绝。
         // 预检失败不触发补偿（补偿只对已写入条目生效），避免把已存在的 intent 覆写为
         // CANCELED。
-        java.util.Set<String> seenIds = new java.util.HashSet<>(intents.size());
+        Set<String> seenIds = new HashSet<>(intents.size());
         for (Intent intent : intents) {
             if (!seenIds.add(intent.getIntentId()) || hasActiveDuplicate(intent.getIntentId())) {
                 throw new IllegalArgumentException(
@@ -350,7 +353,7 @@ public final class IntentCommandService {
         int written = 0;
         long[] oldRevisions = new long[intents.size()];
         IntentStatus[] oldStatuses = new IntentStatus[intents.size()];
-        java.time.Instant[] oldUpdatedAts = new java.time.Instant[intents.size()];
+        Instant[] oldUpdatedAts = new Instant[intents.size()];
         PrecisionTier[] oldTiers = new PrecisionTier[intents.size()];
 
         try {
@@ -1024,11 +1027,6 @@ public final class IntentCommandService {
         return resolveWalMode(precisionTierCatalog, intent, ackMode);
     }
 
-    /** 包级测试入口(同包测试断言 resolveWalMode 行为)。不作为公共 API。 */
-    static WalMode resolveWalModeForTest(PrecisionTierCatalog catalog, Intent intent, AckMode ackMode) {
-        return resolveWalMode(catalog, intent, ackMode);
-    }
-
     /**
      * PHTW 写协议:locate→(inTail? tail.put : wheel.put)→locationIndex.put→(durable? awaitCommit)。
      * 返回实际分配槽位(wheel 路径为 put 捕获的真实槽;tail 路径为 locate 的占位)。
@@ -1129,19 +1127,19 @@ public final class IntentCommandService {
                 }
             }
         } catch (Exception e) {
-            logger.warn("reclaimTerminal failed for intent {}: {}", intentId, e);
+            logger.warn("reclaimTerminal failed for intent {}: {}", intentId, e.getMessage(), e);
         } finally {
             multiSlotIntents.remove(intentId);
         }
     }
 
     /** 恢复期由 WheelRecovery 注入:磁盘上幸存槽数 >1 的 Intent 视为多槽(终态保留墓碑不回收)。 */
-    public void markMultiSlot(java.util.Set<String> ids) {
+    public void markMultiSlot(Set<String> ids) {
         multiSlotIntents.addAll(ids);
     }
 
     /** 恢复期由 WheelRecovery 注入:intentId → 磁盘历史最高 revision(含终态墓碑与跨视界 tail)。 */
-    public void markMaxRevisions(java.util.Map<String, Long> revisions) {
+    public void markMaxRevisions(Map<String, Long> revisions) {
         revisions.forEach((id, rev) -> maxRevisions.merge(id, rev, Math::max));
     }
 

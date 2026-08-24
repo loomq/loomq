@@ -1,5 +1,7 @@
 package com.loomq.domain.intent;
 
+import java.util.Map;
+
 /**
  * 精度档位枚举。
  *
@@ -91,8 +93,8 @@ public enum PrecisionTier {
     // 【边界】此表仅由 fromString(runtime/config 输入)读取。持久化路径(tierByOrdinal)绝不读它:
     // 新格式 ordinal 2 已是 STANDARD,若按旧 HIGH 重映射会把合法新数据窜改成 FAST(ordinal 碰撞,
     // 同一字节读不出两种含义)。存留 wheel 数据必须按 v0.9.x ordinal 断裂契约清库,不做兼容读取。
-    private static final java.util.Map<String, PrecisionTier> LEGACY_REMAPS =
-        java.util.Map.of("HIGH", PrecisionTier.FAST, "ECONOMY", PrecisionTier.STANDARD);
+    private static final Map<String, PrecisionTier> LEGACY_REMAPS =
+        Map.of("HIGH", PrecisionTier.FAST, "ECONOMY", PrecisionTier.STANDARD);
 
     public static PrecisionTier fromString(String value) {
         if (value == null || value.isBlank()) {

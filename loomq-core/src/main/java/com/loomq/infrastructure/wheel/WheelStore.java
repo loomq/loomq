@@ -11,8 +11,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumMap;
+import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -160,7 +165,7 @@ public final class WheelStore implements AutoCloseable {
      * 不预物化到 ArrayList--按 tier -> bucket -> slot 顺序逐个读取 MemorySegment。
      * 空槽和 torn 槽被跳过。
      */
-    public java.util.Iterator<SlotEntry> scanSlotsFrom(java.time.Instant from) {
+    public Iterator<SlotEntry> scanSlotsFrom(Instant from) {
         return new LazySlotIterator(from.toEpochMilli());
     }
 
@@ -169,11 +174,11 @@ public final class WheelStore implements AutoCloseable {
      * hasNext() 时扫描到下一个有效槽并缓存;next() 返回缓存并推进。
      * 跳过时间窗口终点 <= fromMs 的桶(已无需恢复的过期桶)。
      */
-    private final class LazySlotIterator implements java.util.Iterator<SlotEntry> {
-        private final java.util.List<WheelTier> tiers = java.util.List.of(WheelTier.values());
+    private final class LazySlotIterator implements Iterator<SlotEntry> {
+        private final List<WheelTier> tiers = List.of(WheelTier.values());
         private final long fromMs;
         private int tierIdx = 0;
-        private java.util.List<Long> bucketKeys;
+        private List<Long> bucketKeys;
         private int bucketIdx = 0;
         private Bucket currentBucket;
         private int slotIdx = 0;
@@ -188,12 +193,12 @@ public final class WheelStore implements AutoCloseable {
             while (tierIdx < tiers.size()) {
                 WheelTier tier = tiers.get(tierIdx);
                 ConcurrentHashMap<Long, Bucket> buckets = wheels.get(tier);
-                bucketKeys = new java.util.ArrayList<>();
+                bucketKeys = new ArrayList<>();
                 for (long key : buckets.keySet()) {
                     if (key * tier.windowMs + tier.windowMs <= fromMs) continue;
                     bucketKeys.add(key);
                 }
-                java.util.Collections.sort(bucketKeys);
+                Collections.sort(bucketKeys);
                 bucketIdx = 0;
                 if (!bucketKeys.isEmpty()) {
                     currentBucket = buckets.get(bucketKeys.get(0));
@@ -238,7 +243,7 @@ public final class WheelStore implements AutoCloseable {
         }
 
         @Override public SlotEntry next() {
-            if (cached == null && !hasNext()) throw new java.util.NoSuchElementException();
+            if (cached == null && !hasNext()) throw new NoSuchElementException();
             SlotEntry result = cached;
             cached = null;
             return result;

@@ -1,6 +1,7 @@
 package com.loomq.infrastructure.wheel;
 
 import com.loomq.domain.intent.Intent;
+import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -146,7 +147,7 @@ public final class PromotionDaemon implements AutoCloseable {
                     // 钳制 park 时长：executeAt 超远（>292 年）时 Duration.toNanos 溢出为负，
                     // parkNanos 立即返回 → 空转烧核。24h 上限分片 park，无功能影响。
                     long parkMs = Math.min(first.getKey() - now, MAX_PARK_MS);
-                    LockSupport.parkNanos(java.time.Duration.ofMillis(parkMs).toNanos());
+                    LockSupport.parkNanos(Duration.ofMillis(parkMs).toNanos());
                     continue;
                 }
                 tickOnce();

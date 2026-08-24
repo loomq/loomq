@@ -53,20 +53,27 @@ class BugTriggerScanStuckFlagTest {
     }
 
     private static void invokeTriggerScan(PrecisionScheduler scheduler, PrecisionTier tier) throws Exception {
-        Method m = PrecisionScheduler.class.getDeclaredMethod("triggerScan", PrecisionTier.class);
+        // triggerScan 已随扫描全家迁入 ScanCoordinator(Task 5)
+        Method m = ScanCoordinator.class.getDeclaredMethod("triggerScan", PrecisionTier.class);
         m.setAccessible(true);
-        m.invoke(scheduler, tier);
+        m.invoke(scanCoordinator(scheduler), tier);
     }
 
     @SuppressWarnings("unchecked")
     private static AtomicBoolean pendingFlag(PrecisionScheduler scheduler, PrecisionTier tier) throws Exception {
-        Field f = PrecisionScheduler.class.getDeclaredField("pendingScanTrigger");
+        Field f = ScanCoordinator.class.getDeclaredField("pendingScanTrigger");
         f.setAccessible(true);
-        Map<PrecisionTier, AtomicBoolean> map = (Map<PrecisionTier, AtomicBoolean>) f.get(scheduler);
+        Map<PrecisionTier, AtomicBoolean> map = (Map<PrecisionTier, AtomicBoolean>) f.get(scanCoordinator(scheduler));
         AtomicBoolean flag = map.get(tier);
         if (flag == null) {
             throw new IllegalStateException("no pending flag for " + tier);
         }
         return flag;
+    }
+
+    private static Object scanCoordinator(PrecisionScheduler scheduler) throws Exception {
+        Field f = PrecisionScheduler.class.getDeclaredField("scanCoordinator");
+        f.setAccessible(true);
+        return f.get(scheduler);
     }
 }

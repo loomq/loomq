@@ -1,5 +1,10 @@
 package com.loomq.infrastructure.wheel;
 
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -40,8 +45,8 @@ public final class GroupCommitBarrier implements AutoCloseable {
     private final AtomicBoolean inlineForceInFlight = new AtomicBoolean(false);
     /** 内联 force 兜底执行器(平台线程):msync 是 native 阻塞,在 VT 上会 pin carrier,
      *  慢盘下批量 pin 致 VT 调度雪崩。移交平台线程,调用 VT 在 future.get() 上 park(不 pin)。 */
-    private final java.util.concurrent.ExecutorService inlineForceExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+    private final ExecutorService inlineForceExecutor =
+        Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "wheel-inline-force");
             t.setDaemon(true);
             return t;
@@ -108,13 +113,13 @@ public final class GroupCommitBarrier implements AutoCloseable {
                 final long pending = writeTicket.get();
                 try {
                     inlineForceExecutor.submit(() -> doInlineForce(pending)).get();
-                } catch (java.util.concurrent.RejectedExecutionException ree) {
+                } catch (RejectedExecutionException ree) {
                     // R21: close() 已关执行器(stop/close 交错)——写者字节已在 mmap,若按
                     // 失败回滚而字节已持久化,重启后 SCHEDULED 槽复活 = 幽灵投递(正是段 2
                     // 兜底要防的窗口)。shutdown 期间在调用线程同步 force(接受短暂 pin,
                     // 正确性优先);force 成功即发布 frontier,写者按成功返回。
                     doInlineForce(pending);
-                } catch (java.util.concurrent.ExecutionException ee) {
+                } catch (ExecutionException ee) {
                     Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
                     throw new RuntimeException("inline force fallback failed, ticket=" + myTicket, cause);
                 } catch (InterruptedException ie) {
@@ -236,7 +241,7 @@ public final class GroupCommitBarrier implements AutoCloseable {
         // 关闭内联 force 执行器(平台线程)。即使 barrier 从未 start，也必须释放该线程池。
         inlineForceExecutor.shutdown();
         try {
-            if (!inlineForceExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            if (!inlineForceExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 inlineForceExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {

@@ -133,11 +133,15 @@ class SignalDrivenConsumerTest {
 
         // 绕开 scanAndDispatch（不经 offer 后 unpark），直接把 intent 投进 dispatch 队列：
         // 消费者只能靠 1ms park cap 重新 poll 取走它。
-        Field qf = PrecisionScheduler.class.getDeclaredField("tierDispatchQueues");
+        // （队列已随 Task 4 迁入 DispatchPipeline，经 scheduler.pipeline 反射取得。）
+        Field pf = PrecisionScheduler.class.getDeclaredField("pipeline");
+        pf.setAccessible(true);
+        Object pipeline = pf.get(scheduler);
+        Field qf = DispatchPipeline.class.getDeclaredField("tierDispatchQueues");
         qf.setAccessible(true);
         @SuppressWarnings("unchecked")
         Map<PrecisionTier, BlockingQueue<Intent>> queues =
-            (Map<PrecisionTier, BlockingQueue<Intent>>) qf.get(scheduler);
+            (Map<PrecisionTier, BlockingQueue<Intent>>) qf.get(pipeline);
         BlockingQueue<Intent> queue = queues.get(PrecisionTier.ULTRA);
 
         long t0 = System.nanoTime();

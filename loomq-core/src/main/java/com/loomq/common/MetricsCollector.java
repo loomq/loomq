@@ -1,6 +1,7 @@
 package com.loomq.common;
 
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.PrecisionTierCatalog;
 import java.util.Map;
 
 /**
@@ -21,7 +22,7 @@ public class MetricsCollector {
 
     public MetricsCollector() {
         this.operationalMetrics = new OperationalMetricsRegistry();
-        this.tierMetrics = new PrecisionTierMetricsRegistry(com.loomq.domain.intent.PrecisionTierCatalog.defaultCatalog());
+        this.tierMetrics = new PrecisionTierMetricsRegistry(PrecisionTierCatalog.defaultCatalog());
         this.latencyMetrics = new LatencyMetricsRegistry();
         this.runtimeMetrics = new RuntimeMetricsRegistry();
     }

@@ -1,5 +1,6 @@
 package com.loomq;
 
+import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.infrastructure.wheel.WheelConfig;
 import java.util.Properties;
 import org.slf4j.Logger;
@@ -62,7 +63,7 @@ public final class LoomqEngineFactory {
         // 工厂路径恒 null)——Properties 配置的默认档静默失效。
         String defaultTier = props.getProperty("wheel.default_tier", props.getProperty("wheel.defaultTier"));
         if (defaultTier != null && !defaultTier.isBlank()) {
-            builder.defaultTier(com.loomq.domain.intent.PrecisionTier.fromString(defaultTier));
+            builder.defaultTier(PrecisionTier.fromString(defaultTier));
         }
 
         return builder;

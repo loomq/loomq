@@ -5,6 +5,7 @@ import com.loomq.application.recovery.WheelRecovery;
 import com.loomq.application.recovery.WheelRecoveryReport;
 import com.loomq.application.scheduler.BucketGroupManager;
 import com.loomq.application.scheduler.PrecisionScheduler;
+import com.loomq.application.scheduler.StateChangeSink;
 import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
@@ -26,6 +27,7 @@ import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
 import com.loomq.store.ReadOnlyIntentStoreView;
+import com.loomq.tracing.IntentTraceStore;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,10 +35,14 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -78,7 +84,7 @@ public class LoomqEngine implements AutoCloseable {
     private final MetricsCollector metricsCollector;
     private final PrecisionScheduler scheduler;
     private final IntentCommandService commandService;
-    private final com.loomq.tracing.IntentTraceStore traceStore;
+    private final IntentTraceStore traceStore;
     private final BucketReclaimer bucketReclaimer;
 
     // ========== 观察器 ==========
@@ -86,7 +92,7 @@ public class LoomqEngine implements AutoCloseable {
 
     // ========== 回调机制 ==========
     private final Executor callbackExecutor;
-    private final java.util.concurrent.ExecutorService operationExecutor;
+    private final ExecutorService operationExecutor;
 
     // ========== 状态 ==========
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -152,7 +158,7 @@ public class LoomqEngine implements AutoCloseable {
                 : DEFAULT_DELIVERY_HANDLER;
             // R21: traceStore 单实例——调度器与命令服务共享(冷 create/取消的 trace 归命令服务管)
             this.traceStore = builder.intentTraceStore != null
-                ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore();
+                ? builder.intentTraceStore : new IntentTraceStore();
             this.scheduler = new PrecisionScheduler(
                 intentStore,
                 deliveryHandler,
@@ -192,7 +198,7 @@ public class LoomqEngine implements AutoCloseable {
                 traceStore);
 
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
-            scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
+            scheduler.setStateChangeSink(new StateChangeSink() {
                 @Override public void persist(Intent intent) { commandService.persistStateChangePutOnly(intent); }
                 @Override public void persistTerminalInPlace(Intent intent) { commandService.persistTerminalInPlace(intent); }
                 @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
@@ -231,11 +237,7 @@ public class LoomqEngine implements AutoCloseable {
             throw new IllegalStateException("Engine is already running");
         }
         try {
-            logger.info("╔════════════════════════════════════════════════════════╗");
-            logger.info("║       LoomQ Core Engine Starting...                    ║");
-            logger.info("║       Mode: Embedded                                   ║");
-            logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
-            logger.info("╚════════════════════════════════════════════════════════╝");
+            logger.info("LoomQ Core Engine Starting... Mode=Embedded, Persistence=PHTW (Layered Time Wheel)");
 
             if (!deliveryHandlerConfigured) {
                 logger.warn("No DeliveryHandler configured; intents will be silently dead-lettered. "
@@ -317,7 +319,7 @@ public class LoomqEngine implements AutoCloseable {
         // 须在 daemon/scheduler 停止之前完成,使在途 create 仍能正常完成调度。
         operationExecutor.shutdown();
         try {
-            if (!operationExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            if (!operationExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 operationExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {
@@ -479,10 +481,10 @@ public class LoomqEngine implements AutoCloseable {
      * (与 C4-2 的提交后失败修复叠加,关闭竞态降级为可观察的失败,无状态翻转)。
      * 异常类型保持(ExecutionException 解包为原始 RuntimeException/Error)。
      */
-    private <T> T runDrained(java.util.concurrent.Callable<T> command) {
+    private <T> T runDrained(Callable<T> command) {
         try {
             return operationExecutor.submit(command).get();
-        } catch (java.util.concurrent.ExecutionException e) {
+        } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof RuntimeException re) {
                 throw re;
@@ -578,13 +580,6 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取运行状态标志。
-     */
-    public AtomicBoolean getRunning() {
-        return running;
-    }
-
-    /**
      * 获取桶组管理器（高级使用）
      *
      * @return BucketGroupManager
@@ -628,7 +623,7 @@ public class LoomqEngine implements AutoCloseable {
         private PrecisionTier defaultTier;
         private IntentStore intentStore;
         private MetricsCollector metricsCollector;
-        private com.loomq.tracing.IntentTraceStore intentTraceStore;
+        private IntentTraceStore intentTraceStore;
         private PrecisionTierCatalog precisionTierCatalog;
 
         /**
@@ -694,7 +689,7 @@ public class LoomqEngine implements AutoCloseable {
         }
 
         /** Inject a custom IntentTraceStore (default: new instance per engine). */
-        public Builder intentTraceStore(com.loomq.tracing.IntentTraceStore store) {
+        public Builder intentTraceStore(IntentTraceStore store) {
             this.intentTraceStore = store;
             return this;
         }
