@@ -95,7 +95,8 @@ public final class SlotCodec {
 
     /**
      * 防御性解码:CRC/格式/未知状态码等任何异常一律返回 null(调用方按"损坏条目跳过"处理)。
-     * 收敛 IntentCommandService.hasActiveDuplicate / TailIndex.promoteInto / WheelRecovery
+     * 收敛 IntentCreator.hasActiveDuplicate(round 10 前在 IntentCommandService) /
+     * TailIndex.promoteInto / WheelRecovery
      * 三处手写 try/catch(损坏 tail 记录中断启动/创建的历史故障点)。
      */
     public static Intent decodeSafe(byte[] slot) {
