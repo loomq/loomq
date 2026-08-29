@@ -176,7 +176,7 @@ class SlotSpillTest {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
         try (WheelStore s = new WheelStore(cfg(tmp, 1), clock::get)) {
             Intent big = intent("intent_plo0000001", clock, clock.get() + 5_000);
-            big.setShardKey("x".repeat(300));   // encodePayload 超 210B
+            big.setTags(java.util.Map.of("pad", "x".repeat(300)));   // encodePayload 超 210B（tags TLV 0x0E 计入容量）
             assertThrows(SlotOverflowException.class, () -> s.put(big));
             assertEquals(0L, s.getSpillCounts().getOrDefault(WheelTier.SEC, 0L),
                 "payload 溢出不得计入桶溢出 spill 计数");

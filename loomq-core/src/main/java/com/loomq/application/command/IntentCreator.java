@@ -114,7 +114,7 @@ final class IntentCreator {
             // 遮蔽,新 Intent 静默丢失。种子后 incrementRevision 使新槽 revision 严格大于历史最高。
             Long histMax = persistence.maxRevisionOf(intent.getIntentId());
             if (histMax != null && histMax >= intent.getRevision()) {
-                intent.setRevision(histMax);
+                intent.seedRevision(histMax);
             }
             intent.incrementRevision();
 
@@ -267,7 +267,7 @@ final class IntentCreator {
                 // 否则 recovery max-revision 去重会遮蔽新 Intent。
                 Long histMax = persistence.maxRevisionOf(intent.getIntentId());
                 if (histMax != null && histMax >= intent.getRevision()) {
-                    intent.setRevision(histMax);
+                    intent.seedRevision(histMax);
                 }
                 intent.incrementRevision();
                 SlotLocation loc = persistence.persistToWheel(intent, false);
@@ -288,10 +288,10 @@ final class IntentCreator {
                 // 否则非持久化 intent 回滚后 updatedAt 残留 transitionTo/incrementRevision
                 // 的时间戳,与已还原的 status/revision 不一致。
                 // R24: 回滚同样恢复 precisionTier——defaultTier 覆盖不是用户意愿。
-                // 注意：setPrecisionTier 会更新 updatedAt，因此必须在 rollbackStatus 之前执行，
-                // 由 rollbackStatus 统一还原 updatedAt。
+                // 注意：setPrecisionTier 会更新 updatedAt，因此必须在 rollbackVolatileState 之前执行，
+                // 由 rollbackVolatileState 统一还原 updatedAt。
                 intent.setPrecisionTier(oldTiers[i]);
-                intent.rollbackStatus(oldStatuses[i], oldUpdatedAts[i], oldRevisions[i]);
+                intent.rollbackVolatileState(oldStatuses[i], oldUpdatedAts[i], oldRevisions[i]);
             }
             throw new RuntimeException("Batch createIntent persistence failed; " + written + " intents compensated", e);
         }

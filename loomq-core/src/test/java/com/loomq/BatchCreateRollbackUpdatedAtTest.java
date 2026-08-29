@@ -14,7 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * R14: createIntents 失败回滚把变异后的 {@code intent.getUpdatedAt()} 传给 rollbackStatus,
+ * R14: createIntents 失败回滚把变异后的 {@code intent.getUpdatedAt()} 传给 rollbackVolatileState,
  * 导致未持久化 intent 回滚后 updatedAt 残留 transitionTo/incrementRevision 的时间戳,
  * 与已还原的 status/revision 不一致。修复:回滚前捕获原始 updatedAt 并还原。
  *

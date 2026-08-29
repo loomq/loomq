@@ -152,7 +152,7 @@ final class IntentCanceler {
             // 回滚：清理待回收记录（不 free 槽——intent 回滚为活态，槽仍是其 tombstone）
             persistence.discardTerminalBooking(intentId);
             if (oldStatus != null && intent.getStatus() != oldStatus) {
-                intent.rollbackStatus(oldStatus, oldUpdatedAt, oldRevision);
+                intent.rollbackVolatileState(oldStatus, oldUpdatedAt, oldRevision);
                 scheduler.restore(intent);
             }
             throw e;

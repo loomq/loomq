@@ -19,33 +19,33 @@ class TerminalIntentEvictionTest {
         ConcurrentIntentStore store = new ConcurrentIntentStore();
 
         // Create a terminal intent with updatedAt 25h ago
-        Intent old = Intent.restore(
+        Intent old = Intent.restore(new Intent.Snapshot(
             null, "intent_old_terminal01", IntentStatus.ACKED,
             Instant.now().minus(26, ChronoUnit.HOURS),
             Instant.now().minus(25, ChronoUnit.HOURS),
             Instant.now().minusSeconds(10),
-            null, null, PrecisionTier.STANDARD, null, null, null,
-            null, null, null, null, 0, null, 5);
+            null, null, PrecisionTier.STANDARD, null,
+            null, null, null, null, 0, null, 5));
         store.upsert(old);
 
         // Create a fresh terminal intent (updatedAt = now)
-        Intent fresh = Intent.restore(
+        Intent fresh = Intent.restore(new Intent.Snapshot(
             null, "intent_fresh_000001", IntentStatus.ACKED,
             Instant.now().minusSeconds(10),
             Instant.now().minusSeconds(5),
             Instant.now().minusSeconds(10),
-            null, null, PrecisionTier.STANDARD, null, null, null,
-            null, null, null, null, 0, null, 5);
+            null, null, PrecisionTier.STANDARD, null,
+            null, null, null, null, 0, null, 5));
         store.upsert(fresh);
 
         // Create a non-terminal intent updated 25h ago (should NOT be evicted)
-        Intent oldScheduled = Intent.restore(
+        Intent oldScheduled = Intent.restore(new Intent.Snapshot(
             null, "intent_old_scheduled", IntentStatus.SCHEDULED,
             Instant.now().minus(26, ChronoUnit.HOURS),
             Instant.now().minus(25, ChronoUnit.HOURS),
             Instant.now().plusSeconds(3600),
-            null, null, PrecisionTier.STANDARD, null, null, null,
-            null, null, null, null, 0, null, 3);
+            null, null, PrecisionTier.STANDARD, null,
+            null, null, null, null, 0, null, 3));
         store.upsert(oldScheduled);
 
         // Run cleanup
@@ -72,13 +72,13 @@ class TerminalIntentEvictionTest {
 
         // createdAt is recent (within 24h idempotency window), but updatedAt is 25h ago
         // (triggers terminal eviction). This isolates eviction from idempotency expiry.
-        Intent terminal = Intent.restore(
+        Intent terminal = Intent.restore(new Intent.Snapshot(
             null, "intent_idem_00000001", IntentStatus.ACKED,
             Instant.now().minusSeconds(10),
             Instant.now().minus(25, ChronoUnit.HOURS),
             Instant.now().minusSeconds(10),
-            null, null, PrecisionTier.STANDARD, null, null, null,
-            null, null, "idem-key-001", null, 0, null, 5);
+            null, null, PrecisionTier.STANDARD, null,
+            null, null, "idem-key-001", null, 0, null, 5));
         store.upsert(terminal);
 
         // Verify idempotency record exists

@@ -132,8 +132,8 @@ public final class SlotCodec {
         if (intent.getExpiredAction() != null) putByte(b, (byte) 0x05, (byte) intent.getExpiredAction().ordinal());
         if (intent.getPrecisionTier() != null) putByte(b, (byte) 0x06, (byte) intent.getPrecisionTier().ordinal());
         if (intent.getWalMode() != null) putByte(b, (byte) 0x07, (byte) intent.getWalMode().ordinal());
-        if (intent.getShardKey() != null) putStr(b, (byte) 0x08, intent.getShardKey());
-        if (intent.getShardId() != null) putStr(b, (byte) 0x09, intent.getShardId());
+        // round 11 弃用 shardKey/shardId 持久化（原 TLV 0x08/0x09）：内核无 Shard 路由概念，
+        // 字段恒写读往返无消费者。tag 号弃置不复用；旧盘数据由 decode 的 default-skip 兼容。
         if (intent.getAttempts() > 0) putInt(b, (byte) 0x0B, intent.getAttempts());
         if (intent.getLastDeliveryId() != null) putStr(b, (byte) 0x0C, intent.getLastDeliveryId());
         if (intent.getIdempotencyKey() != null) putStr(b, (byte) 0x0D, intent.getIdempotencyKey());
@@ -161,7 +161,6 @@ public final class SlotCodec {
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
         String traceId = null; long createdAt = 0, updatedAt = 0, deadline = 0;
         ExpiredAction expiredAction = null; PrecisionTier tier = null; WalMode walMode = null;
-        String shardKey = null, shardId = null;
         int attempts = 0; String lastDeliveryId = null, idempotencyKey = null;
         Map<String, String> tags = null; // ADAPTATION: 支持 tags 回读
         boolean hasRedelivery = false;
@@ -191,8 +190,6 @@ public final class SlotCodec {
                 }
                 case 0x06 -> tier = PrecisionTierCatalog.defaultCatalog().tierByOrdinal(b.get() & 0xFF);
                 case 0x07 -> walMode = decodeWalMode(b.get() & 0xFF);
-                case 0x08 -> shardKey = getStr(b, len);
-                case 0x09 -> shardId = getStr(b, len);
                 case 0x0B -> attempts = b.getInt();
                 case 0x0C -> lastDeliveryId = getStr(b, len);
                 case 0x0D -> idempotencyKey = getStr(b, len);
@@ -215,15 +212,16 @@ public final class SlotCodec {
             throw new IllegalStateException("unknown intent status ordinal: " + statusOrd);
         }
         IntentStatus status = IntentStatus.values()[statusOrd - 1];
-        return Intent.restore(traceId, intentId, status,
+        return Intent.restore(new Intent.Snapshot(
+            traceId, intentId, status,
             Instant.ofEpochMilli(createdAt), Instant.ofEpochMilli(updatedAt),
             unpackExecuteAt(executeAtPacked),
             deadline == 0 ? null : Instant.ofEpochMilli(deadline),
-            expiredAction, tier, walMode, shardKey, shardId,
-            null,
+            expiredAction, tier, walMode,
+            null, // callback 不持久化：重启/恢复/冷路径载入后恒 null
             hasRedelivery ? new RedeliveryPolicy(maxAttempts, backoff, initialDelayMs, maxDelayMs,
                 multiplier, jitter) : null,
-            idempotencyKey, tags, attempts, lastDeliveryId, revision);
+            idempotencyKey, tags, attempts, lastDeliveryId, revision));
     }
 
     /**
@@ -293,8 +291,6 @@ public final class SlotCodec {
         if (intent.getExpiredAction() != null) n += 6;
         if (intent.getPrecisionTier() != null) n += 6;
         if (intent.getWalMode() != null) n += 6;
-        if (intent.getShardKey() != null) n += 7 + utf8Len(intent.getShardKey());
-        if (intent.getShardId() != null) n += 7 + utf8Len(intent.getShardId());
         if (intent.getAttempts() > 0) n += 9;
         if (intent.getLastDeliveryId() != null) n += 7 + utf8Len(intent.getLastDeliveryId());
         if (intent.getIdempotencyKey() != null) n += 7 + utf8Len(intent.getIdempotencyKey());

@@ -123,7 +123,7 @@ final class IntentUpdater {
                 // 终态槽回收，遗留 locationIndex/intentExpiryIndex/multiSlot 泄漏直到重启。
                 // 拒绝并回滚状态，指引调用方使用 cancelIntent。
                 if (intent.getStatus().isTerminal()) {
-                    intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    intent.rollbackVolatileState(statusBeforeUpdater, updatedAtBeforeUpdater);
                     throw new IllegalArgumentException(
                         "updater must not transition intent " + intentId + " to terminal state "
                             + intent.getStatus() + "; use cancelIntent");
@@ -132,11 +132,11 @@ final class IntentUpdater {
                 // R16: updater 置空 executeAt 会污染调度器——persistToWheel.locate(null) NPE,
                 // 且 scanDue 的 intent.getExecuteAt().isAfter(now) 持续 NPE 使该档扫描永久卡死。
                 // 拒绝并回滚 executeAt/updatedAt,维持内核不变量(executeAt 恒非空)。
-                // 注意顺序:setExecuteAt 会重写 updatedAt,须先还原 executeAt 再 rollbackStatus
+                // 注意顺序:setExecuteAt 会重写 updatedAt,须先还原 executeAt 再 rollbackVolatileState
                 // (后者同时还原 status 与 updatedAt),避免 updatedAt 残留变异时间戳。
                 if (intent.getExecuteAt() == null) {
                     intent.setExecuteAt(oldExecuteAt);
-                    intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    intent.rollbackVolatileState(statusBeforeUpdater, updatedAtBeforeUpdater);
                     throw new IllegalArgumentException(
                         "updater must not set executeAt to null for intent " + intentId);
                 }
@@ -147,9 +147,9 @@ final class IntentUpdater {
                 // 抛 ISE 被 runFinalizeTask 吞 → ACK 不落盘/onDelivered 不通知;重启后
                 // recovery 把非终态 DISPATCHING 当活 intent 重复投递。拒绝并回滚。
                 if (intent.getStatus() != IntentStatus.SCHEDULED && intent.getStatus() != IntentStatus.DUE) {
-                    // 先捕获违规状态再回滚——rollbackStatus 会还原 status,消息须点名违规值
+                    // 先捕获违规状态再回滚——rollbackVolatileState 会还原 status,消息须点名违规值
                     IntentStatus offender = intent.getStatus();
-                    intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                    intent.rollbackVolatileState(statusBeforeUpdater, updatedAtBeforeUpdater);
                     throw new IllegalArgumentException(
                         "updater must not move intent " + intentId + " to " + offender
                             + "; only SCHEDULED/DUE are valid post-update states");
@@ -238,7 +238,7 @@ final class IntentUpdater {
             // (与"失败即还原"语义不符,见 BugUpdateUpdaterFailureTest)。
             // 非调度字段(内容)的变异不可回滚(无更新前快照),属用户 updater 契约边界。
             // 顺序:setExecuteAt/setPrecisionTier 会重写 updatedAt,须先执行,再由
-            // rollbackStatus 统一还原 status 与 updatedAt。
+            // rollbackVolatileState 统一还原 status 与 updatedAt。
             if (oldExecuteAt != null) {
                 intent.setExecuteAt(oldExecuteAt);
             }
@@ -246,7 +246,7 @@ final class IntentUpdater {
                 // R28: precisionTier 也是调度字段(决定 cohort/桶路由),updater 污染后必须
                 // 还原,否则活对象残留 null/错误档,与磁盘(recovery 恢复值)短暂不一致。
                 intent.setPrecisionTier(tierBeforeUpdater);
-                intent.rollbackStatus(statusBeforeUpdater, updatedAtBeforeUpdater);
+                intent.rollbackVolatileState(statusBeforeUpdater, updatedAtBeforeUpdater);
             }
             // 更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按原 executeAt
             // 重新调度——否则 intent 在 store 中为 SCHEDULED/DUE 却不在任何
