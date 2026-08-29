@@ -74,7 +74,7 @@ public class PrecisionScheduler {
      * 重试重排程是新的调度承诺而非中间态：必须落盘，否则崩溃恢复看到的是
      * 旧 executeAt 的 SCHEDULED 槽，重试链静默丢失。(I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
      */
-    private final StatePersistence persistence = new StatePersistence();
+    private final StatePersistence persistence;
 
     // 投递结算引擎:终态化/重试/死信/过期 + 结算任务提交;消费循环经 DeliverySettlement 回调进入
     private final SettlementEngine settlementEngine;
@@ -148,6 +148,9 @@ public class PrecisionScheduler {
 
         // 初始化在途投递计数
         this.inFlightCounters = new InFlightCounters(this.precisionTierCatalog.supportedTiers());
+
+        // 持久化通道注入 MC:I6 容错计数(persistFailures)收口到中央导出(round 12)
+        this.persistence = new StatePersistence(metricsCollector);
 
         // 投递结算引擎:叶子组件(持久化/观察器/重试/过期索引/lag/在途计数)与 redeliveryDecider
         // 解析均完成后创建;executor 由 start() 经 bindExecutor 注入。
@@ -457,14 +460,12 @@ public class PrecisionScheduler {
     /** 获取档位背压信息（委托消费管线） */
     public Map<PrecisionTier, DispatchPipeline.BackpressureInfo> getBackpressureStatus() { return pipeline.backpressureStatus(); }
 
-    /** 诊断：结算任务抛异常次数（finalize 异常被吞，onDelivered 可能不触发）。 */
-    public long getFinalizeTaskExceptions() { return settlementEngine.finalizeTaskExceptions(); }
-
-    /** 诊断：状态持久化失败次数（I6 容错吞掉，onDelivered 仍触发）。 */
-    public long getPersistFailures() { return persistence.persistFailures(); }
-
     /** 诊断：最近的 finalize 异常样本（类名:消息），有界，供取证。 */
     public List<String> getFinalizeExceptionSamples() { return settlementEngine.finalizeExceptionSamples(); }
+
+    public CohortManager getCohortManager() {
+        return cohortManager;
+    }
 
     /** 设置 Intent 生命周期观察器列表（由 LoomqEngine 调用） */
     public void setObservers(List<IntentObserver> observers) {
@@ -501,9 +502,5 @@ public class PrecisionScheduler {
 
     public PrecisionTierCatalog getPrecisionTierCatalog() {
         return precisionTierCatalog;
-    }
-
-    public CohortManager getCohortManager() {
-        return cohortManager;
     }
 }

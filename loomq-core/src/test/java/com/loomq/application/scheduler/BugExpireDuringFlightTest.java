@@ -3,6 +3,7 @@ package com.loomq.application.scheduler;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
@@ -10,6 +11,7 @@ import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -34,6 +36,7 @@ import org.junit.jupiter.api.Test;
 class BugExpireDuringFlightTest {
 
     private PrecisionScheduler scheduler;
+    private MetricsCollector metrics;
     private ConcurrentIntentStore intentStore;
 
     @AfterEach
@@ -57,7 +60,8 @@ class BugExpireDuringFlightTest {
             return f;
         };
         intentStore = new ConcurrentIntentStore();
-        scheduler = new PrecisionScheduler(intentStore, handler, null);
+        metrics = new MetricsCollector();
+        scheduler = new PrecisionScheduler(intentStore, handler, null, null, metrics, new IntentTraceStore());
         scheduler.addObserver(new IntentObserver() {
             @Override public void onDelivered(Intent i, DeliveryResult r) { onDelivered.incrementAndGet(); }
             @Override public void onScheduled(Intent i) {}
@@ -88,7 +92,7 @@ class BugExpireDuringFlightTest {
         pending.get().complete(DeliveryResult.SUCCESS);
         Thread.sleep(500);   // 等 finalize 结算
 
-        assertEquals(0, scheduler.getFinalizeTaskExceptions(), "finalize 不得因终态转换抛异常");
+        assertEquals(0, metrics.getFinalizeTaskExceptionsTotal(), "finalize 不得因终态转换抛异常");
         assertEquals(IntentStatus.EXPIRED, intent.getStatus(), "终态胜者在途投递结果");
         assertEquals(1, deliveries.get(), "投递恰好发生一次（在途那次）");
         assertEquals(0, onDelivered.get(), "已过期 intent 不得再通知 onDelivered");

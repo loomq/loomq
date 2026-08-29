@@ -1,7 +1,7 @@
 package com.loomq.application.scheduler;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
-import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,19 +19,19 @@ final class StatePersistence {
     private static final Logger logger = LoggerFactory.getLogger(StatePersistence.class);
 
     private volatile StateChangeSink sink;
-    private final AtomicLong persistFailures = new AtomicLong();
+    private final MetricsCollector metrics;
+
+    StatePersistence(MetricsCollector metrics) {
+        this.metrics = metrics;
+    }
 
     void setSink(StateChangeSink sink) {
         this.sink = sink;
     }
 
-    long persistFailures() {
-        return persistFailures.get();
-    }
-
     /** 非持久化失败计数(updateStoreBestEffort 等内存镜像路径共用)。 */
     void countFailure() {
-        persistFailures.incrementAndGet();
+        metrics.incrementPersistFailures();
     }
 
     /** revision 递增 + 非阻塞 put;须在 synchronized(intent) 内调用以维持 I2/I3 原子性。 */
@@ -42,7 +42,7 @@ final class StatePersistence {
         try {
             s.persist(intent);
         } catch (Exception e) {
-            persistFailures.incrementAndGet();
+            metrics.incrementPersistFailures();
             logger.error("persistStateChange failed for intent {} (revision {}): {}",
                 intent.getIntentId(), intent.getRevision(), e.getMessage(), e);
         }
@@ -56,7 +56,7 @@ final class StatePersistence {
         try {
             s.persistTerminalInPlace(intent);
         } catch (Exception e) {
-            persistFailures.incrementAndGet();
+            metrics.incrementPersistFailures();
             logger.error("persistTerminalInPlace failed for intent {} (revision {}): {}",
                 intent.getIntentId(), intent.getRevision(), e.getMessage(), e);
         }
@@ -80,7 +80,7 @@ final class StatePersistence {
         try {
             s.awaitCommit();
         } catch (Exception e) {
-            persistFailures.incrementAndGet();
+            metrics.incrementPersistFailures();
             logger.error("awaitCommit failed: {}", e.getMessage(), e);
         }
     }

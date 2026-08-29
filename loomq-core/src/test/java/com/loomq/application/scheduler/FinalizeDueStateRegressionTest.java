@@ -2,12 +2,14 @@ package com.loomq.application.scheduler;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IntentStore;
+import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -35,7 +37,8 @@ class FinalizeDueStateRegressionTest {
             deliveries.incrementAndGet();
             return CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         };
-        PrecisionScheduler scheduler = new PrecisionScheduler(store, handler, null);
+        MetricsCollector metrics = new MetricsCollector();
+        PrecisionScheduler scheduler = new PrecisionScheduler(store, handler, null, null, metrics, new IntentTraceStore());
         scheduler.start();
         try {
             Intent intent = new Intent("r6-due-settle-0001");
@@ -57,7 +60,7 @@ class FinalizeDueStateRegressionTest {
             assertEquals(IntentStatus.ACKED, st,
                 "DUE-status intent must settle through the dispatch chain to ACKED, not crash the settlement");
             assertEquals(1, deliveries.get(), "exactly one delivery");
-            assertEquals(0, scheduler.getFinalizeTaskExceptions(),
+            assertEquals(0, metrics.getFinalizeTaskExceptionsTotal(),
                 "no swallowed finalize exceptions (pre-fix: ISE from DUE->DUE transition)");
         } finally {
             scheduler.stop();

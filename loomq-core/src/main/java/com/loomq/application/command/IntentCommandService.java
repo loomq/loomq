@@ -48,8 +48,6 @@ public final class IntentCommandService {
     private final AtomicBoolean running;
 
     private volatile CallbackHandler callbackHandler;
-    // R21: 注入 catalog(自定义目录的 walMode 默认必须被尊重,见 resolveWalMode)
-    private final PrecisionTierCatalog precisionTierCatalog;
 
     /** PHTW 持久化协议 + 簿记四件套单主(round 10 自本类拆出,见 WheelPersistence)。 */
     private final WheelPersistence persistence;
@@ -92,19 +90,19 @@ public final class IntentCommandService {
         this.callbackExecutor = callbackExecutor;
         this.running = running;
         this.callbackHandler = callbackHandler;
-        // R21: 注入 catalog(自定义目录的 walMode 默认必须被尊重)与 traceStore
+        // R21: catalog 归一(自定义目录的 walMode 默认必须被尊重)与 traceStore
         // (冷 create/取消/fireNow 的 trace 生命周期归命令服务管)
-        this.precisionTierCatalog = config.precisionTierCatalog() != null
+        PrecisionTierCatalog catalog = config.precisionTierCatalog() != null
             ? config.precisionTierCatalog()
             : PrecisionTierCatalog.defaultCatalog();
         // 组件组装顺序:persistence → creator → updater → canceler(round 10 拆分终态;
         // canceler 末参经 CallbackDispatcher 端口回指 facade 的锁外派发)
         this.creator = new IntentCreator(intentStore, scheduler, phtw.promotionDaemon(),
             metricsCollector, traceStore, sequenceNumber, config.defaultTier(),
-            config.groupCommitIntervalMs(), config.hotBoundaryMs(), this.precisionTierCatalog,
+            config.groupCommitIntervalMs(), config.hotBoundaryMs(), catalog,
             phtw.wheelStore(), phtw.tailIndex(), phtw.locationIndex(), this.persistence);
         this.updaterService = new IntentUpdater(intentStore, scheduler,
-            phtw.locationIndex(), this.precisionTierCatalog, this.persistence);
+            phtw.locationIndex(), catalog, this.persistence);
         this.canceler = new IntentCanceler(intentStore, scheduler, phtw.promotionDaemon(),
             phtw.locationIndex(), phtw.wheelStore(), phtw.tailIndex(), metricsCollector,
             traceStore, this.persistence, this::dispatchCallback);
@@ -208,7 +206,7 @@ public final class IntentCommandService {
 
     /**
      * 终态原地覆写（非阻塞 mmap）：把 locationIndex 指向的最新槽覆写为终态，不追加新槽。
-     * 单槽 Intent 排队待回收（pendingReclaims），落盘后由 reclaimTerminal 清空；多槽只覆写不回收。
+     * 单槽 Intent 排队待回收（WheelPersistence 内部 pendingReclaims 队列），落盘后由 reclaimTerminal 清空；多槽只覆写不回收。
      * 无索引或 tail 时回退追加（tail 超视界非回收路径）。失败由调用方按 I6 吞掉。
      */
     public void persistTerminalInPlace(Intent intent) {
@@ -218,7 +216,7 @@ public final class IntentCommandService {
     /**
      * 终态槽回收（须在 awaitCommit 之后调用）：先清 locationIndex（终态不索引，杜绝 freed 槽被
      * stale 别名误复用），单槽清空入 free-list 复用；多槽保留 tombstone。无论单多槽都清理
-     * multiSlotIntents，避免集合泄漏。
+     * WheelPersistence 内部的多槽登记（multiSlotIntents），避免集合泄漏。
      */
     public void reclaimTerminal(String intentId) {
         persistence.reclaimTerminal(intentId);

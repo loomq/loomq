@@ -173,8 +173,9 @@ class StallDetectionTest {
         sb.append("\n=== engine finalize diagnostics ===\n");
         try {
             var s = engine.getScheduler();
-            sb.append("finalizeTaskExceptions=").append(s.getFinalizeTaskExceptions())
-              .append(" persistFailures=").append(s.getPersistFailures()).append("\n");
+            var mc = engine.getMetricsCollector();
+            sb.append("finalizeTaskExceptions=").append(mc.getFinalizeTaskExceptionsTotal())
+              .append(" persistFailures=").append(mc.getPersistFailuresTotal()).append("\n");
             for (String ex : s.getFinalizeExceptionSamples()) sb.append("  finalizeException: ").append(ex).append("\n");
         } catch (Exception ignored) { }
         sb.append("\n=== engine backpressure at stall ===\n");

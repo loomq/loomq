@@ -18,7 +18,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import org.slf4j.Logger;
@@ -46,7 +45,6 @@ final class SettlementEngine implements DeliverySettlement {
     private final Rescheduler rescheduler; // 锁外重排程端口(schedule() 经此触发,不依赖门面整体)
 
     private volatile ExecutorService executor; // bindExecutor 在 start() 注入;消费者仅在绑定后运行,提交路径不可达 null
-    private final AtomicLong finalizeTaskExceptions = new AtomicLong();
     private final ConcurrentLinkedQueue<String> finalizeExceptionSamples = new ConcurrentLinkedQueue<>();
 
     SettlementEngine(IntentStore intentStore, StatePersistence persistence, ObserverNotifier notifier,
@@ -235,7 +233,7 @@ final class SettlementEngine implements DeliverySettlement {
             flushOutcome(outcome, intent);
         } finally {
             long durationMs = (System.nanoTime() - startTime) / 1_000_000;
-            metrics.recordWebhookLatency(durationMs);
+            metrics.recordFinalizeDuration(durationMs);
             // 结算路径不再计数 intent_total(创建数统计在 createIntent/createIntents,HELP 语义)——重试不再虚增
         }
     }
@@ -481,7 +479,7 @@ final class SettlementEngine implements DeliverySettlement {
         try {
             task.run();
         } catch (Exception e) {
-            finalizeTaskExceptions.incrementAndGet();
+            metrics.incrementFinalizeTaskExceptions();
             if (finalizeExceptionSamples.size() < 20) {
                 finalizeExceptionSamples.add(e.getClass().getSimpleName() + ": "
                     + (e.getMessage() != null ? e.getMessage() : "(null)"));
@@ -494,10 +492,6 @@ final class SettlementEngine implements DeliverySettlement {
 
     private static long executeAtMs(Intent intent) {
         return intent.getExecuteAt() != null ? intent.getExecuteAt().toEpochMilli() : 0L;
-    }
-
-    long finalizeTaskExceptions() {
-        return finalizeTaskExceptions.get();
     }
 
     List<String> finalizeExceptionSamples() {

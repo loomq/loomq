@@ -150,7 +150,9 @@ public class LoomqEngine implements AutoCloseable {
                 wheelConfig.groupCommitIntervalMs(),
                 wheelConfig.awaitCommitTimeoutMs());
             this.locationIndex = new IntentLocationIndex();
-            this.metricsCollector = builder.metricsCollector != null ? builder.metricsCollector : new MetricsCollector();
+            this.metricsCollector = builder.metricsCollector != null
+                ? builder.metricsCollector
+                : new MetricsCollector(builder.precisionTierCatalog);
 
             // 初始化调度器(未配置 deliveryHandler 时使用默认 DEAD_LETTER 处理器)
             DeliveryHandler deliveryHandler = builder.deliveryHandler != null
@@ -207,8 +209,10 @@ public class LoomqEngine implements AutoCloseable {
 
             // C4-8: 不再注册构造期 observer——setObservers(observers) 在 start() 会整体清空
             // 调度器观察器列表,该 observer 从未在运行期生效(死代码);且 onDelivered 若生效
-            // 会把非终态 DELIVERED 的索引摘除(hasActiveDuplicate 误放行同 id 重建),反而有害。
-            // 终态索引清理由 reclaimTerminal(调度器终态路径)/cancelIntent/cancelCold 覆盖。
+            // 会把非终态 DELIVERED 的索引摘除(hasActiveDuplicate——IntentCreator,command 包,
+            // 误放行同 id 重建),反而有害。
+            // 终态索引清理由 reclaimTerminal(调度器终态路径)/cancelIntent/cancelCold
+            // (IntentCanceler,command 包)覆盖。
 
             this.bucketReclaimer = new BucketReclaimer(wheelStore, locationIndex, wheelConfig.bucketRetentionMs());
 

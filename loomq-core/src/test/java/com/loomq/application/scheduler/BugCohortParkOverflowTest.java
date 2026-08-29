@@ -2,12 +2,14 @@ package com.loomq.application.scheduler;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import org.junit.jupiter.api.AfterEach;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.Test;
 class BugCohortParkOverflowTest {
 
     private PrecisionScheduler scheduler;
+    private MetricsCollector metrics;
 
     @AfterEach
     void tearDown() {
@@ -34,7 +37,8 @@ class BugCohortParkOverflowTest {
     void farFutureCohortMustNotSpinWakeLoop() throws Exception {
         ConcurrentIntentStore intentStore = new ConcurrentIntentStore();
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
-        scheduler = new PrecisionScheduler(intentStore, handler, null);
+        metrics = new MetricsCollector();
+        scheduler = new PrecisionScheduler(intentStore, handler, null, null, metrics, new IntentTraceStore());
         scheduler.start();
 
         Intent far = new Intent("far-future");
@@ -47,7 +51,7 @@ class BugCohortParkOverflowTest {
 
         Thread.sleep(600);   // 修复前：wakeLoop 每 ~100ms 报错一次（wakeLoopErrors>=1）
 
-        assertEquals(0, scheduler.getCohortManager().getWakeLoopErrors(),
+        assertEquals(0, metrics.getWakeLoopErrorsTotal(),
             "wakeLoop 不得因 park 时长溢出而错误空转");
     }
 }

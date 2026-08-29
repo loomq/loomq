@@ -304,3 +304,13 @@ LoomqEngine.createIntent (虚拟线程异步)
 | `spi` | `DeliveryHandler`、`CallbackHandler`、`IntentObserver`、`RedeliveryDecider`、`DeliveryContext` |
 | `config` | `SchedulerConfig` 等配置记录 |
 | `common` / `metrics` / `tracing` | 指标（`MetricsCollector` 及各 registry）、校验、`IntentTrace(Store)`、异常体系 |
+
+### 指标导出(round 12 收敛)
+
+导出唯一入口:`LoomqEngine.getMetricsCollector().exportPrometheusMetrics()`(OMR → LMR → PTMR 三段)。直方图/分位算法统一在 `common.Histogram`(ceil-累积返回桶下界)。
+
+**v0.10 迁移清单**(相对 round 11 前的导出文本):
+
+- 删除(恒 0 / 常量,从未反映真实数据):意图状态分布 4 项 `loomq_intents_total`/`loomq_intents_pending`/`loomq_intents_scheduled`/`loomq_intents_dispatching`(需要时用 `ConcurrentIntentStore.countByStatus()` 自算)、`loomq_recovery_duration_ms`、`loomq_recovery_intents_total`、`loomq_wal_*` 系列、`loomq_scheduler_max_pending_intents`、`loomq_trigger_latency_ms_p95`(+samples)、`loomq_wake_latency_ms_p95`(+samples)、`loomq_total_latency_ms_p95`(+samples)、`loomq_intents_ack_success_total`/`loomq_intents_failed_terminal_total`/`loomq_intents_retry_total`/`loomq_intents_expired_total`/`loomq_intents_dead_letter_total`、`loomq_webhook_requests_total`/`loomq_webhook_timeout_total`/`loomq_webhook_error_total`/`loomq_webhook_timeout_rate_percent`、`loomq_bucket_intent_count`、`loomq_ready_queue_size`
+- 更名:`loomq_webhook_latency_ms_p95` → `loomq_finalize_duration_ms_p95`(统计对象是单次结算任务全程耗时,非 webhook;samples 指标同步更名)
+- 新增:`loomq_persist_failures_total`、`loomq_finalize_task_exceptions_total`、`loomq_wake_loop_errors_total`(调度故障收口,写点分别为 StatePersistence / SettlementEngine / CohortManager)

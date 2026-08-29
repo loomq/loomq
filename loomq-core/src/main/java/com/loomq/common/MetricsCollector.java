@@ -14,17 +14,24 @@ public class MetricsCollector {
 
     private final PrecisionTierMetricsRegistry tierMetrics;
 
-    // 唤醒/webhook/cohort flush 延迟指标
+    // 唤醒/finalize/cohort flush 延迟指标
     private final LatencyMetricsRegistry latencyMetrics;
 
-    // 运行时指标
-    private final RuntimeMetricsRegistry runtimeMetrics;
-
     public MetricsCollector() {
+        this(null);
+    }
+
+    /**
+     * catalog 感知构造:tier 维度注册表按注入目录初始化,自定义档不再静默归并 defaultTier。
+     * null 等价于 {@link PrecisionTierCatalog#defaultCatalog()}(无参构造路径)。
+     * 经 {@code LoomqEngine.Builder.metricsCollector(...)} 注入的自定义 MC 由注入方自行
+     * 负责其 catalog 一致性——内核不改动注入对象。
+     */
+    public MetricsCollector(PrecisionTierCatalog catalog) {
         this.operationalMetrics = new OperationalMetricsRegistry();
-        this.tierMetrics = new PrecisionTierMetricsRegistry(PrecisionTierCatalog.defaultCatalog());
+        this.tierMetrics = new PrecisionTierMetricsRegistry(
+            catalog != null ? catalog : PrecisionTierCatalog.defaultCatalog());
         this.latencyMetrics = new LatencyMetricsRegistry();
-        this.runtimeMetrics = new RuntimeMetricsRegistry();
     }
 
     // ========== 计数器更新 ==========
@@ -39,6 +46,35 @@ public class MetricsCollector {
 
     public void incrementRecoveryOverdue() {
         operationalMetrics.incrementRecoveryOverdue();
+    }
+
+    // ========== 调度故障收口计数(round 12) ==========
+
+    /** 记录一次状态持久化失败(I6 容错吞掉,不阻塞调度;写点 StatePersistence)。 */
+    public void incrementPersistFailures() {
+        operationalMetrics.incrementPersistFailures();
+    }
+
+    /** 记录一次结算任务抛异常(finalize 异常被吞,onDelivered 可能不触发;写点 SettlementEngine)。 */
+    public void incrementFinalizeTaskExceptions() {
+        operationalMetrics.incrementFinalizeTaskExceptions();
+    }
+
+    /** 记录一次 CohortManager wakeLoop 异常(诊断计数,循环保活空转;写点 CohortManager)。 */
+    public void incrementWakeLoopErrors() {
+        operationalMetrics.incrementWakeLoopErrors();
+    }
+
+    public long getPersistFailuresTotal() {
+        return operationalMetrics.getPersistFailuresTotal();
+    }
+
+    public long getFinalizeTaskExceptionsTotal() {
+        return operationalMetrics.getFinalizeTaskExceptionsTotal();
+    }
+
+    public long getWakeLoopErrorsTotal() {
+        return operationalMetrics.getWakeLoopErrorsTotal();
     }
 
     public long getIntentsCancelledTotal() {
@@ -217,10 +253,10 @@ public class MetricsCollector {
     // ========== 延迟记录 ==========
 
     /**
-     * 记录 webhook 执行延迟 (开始执行 → 收到响应)
+     * 记录单次结算任务全程耗时(毫秒;状态转换 + awaitCommit 等待,非 webhook 执行)。
      */
-    public void recordWebhookLatency(long latencyMs) {
-        latencyMetrics.recordWebhookLatency(latencyMs);
+    public void recordFinalizeDuration(long durationMs) {
+        latencyMetrics.recordFinalizeDuration(durationMs);
     }
 
     /**
@@ -233,26 +269,14 @@ public class MetricsCollector {
     // ========== 导出指标 ==========
 
     /**
-     * 导出 Prometheus 格式的指标（使用当前运行时状态）
+     * 导出 Prometheus 格式的指标(OMR → LMR → PTMR 三段拼接)。
      */
     public String exportPrometheusMetrics() {
-        return exportPrometheusMetrics(getIntentStatusCounts());
-    }
-
-    /**
-     * 导出 Prometheus 格式的指标
-     */
-    public String exportPrometheusMetrics(Map<String, Long> intentStats) {
         StringBuilder sb = new StringBuilder();
-        operationalMetrics.appendPrometheusMetrics(intentStats, sb);
+        operationalMetrics.appendPrometheusMetrics(sb);
         latencyMetrics.appendPrometheusMetrics(sb);
-        runtimeMetrics.appendPrometheusMetrics(sb);
         tierMetrics.appendPrometheusMetrics(sb);
 
         return sb.toString();
-    }
-
-    public Map<String, Long> getIntentStatusCounts() {
-        return runtimeMetrics.getIntentStatusCounts();
     }
 }

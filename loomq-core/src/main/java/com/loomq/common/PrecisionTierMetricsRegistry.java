@@ -4,7 +4,6 @@ import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
 import java.util.EnumMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -28,8 +27,7 @@ final class PrecisionTierMetricsRegistry {
     private final Map<PrecisionTier, AtomicLong> scanDurationSamplesByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> scanCountByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> backpressureEventsByTier = new EnumMap<>(PrecisionTier.class);
-    private final Map<PrecisionTier, ConcurrentHashMap<Integer, AtomicLong>> wakeupLatencyByTier = new EnumMap<>(PrecisionTier.class);
-    private final Map<PrecisionTier, AtomicLong> wakeupLatencySampleCountByTier = new EnumMap<>(PrecisionTier.class);
+    private final Map<PrecisionTier, Histogram> wakeupLatencyByTier = new EnumMap<>(PrecisionTier.class);
 
     // 三级漏斗：offer_failed → backpressure_events → abandoned
     private final Map<PrecisionTier, AtomicLong> dispatchQueueOfferFailedByTier = new EnumMap<>(PrecisionTier.class);
@@ -45,8 +43,7 @@ final class PrecisionTierMetricsRegistry {
     private final Map<PrecisionTier, AtomicLong> scannerWakeEarlyByTier = new EnumMap<>(PrecisionTier.class);
 
     // due→dispatch lag histogram
-    private final Map<PrecisionTier, ConcurrentHashMap<Integer, AtomicLong>> dispatchQueueLagByTier = new EnumMap<>(PrecisionTier.class);
-    private final Map<PrecisionTier, AtomicLong> dispatchQueueLagSampleCountByTier = new EnumMap<>(PrecisionTier.class);
+    private final Map<PrecisionTier, Histogram> dispatchQueueLagByTier = new EnumMap<>(PrecisionTier.class);
 
     PrecisionTierMetricsRegistry(PrecisionTierCatalog precisionTierCatalog) {
         this.precisionTierCatalog = precisionTierCatalog;
@@ -58,8 +55,7 @@ final class PrecisionTierMetricsRegistry {
             scanDurationSamplesByTier.put(tier, new AtomicLong(0));
             scanCountByTier.put(tier, new AtomicLong(0));
             backpressureEventsByTier.put(tier, new AtomicLong(0));
-            wakeupLatencyByTier.put(tier, new ConcurrentHashMap<>());
-            wakeupLatencySampleCountByTier.put(tier, new AtomicLong(0));
+            wakeupLatencyByTier.put(tier, new Histogram(LATENCY_BOUNDS));
 
             dispatchQueueOfferFailedByTier.put(tier, new AtomicLong(0));
             dispatchQueueRetryByTier.put(tier, new AtomicLong(0));
@@ -68,18 +64,7 @@ final class PrecisionTierMetricsRegistry {
             milliFallbackByTier.put(tier, new AtomicLong(0));
             scannerParkByTier.put(tier, new AtomicLong(0));
             scannerWakeEarlyByTier.put(tier, new AtomicLong(0));
-            dispatchQueueLagByTier.put(tier, new ConcurrentHashMap<>());
-            dispatchQueueLagSampleCountByTier.put(tier, new AtomicLong(0));
-
-            ConcurrentHashMap<Integer, AtomicLong> wakeupBuckets = wakeupLatencyByTier.get(tier);
-            for (int i = 0; i < LATENCY_BOUNDS.length; i++) {
-                wakeupBuckets.put(i, new AtomicLong(0));
-            }
-
-            ConcurrentHashMap<Integer, AtomicLong> lagBuckets = dispatchQueueLagByTier.get(tier);
-            for (int i = 0; i < LAG_BOUNDS_MS.length; i++) {
-                lagBuckets.put(i, new AtomicLong(0));
-            }
+            dispatchQueueLagByTier.put(tier, new Histogram(LAG_BOUNDS_MS));
         }
     }
 
@@ -114,10 +99,7 @@ final class PrecisionTierMetricsRegistry {
     }
 
     void recordWakeupLatencyByTier(PrecisionTier tier, long latencyUs) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        wakeupLatencySampleCountByTier.get(resolvedTier).incrementAndGet();
-        int bucketIndex = findBucket(latencyUs);
-        wakeupLatencyByTier.get(resolvedTier).get(bucketIndex).incrementAndGet();
+        wakeupLatencyByTier.get(resolveTier(tier)).record(latencyUs);
     }
 
     void incrementBackpressureEvent(PrecisionTier tier) {
@@ -146,10 +128,7 @@ final class PrecisionTierMetricsRegistry {
     }
 
     void recordDispatchQueueLagByTier(PrecisionTier tier, long lagMs) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        dispatchQueueLagSampleCountByTier.get(resolvedTier).incrementAndGet();
-        int bucketIndex = findLagBucket(lagMs);
-        dispatchQueueLagByTier.get(resolvedTier).get(bucketIndex).incrementAndGet();
+        dispatchQueueLagByTier.get(resolveTier(tier)).record(lagMs);
     }
 
     Map<PrecisionTier, Long> getBackpressureEventsByTier() {
@@ -175,10 +154,7 @@ final class PrecisionTierMetricsRegistry {
     }
 
     long calculateP95WakeupLatencyByTier(PrecisionTier tier) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        ConcurrentHashMap<Integer, AtomicLong> buckets = wakeupLatencyByTier.get(resolvedTier);
-        long totalSamples = wakeupLatencySampleCountByTier.get(resolvedTier).get();
-        return calculateP95(buckets, totalSamples);
+        return percentileForTier(tier, 0.95);
     }
 
     long calculateP50WakeupLatencyByTier(PrecisionTier tier) {
@@ -202,62 +178,24 @@ final class PrecisionTierMetricsRegistry {
     }
 
     long calculateMaxWakeupLatencyByTier(PrecisionTier tier) {
-        return maxOfBucket(tier, wakeupLatencyByTier);
+        return wakeupLatencyByTier.get(resolveTier(tier)).max();
     }
 
     long calculateMeanWakeupLatencyByTier(PrecisionTier tier) {
-        return meanOfBuckets(tier, wakeupLatencyByTier, wakeupLatencySampleCountByTier);
+        return wakeupLatencyByTier.get(resolveTier(tier)).mean();
     }
 
     long getWakeupLatencySampleCountByTier(PrecisionTier tier) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        return wakeupLatencySampleCountByTier.get(resolvedTier).get();
+        return wakeupLatencyByTier.get(resolveTier(tier)).sampleCount();
     }
 
     private long percentileForTier(PrecisionTier tier, double p) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        ConcurrentHashMap<Integer, AtomicLong> buckets = wakeupLatencyByTier.get(resolvedTier);
-        long totalSamples = wakeupLatencySampleCountByTier.get(resolvedTier).get();
-        return calculatePercentile(buckets, totalSamples, p);
+        return wakeupLatencyByTier.get(resolveTier(tier)).percentile(p);
     }
 
-    private long maxOfBucket(PrecisionTier tier, Map<PrecisionTier, ConcurrentHashMap<Integer, AtomicLong>> histogram) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        ConcurrentHashMap<Integer, AtomicLong> buckets = histogram.get(resolvedTier);
-        for (int i = LATENCY_BOUNDS.length - 1; i >= 0; i--) {
-            if (buckets.get(i).get() > 0) {
-                return LATENCY_BOUNDS[i];
-            }
-        }
-        return 0;
-    }
-
-    private long meanOfBuckets(PrecisionTier tier, Map<PrecisionTier, ConcurrentHashMap<Integer, AtomicLong>> histogram,
-                               Map<PrecisionTier, AtomicLong> sampleCounts) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        ConcurrentHashMap<Integer, AtomicLong> buckets = histogram.get(resolvedTier);
-        long totalSamples = sampleCounts.get(resolvedTier).get();
-        if (totalSamples == 0) return 0;
-        long sum = 0;
-        for (int i = 0; i < LATENCY_BOUNDS.length; i++) {
-            long lower = LATENCY_BOUNDS[i];
-            long upper = (i + 1 < LATENCY_BOUNDS.length) ? LATENCY_BOUNDS[i + 1] : lower;
-            long midpoint = (lower + upper) / 2;
-            sum += midpoint * buckets.get(i).get();
-        }
-        return sum / totalSamples;
-    }
-
-    private long calculateP95DispatchQueueLagByTier(PrecisionTier tier) {
-        PrecisionTier resolvedTier = resolveTier(tier);
-        ConcurrentHashMap<Integer, AtomicLong> buckets = dispatchQueueLagByTier.get(resolvedTier);
-        long totalSamples = dispatchQueueLagSampleCountByTier.get(resolvedTier).get();
-        return calculatePercentile(buckets, totalSamples, 0.95, LAG_BOUNDS_MS);
-    }
-
-    /** 供 MetricsCollector 暴露 due→dispatch lag P95(毫秒)。 */
+    /** 由本注册表 appendPrometheusMetrics 导出 due→dispatch lag P95(毫秒;诊断/测试读数入口)。 */
     long getDispatchQueueLagP95(PrecisionTier tier) {
-        return calculateP95DispatchQueueLagByTier(tier);
+        return dispatchQueueLagByTier.get(resolveTier(tier)).percentile(0.95);
     }
 
     Map<PrecisionTier, Long> getIntentCountsByTier() {
@@ -403,7 +341,7 @@ final class PrecisionTierMetricsRegistry {
             sb.append("loomq_dispatch_queue_lag_ms_p95{precision_tier=\"")
               .append(tier.name().toLowerCase())
               .append("\"} ")
-              .append(calculateP95DispatchQueueLagByTier(tier))
+              .append(getDispatchQueueLagP95(tier))
               .append("\n");
         }
         sb.append("\n");
@@ -422,54 +360,5 @@ final class PrecisionTierMetricsRegistry {
             counter = counters.get(precisionTierCatalog.defaultTier());
         }
         return counter;
-    }
-
-    private int findBucket(long latencyMs) {
-        for (int i = LATENCY_BOUNDS.length - 1; i >= 0; i--) {
-            if (latencyMs >= LATENCY_BOUNDS[i]) {
-                return i;
-            }
-        }
-        return 0;
-    }
-
-    private int findLagBucket(long lagMs) {
-        for (int i = LAG_BOUNDS_MS.length - 1; i >= 0; i--) {
-            if (lagMs >= LAG_BOUNDS_MS[i]) {
-                return i;
-            }
-        }
-        return 0;
-    }
-
-    private long calculateP95(ConcurrentHashMap<Integer, AtomicLong> buckets, long totalSamples) {
-        return calculatePercentile(buckets, totalSamples, 0.95);
-    }
-
-    private long calculatePercentile(ConcurrentHashMap<Integer, AtomicLong> buckets,
-                                     long totalSamples,
-                                     double percentile) {
-        return calculatePercentile(buckets, totalSamples, percentile, LATENCY_BOUNDS);
-    }
-
-    private long calculatePercentile(ConcurrentHashMap<Integer, AtomicLong> buckets,
-                                     long totalSamples,
-                                     double percentile,
-                                     int[] bounds) {
-        if (totalSamples == 0) {
-            return 0;
-        }
-
-        long target = (long) Math.ceil(totalSamples * percentile);
-        long cumulative = 0;
-
-        for (int i = 0; i < bounds.length; i++) {
-            cumulative += buckets.get(i).get();
-            if (cumulative >= target) {
-                return bounds[i];
-            }
-        }
-
-        return bounds[bounds.length - 1];
     }
 }

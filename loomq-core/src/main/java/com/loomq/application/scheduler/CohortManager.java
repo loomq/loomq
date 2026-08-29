@@ -60,11 +60,6 @@ public final class CohortManager {
      */
     private final AtomicLong generation = new AtomicLong();
 
-    /** wakeLoop 异常计数（诊断：park 时长溢出等会让 wakeLoop 每 100ms 报错空转）。 */
-    private final AtomicLong wakeLoopErrors = new AtomicLong(0);
-
-    long getWakeLoopErrors() { return wakeLoopErrors.get(); }
-
     CohortManager(BucketGroupManager bucketGroupManager, PrecisionTierCatalog catalog,
                   Consumer<Collection<Intent>> scanTrigger, MetricsCollector metrics) {
         this.bucketGroupManager = bucketGroupManager;
@@ -270,7 +265,7 @@ public final class CohortManager {
                     }
                 }
             } catch (Exception e) {
-                wakeLoopErrors.incrementAndGet();
+                metrics.incrementWakeLoopErrors();
                 logger.error("CohortManager wake loop error", e);
                 LockSupport.parkNanos(Duration.ofMillis(100).toNanos());
             }
