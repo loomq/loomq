@@ -14,16 +14,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * PHTW 持久化协议 + 簿记四件套单主所有（round 10 自 IntentCommandService 拆出）。
+ * PHTW 持久化协议 + 簿记四件套单主所有（round 10 自 IntentCommandService 拆出;非 final——round 14 测试桩子类注入提交后失败用）。
  *
  * 写协议:locate→(inTail? tail.put : wheel.put)→locationIndex.put→(durable? awaitCommit);
  * 终态经 persistTerminalInPlace 原地覆写,reclaimTerminal 在 awaitCommit 后定向回收。
  * multiSlotIntents/tombstoneIds/pendingReclaims/maxRevisions 仅本类可触碰;
- * 其他组件经 maxRevisionOf / markColdCancelTombstone / discardTerminalBooking /
- * trackMaxRevision / acquireColdLock / releaseColdLock / readColdSlot 七缝访问
- * (round 13 增冷改期三缝)。
+ * 兄弟组件经簿记缝访问(列举不计数,免得每次加缝改这行):maxRevisionOf /
+ * markColdCancelTombstone / discardTerminalBooking / trackMaxRevision /
+ * markMultiSlot / markMaxRevisions(恢复期经命令服务注入) /
+ * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝)。
  */
-final class WheelPersistence {
+class WheelPersistence {
 
     private static final Logger logger = LoggerFactory.getLogger(WheelPersistence.class);
 
@@ -65,7 +66,7 @@ final class WheelPersistence {
         new ConcurrentHashMap<>();
 
     /**
-     * 冷路径(冷取消/冷改期 round 13)按 intentId 串行化的细粒度锁注册表(共享单主)。
+     * 冷路径(冷取消/冷改期 round 13/冷 fireNow round 14)按 intentId 串行化的细粒度锁注册表(共享单主)。
      *
      * <p>wheel 路径:wheelStore.readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient
      * 副本,无法阻塞并发写;按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径同持此锁
@@ -217,9 +218,9 @@ final class WheelPersistence {
 
     /**
      * 恢复注入与活映射读取的缝——恒等实现见计划缝方法表，禁止增删操作。
-     * 兄弟组件可触达成员共七个:maxRevisionOf / markColdCancelTombstone /
-     * discardTerminalBooking / trackMaxRevision(round 13 增 acquireColdLock /
-     * releaseColdLock / readColdSlot 冷改期三缝)。
+     * 兄弟组件可触达成员(列举不计数):maxRevisionOf / markColdCancelTombstone /
+     * discardTerminalBooking / trackMaxRevision / markMultiSlot / markMaxRevisions /
+     * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝)。
      */
     Long maxRevisionOf(String intentId) {
         return maxRevisions.get(intentId);

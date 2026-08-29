@@ -19,7 +19,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Intent 取消路径（round 10 自 IntentCommandService 拆出）:热取消(synchronized(intent) 串行化
  * 状态迁移) + 冷取消(locationIndex 定位磁盘槽,冷锁注册表迁 WheelPersistence 共享
- * (冷改期 round 13 同锁))。
+ * (冷改期/冷 fireNow round 13/14 同锁))。
  * 回调派发经 CallbackDispatcher 端口回调 facade(锁外派发 + I5 防御性快照时序原样)。
  */
 final class IntentCanceler {
@@ -35,13 +35,14 @@ final class IntentCanceler {
     private final MetricsCollector metricsCollector;
     private final IntentTraceStore traceStore;
     private final WheelPersistence persistence;
+    private final ColdHotReconciler reconciler;
     private final CallbackDispatcher callbackDispatcher;
 
     IntentCanceler(IntentStore intentStore, PrecisionScheduler scheduler,
                    PromotionDaemon promotionDaemon, IntentLocationIndex locationIndex,
                    WheelStore wheelStore, TailIndex tailIndex, MetricsCollector metricsCollector,
                    IntentTraceStore traceStore, WheelPersistence persistence,
-                   CallbackDispatcher callbackDispatcher) {
+                   ColdHotReconciler reconciler, CallbackDispatcher callbackDispatcher) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
         this.promotionDaemon = promotionDaemon;
@@ -51,6 +52,7 @@ final class IntentCanceler {
         this.metricsCollector = metricsCollector;
         this.traceStore = traceStore;
         this.persistence = persistence;
+        this.reconciler = reconciler;
         this.callbackDispatcher = callbackDispatcher;
     }
 
@@ -154,12 +156,13 @@ final class IntentCanceler {
      * awaitCommit);槽位缺失/损坏时返回 false,不谎报未持久化的取消。
      *
      * <ul>
-     *   <li>tail:round 13 起同持 per-id 冷锁(与冷改期 tailIndex.put 串行,防复活)——布尔门控保留作
+     *   <li>tail:round 13 起同持 per-id 冷锁(与冷改期 tailIndex.put 串行,防复活);
+     *       round 14 F3:分支决策移入锁内(锁内重读索引),stale 快照不再决定分支——布尔门控保留作
      *       纵深防御;追加 TOMBSTONE 到 run 文件 + awaitCommit 强制落盘;以 TailIndex.remove 返回值门控 ——
      *       remove 返回 false 表示已被并发取消者移除(已追加 tombstone),直接返回 false 不重复计数。
      *       appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需布尔门控</li>
      *   <li>wheel:按 intentId 串行化(per-id 冷锁,注册表现居 `WheelPersistence` 冷锁缝,与冷改期
-     *       updateCold 共享)→ 锁内重读索引取最新槽 → 读槽解码 →
+     *       updateCold/冷 fireNow fireNowCold 共享)→ 锁内重读索引取最新槽 → 读槽解码 →
      *       transitionTo(CANCELED) + incrementRevision → 写新槽(recovery 按 max revision
      *       去重,terminal 跳过)→ 索引指向新 CANCELED 槽(在 awaitCommit 之前,杜绝在途 promote 复活)
      *       + awaitCommit。串行化保证后到者重读得到先到者写入的 CANCELED 槽(terminal)→ transitionTo
@@ -170,43 +173,36 @@ final class IntentCanceler {
     private boolean cancelCold(String intentId) {
         SlotLocation loc = locationIndex.get(intentId);
         if (loc == null) {
-            return false;                                   // 不存在(无索引项)
+            return false;                                   // 不存在(无索引项)——锁外快路径
         }
         SlotLocation terminalLoc = null;
-        if (loc.inTail()) {
-            // round 13:tail 路径同持 per-id 冷锁——冷改期的 tailIndex.put 与本路径 remove 交错
-            // 会让被取消 Intent 以更高 revision 复活;布尔门控保留作纵深防御。
-            Object lock = persistence.acquireColdLock(intentId);
-            synchronized (lock) {
-                try {
+        // round 14 F3:单锁块 + 锁内重读索引分支——分支依据曾用锁外快照(loc),tail→wheel 迁移
+        // 或新改期先到时按 stale 槽走错分支:tail→wheel 竞态返回假 false(可重试);tail→tail
+        // 竞态(改期换了 execMs,槽位不同)以旧 terminalLoc 定向移除变 no-op,残留 stale 索引。
+        // 镜像 wheel 分支既有的锁内重读语义。
+        Object lock = persistence.acquireColdLock(intentId);
+        synchronized (lock) {
+            try {
+                SlotLocation latest = locationIndex.get(intentId);
+                if (latest == null) {
+                    return false;                           // 并发取消/终态回收已清索引
+                }
+                if (latest.inTail()) {
                     // tail 路径:TailIndex.remove 返回 false 表示该 intent 已被并发取消者移除(已追加 tombstone)。
                     // 此时不可谎报成功或重复计数 —— 直接返回 false(镜像 wheel 路径第二取消者行为)。
                     if (!tailIndex.remove(intentId)) {
                         return false;
                     }
                     persistence.awaitDurableCommit();           // cancel 恒 DURABLE:确保 tombstone 落盘
-                    terminalLoc = loc;
+                    terminalLoc = latest;
                     // 冷取消 = 追加 TOMBSTONE:run 文件中残留到 compaction。按多槽墓碑语义保护
                     // revision 种子映射(C4-1)——磁盘痕迹未清,同 id 重建须抬升到历史最高之上。
                     persistence.markColdCancelTombstone(intentId);
-                } finally {
-                    persistence.releaseColdLock(intentId, lock);
-                }
-            }
-        } else {
-            // wheel 路径:readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient 副本,
-            // 并发取消互不阻塞 → double-write + double 计数。按 intentId 串行化:第二个取消者
-            // 串行进入后重读索引拿到先到者写入的 CANCELED 新槽(terminal)→ transitionTo 抛 ISE → 返回 false。
-            Object lock = persistence.acquireColdLock(intentId);
-            synchronized (lock) {
-                try {
-                    // 必须在锁内重读索引:锁外拿到的 loc 是先到者写新槽前的旧槽位,指向 SCHEDULED 旧槽
-                    // (WheelStore 状态变更写新槽,旧槽不被覆写)。重读得到先到者更新后的 CANCELED 槽才能让
-                    // 后到者见到 terminal 状态。若先到者已走出锁并移除索引项,这里拿到 null → 返回 false。
-                    SlotLocation latest = locationIndex.get(intentId);
-                    if (latest == null) {
-                        return false;
-                    }
+                } else {
+                    // wheel 路径:readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient 副本,
+                    // 并发取消互不阻塞 → double-write + double 计数。按 intentId 串行化:第二个取消者
+                    // 串行进入后重读索引拿到先到者写入的 CANCELED 新槽(terminal)→ transitionTo
+                    // 抛 ISE → 返回 false。
                     Intent cold = wheelStore.readSlot(latest);
                     if (cold == null) {
                         // 槽位缺失/损坏(空槽、撕裂写或桶已回收):无法持久化取消。
@@ -234,10 +230,10 @@ final class IntentCanceler {
                     persistence.markColdCancelTombstone(intentId);
                     terminalLoc = canceledLoc;
                     persistence.awaitDurableCommit();       // cancel 恒 DURABLE
-                } finally {
-                    // identity 校验移除,见 releaseColdLock 契约。
-                    persistence.releaseColdLock(intentId, lock);
                 }
+            } finally {
+                // identity 校验移除,见 releaseColdLock 契约。
+                persistence.releaseColdLock(intentId, lock);
             }
         }
 
@@ -247,15 +243,8 @@ final class IntentCanceler {
         locationIndex.remove(intentId, terminalLoc);
         // R21: 冷取消同样反映到 trace(computeIfPresent:无 trace 则 no-op,如从未被冷 create 记录的旧数据)
         traceStore.updateStatus(intentId, IntentStatus.CANCELED);
-        // P1-2: 与 promote 竞态收口——取消生效期间 intent 可能被 PromotionDaemon 并发提升入内存。
-        // 若已热载,需从调度结构+store 移除,否则 ghost 投递直到重启 max-revision 纠正。
-        // 与 LoomqEngine 中 promote 回调的 post-check 形成双向清理,确定性关闭竞态窗口。
-        Intent hot = intentStore.findByIdInternal(intentId);
-        if (hot != null) {
-            scheduler.removeFromSchedule(hot);
-            intentStore.delete(intentId);
-            logger.warn("Cold cancel raced with promotion; removed hot copy of intent {}", intentId);
-        }
+        // P1-2 → round 14:promote 竞态 post-check 收口至 ColdHotReconciler(单一权威实现)。
+        reconciler.removeHotCopyIfPresent(intentId);
         metricsCollector.incrementIntentsCancelled();
         logger.info("Cold intent cancelled: id={}", intentId);
         return true;

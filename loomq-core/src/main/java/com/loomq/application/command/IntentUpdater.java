@@ -21,9 +21,12 @@ import org.slf4j.LoggerFactory;
  * updateIntent 与 fireNow 共享三条纪律:removeFromSchedule 布尔返回 = scanDue CAS 认领判别;
  * 锁内 put / 锁外 awaitCommit / 锁外 schedule·restore(VT pinning 规避);
  * 提交后失败不回滚(C4-2/C4-3 同款,磁盘/索引为权威)。
- * 冷路径(round 13):updateIntent 对冷 Intent 走 updateCold(per-id 冷锁 + persistToWheel 写协议 + cohort 安全网);fireNow 冷 Intent 仍返回 false(未实现)。
+ * 冷路径(round 13/14):updateIntent 对冷 Intent 走 updateCold,fireNow 对冷 Intent 走 fireNowCold
+ * (per-id 冷锁 + persistToWheel 写协议 + cohort 安全网;冷 fireNow 把 executeAt 改写为 now 后
+ * 立即热载投递,不跑 IntentValidator——镜像热路径)。
+ * 非 final(round 14):测试桩子类覆写 routeColdAfterPersist 注入提交后路由失败。
  */
-final class IntentUpdater {
+class IntentUpdater {
 
     private static final Logger logger = LoggerFactory.getLogger(IntentUpdater.class);
 
@@ -38,17 +41,20 @@ final class IntentUpdater {
     private final PrecisionTierCatalog precisionTierCatalog;
     private final WheelPersistence persistence;
     private final PromotionDaemon promotionDaemon;
+    private final ColdHotReconciler reconciler;
     private final long hotBoundaryMs;
 
     IntentUpdater(IntentStore intentStore, PrecisionScheduler scheduler,
                   IntentLocationIndex locationIndex, PrecisionTierCatalog precisionTierCatalog,
-                  WheelPersistence persistence, PromotionDaemon promotionDaemon, long hotBoundaryMs) {
+                  WheelPersistence persistence, PromotionDaemon promotionDaemon,
+                  ColdHotReconciler reconciler, long hotBoundaryMs) {
         this.intentStore = intentStore;
         this.scheduler = scheduler;
         this.locationIndex = locationIndex;
         this.precisionTierCatalog = precisionTierCatalog;
         this.persistence = persistence;
         this.promotionDaemon = promotionDaemon;
+        this.reconciler = reconciler;
         this.hotBoundaryMs = hotBoundaryMs;
     }
 
@@ -312,15 +318,22 @@ final class IntentUpdater {
         return DetachResult.DETACHED;
     }
 
+    /**
+     * 立即触发 Intent(热路径):removeFromSchedule 布尔返回 = scanDue CAS 认领判别——已认领
+     * 则在途投递即为 fireNow 语义等价(不改写 executeAt/不落盘,防重复投递);认领成功则
+     * executeAt=now + revision+1 + DURABLE 落盘。提交后失败不回滚(C4-3:restore + 返回 true,
+     * 磁盘 @now 槽为权威);提交前失败回滚 executeAt/revision 并 restore + 返回 false。
+     * 冷 Intent 走 {@link #fireNowCold}(round 14)。
+     */
     boolean fireNow(String intentId) {
         Intent intent = intentStore.findByIdInternal(intentId);
         if (intent == null) {
-            // 冷意图尚在磁盘:cold fireNow 未实现(round 13 范围外,spec 非目标),返回 false。
-            // 与"不存在"(同样 false)在返回值上不可区分——调用方需先查存在性再 fireNow。
-            if (locationIndex.get(intentId) != null) {
-                logger.warn("Cannot fire-now a cold intent (not yet promoted into memory): id={}", intentId);
+            // 冷意图:不在内存 store 但索引在——走冷 fireNow(round 14):磁盘槽 executeAt=now
+            // + 立即热载,语义镜像热路径。不存在(索引也空)仍返回 false。
+            if (locationIndex.get(intentId) == null) {
+                return false;
             }
-            return false;
+            return fireNowCold(intentId);
         }
 
         if (intent.getStatus().isTerminal()) {
@@ -395,6 +408,80 @@ final class IntentUpdater {
     }
 
     /**
+     * 冷 fireNow(round 14):Intent 不在内存 store 时,经磁盘槽位把 executeAt 改写为 now
+     * 并 DURABLE 落新槽,随后锁外路由立即热载调度(下个扫描 tick 投递)。
+     *
+     * <p><b>语义镜像热 fireNow</b>:不跑 IntentValidator、提交后失败不回滚(C4-3 同款,
+     * 返回 true)、布尔契约(不存在/索引已清/槽不可读/终态/非 SCHEDULED/提交前持久化失败
+     * → false)。与热路径的差异仅两点:冷域无 CAS 认领分支(无在途投递可充当 fireNow);写槽前
+     * normalize 档位(executeAt 变更后槽必须自洽——热路径由调度器按内存对象重排,无此需求)。
+     * deadline 已过时的 fireNow 行为两侧一致:照常触发,由结算/过期逻辑按既有语义处理。</p>
+     *
+     * <p><b>锁内段</b>:镜像 updateCold——per-id 冷锁 → 锁内重读索引 → readColdSlot →
+     * terminal/非 SCHEDULED 拒绝 → setExecuteAt(now) + normalize → incrementRevision →
+     * persistToWheel → awaitCommit 窄 try/catch 守卫(C4-2:提交后失败仅 warn,无回滚)。
+     * tail Intent 落 wheel 新槽时由 persistToWheel 的 tail→wheel 迁移免费清旧 tail 记录。</p>
+     */
+    private boolean fireNowCold(String intentId) {
+        SlotLocation newLoc = null;
+        Intent cold = null;
+        Object lock = persistence.acquireColdLock(intentId);
+        synchronized (lock) {
+            try {
+                SlotLocation latest = locationIndex.get(intentId);
+                if (latest == null) {
+                    return false;                        // 并发取消已清索引
+                }
+                Intent current = persistence.readColdSlot(intentId, latest);
+                if (current == null) {
+                    logger.warn("fireNowCold: slot unreadable for cold intent {}, loc={}", intentId, latest);
+                    return false;
+                }
+                if (current.getStatus().isTerminal()) {
+                    logger.warn("Cannot fire intent in terminal state: id={}, status={}",
+                        intentId, current.getStatus());
+                    return false;
+                }
+                if (current.getStatus() != IntentStatus.SCHEDULED) {
+                    // 冷域只有 SCHEDULED(DUE 是热扫描态,不会落盘);见到即数据异常,不谎报触发。
+                    logger.warn("Cannot fire cold intent in non-SCHEDULED state: id={}, status={}",
+                        intentId, current.getStatus());
+                    return false;
+                }
+                current.setExecuteAt(Instant.now());
+                // 冷写槽必须自洽:executeAt 变更后档位随 delay 重算(热路径由调度器按内存对象重排)。
+                IntentCommandService.normalizePrecisionTier(precisionTierCatalog, current);
+                current.incrementRevision();
+                try {
+                    newLoc = persistence.persistToWheel(current, false);
+                } catch (RuntimeException e) {
+                    // 提交前持久化失败(槽分配/编码/写 put 抛出):磁盘 untouched(副本 transient,
+                    // 无需回滚)——镜像热 fireNow 提交前分支(回滚 + 返回 false),不向上抛。
+                    logger.warn("Failed to persist cold fireNow: id={}", intentId, e);
+                    return false;
+                }
+                try {
+                    persistence.awaitDurableCommit();
+                } catch (RuntimeException e) {
+                    // C4-2/C4-3 同款:提交后失败不回滚(镜像热 fireNow 提交后分支)。
+                    logger.warn("Cold fireNow committed; ignoring post-commit awaitCommit failure: id={}",
+                        intentId, e);
+                }
+                cold = current;
+            } finally {
+                persistence.releaseColdLock(intentId, lock);
+            }
+        }
+        try {
+            routeColdAfterPersist(intentId, cold, newLoc);   // executeAt=now 恒在热窗口:upsert+schedule
+        } catch (RuntimeException e) {
+            logger.warn("Cold fireNow committed; ignoring post-commit routing failure: id={}", intentId, e);
+        }
+        logger.info("Cold intent fired immediately: id={}", intentId);
+        return true;
+    }
+
+    /**
      * 冷改期/冷更新(round 13):Intent 不在内存 store(>hotBoundaryMs 未提升或 >day 视界落 tail),
      * 经 locationIndex 定位磁盘槽,持 per-id 冷锁读-改-写新槽。写路径全走
      * {@link WheelPersistence#persistToWheel}(tail→wheel 迁移清旧 tail 记录 / multiSlot 墓碑 /
@@ -408,9 +495,15 @@ final class IntentUpdater {
      * 语义同热路径)。</p>
      *
      * <p><b>锁外路由</b>:cohort 安全网注册(窗口内外统一,见 {@link #routeColdAfterPersist})→
-     * 窗口内热载 → P1-2 post-check。</p>
+     * 窗口内热载 → P1-2 post-check(round 14 收口至 {@link ColdHotReconciler})。</p>
      *
-     * @return 更新后的 Intent 副本;不存在(无索引)/并发取消已清索引/槽缺失损坏/已终态返回 empty
+     * <p><b>C4-2 提交后守卫(round 14 F4)</b>:persistToWheel 成功即提交——此后 awaitCommit 或
+     * 锁外路由失败一律 warn 后按成功返回,不回滚 revision、不作废新槽(镜像热路径提交后分支)。
+     * 与热路径的差异:热路径提交后失败有 intentStore.save 补偿面;冷路径提交后磁盘/索引已一致,
+     * 路由属增强,无补偿面。提交前失败(updater IAE/校验 IAE/槽不可读)行为不变。</p>
+     *
+     * @return 更新后的 Intent 副本;不存在(无索引)/并发取消已清索引/槽缺失损坏/已终态返回 empty;
+     *         提交后失败(awaitCommit/路由)按成功返回(C4-2)
      */
     private Optional<Intent> updateCold(String intentId, Consumer<Intent> updater, Instant newExecuteAt) {
         if (locationIndex.get(intentId) == null) {
@@ -460,18 +553,33 @@ final class IntentUpdater {
                 // 写协议全复用:locate→put(tail/wheel)→tail→wheel 迁移清旧记录→multiSlot.add→
                 // locationIndex.put(索引先行)→trackMaxRevision。round 13 冷改期恒 DURABLE。
                 newLoc = persistence.persistToWheel(current, false);
-                persistence.awaitDurableCommit();
+                try {
+                    persistence.awaitDurableCommit();
+                } catch (RuntimeException e) {
+                    // C4-2(round 14 F4):persistToWheel 成功即提交(新槽已在 mmap + 索引),
+                    // awaitCommit 失败不回滚 revision/不作废新槽——镜像热路径提交后分支
+                    // (updateIntent 提交后 catch 分支),磁盘/索引为权威。
+                    logger.warn("Cold update committed; ignoring post-commit awaitCommit failure: id={}",
+                        intentId, e);
+                }
                 cold = current;
             } finally {
                 persistence.releaseColdLock(intentId, lock);
             }
         }
-        routeColdAfterPersist(intentId, cold, newLoc);
+        try {
+            routeColdAfterPersist(intentId, cold, newLoc);
+        } catch (RuntimeException e) {
+            // C4-2(round 14 F4):路由属提交后增强(热载/cohort 注册),失败不回滚磁盘权威态;
+            // cohort 缺注册由重启 recovery 重建兜底,热载缺口由 cohort 安全网复核自愈。
+            logger.warn("Cold update committed; ignoring post-commit routing failure: id={}", intentId, e);
+        }
         return Optional.of(cold.copy());
     }
 
     /**
-     * 冷改期锁外路由:cohort 安全网注册(窗口内外统一)+ 窗口内热载 + P1-2 post-check(update 侧)。
+     * 冷改期锁外路由:cohort 安全网注册(窗口内外统一)+ 窗口内热载 + P1-2 post-check
+     * (round 14 收口至 ColdHotReconciler;update/fireNow 冷命令共用本路由)。
      *
      * <p><b>为什么窗口内也注册 cohort(spec 4.4 安全网)</b>:promote 回调的复核回滚是
      * 无条件按 id 删热副本——在途旧 promote(旧 cohort 已出队)与我们交错时可能误删刚热载的
@@ -481,17 +589,21 @@ final class IntentUpdater {
      *
      * <p><b>post-check stale 判别</b>:窗口外任何热副本皆 stale(promote 只可能载入旧槽内容);
      * 窗口内按 revision 判别(&lt; 本次新 revision 为 stale)。与 LoomqEngine promote 回调自检
-     * (latest≠h.loc 跳过 + upsert 后复核回滚)构成双向清理,P1-2 同构。</p>
+     * (latest≠h.loc 跳过 + upsert 后复核回滚)构成双向清理,P1-2 同构(round 14 双侧统一
+     * 收口至 ColdHotReconciler)。</p>
+     *
+     * <p>package-private(round 14):测试桩覆写本方法注入提交后路由失败。</p>
      */
-    private void routeColdAfterPersist(String intentId, Intent cold, SlotLocation newLoc) {
+    void routeColdAfterPersist(String intentId, Intent cold, SlotLocation newLoc) {
         // R13a(终审修正):路由起点重读索引——释放冷锁后,并发冷取消可能已写 CANCELED 槽并清索引,
         // 或并发更新已写更高 revision 的新槽。索引不再指向本写(newLoc)说明磁盘已有更高 revision
         // 的权威态(取消/新改期):本写的热载会成为 ghost(已取消)或 stale(旧改期)热副本——
         // 弃用路由,磁盘/后到者的路由为权威。交错窗口内(取消持锁未写索引)本路由可能先行
-        // upsert,由 cancelCold 的 P1-2 post-check 删热副本收口(既有双向清理)。
+        // upsert,由 cancelCold 的 P1-2 post-check 删热副本收口(round 14 经 ColdHotReconciler
+        // 单一权威实现)。
         SlotLocation current = locationIndex.get(intentId);
         if (current == null || !current.equals(newLoc)) {
-            logger.warn("Cold update superseded by cancel/newer write before routing; "
+            logger.warn("Cold write superseded by cancel/newer write before routing; "
                 + "skipping hot-load: id={}", intentId);
             return;
         }
@@ -504,16 +616,8 @@ final class IntentUpdater {
             // 冷域恒 SCHEDULED(锁内已校验),直接 schedule;镜像 create 热路由(IntentCreator 冷热分支)。
             scheduler.schedule(cold);
         }
-        // P1-2 post-check:冷改期可能与在途 promote 交错,热副本可能是旧槽内容(旧 revision)。
-        Intent hot = intentStore.findByIdInternal(intentId);
-        if (hot != null && (!withinHotWindow || hot.getRevision() < cold.getRevision())) {
-            scheduler.removeFromSchedule(hot);
-            intentStore.delete(intentId);
-            if (withinHotWindow) {
-                intentStore.upsert(cold);
-                scheduler.schedule(cold);
-            }
-            logger.warn("Cold update raced with promotion; reconciled to new schedule: id={}", intentId);
-        }
+        // P1-2 → round 14:promote 竞态 post-check 收口至 ColdHotReconciler(单一权威实现:
+        // 窗口/revision 判别 + 降级 + 窗口内重热载,行为原样保持)。
+        reconciler.removeHotCopyIfStale(intentId, cold, withinHotWindow);
     }
 }

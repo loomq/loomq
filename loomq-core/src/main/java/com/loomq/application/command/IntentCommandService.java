@@ -10,6 +10,7 @@ import com.loomq.domain.intent.WalMode;
 import com.loomq.infrastructure.wheel.GroupCommitBarrier;
 import com.loomq.infrastructure.wheel.IntentLocationIndex;
 import com.loomq.infrastructure.wheel.PromotionDaemon;
+import com.loomq.infrastructure.wheel.SlotLocation;
 import com.loomq.infrastructure.wheel.TailIndex;
 import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.CallbackHandler;
@@ -52,6 +53,9 @@ public final class IntentCommandService {
     /** PHTW 持久化协议 + 簿记四件套单主(round 10 自本类拆出,见 WheelPersistence)。 */
     private final WheelPersistence persistence;
 
+    /** 冷↔热 reconcile 单一权威实现(round 14,原 P1-2 三处内联收口)。 */
+    private final ColdHotReconciler reconciler;
+
     /** 创建路径组件(round 10 自本类拆出):单条/批量创建、失败补偿取消、活跃副本预检。 */
     private final IntentCreator creator;
 
@@ -86,6 +90,7 @@ public final class IntentCommandService {
     ) {
         this.persistence = new WheelPersistence(phtw.wheelStore(), phtw.tailIndex(),
             phtw.commitBarrier(), phtw.locationIndex());
+        this.reconciler = new ColdHotReconciler(intentStore, scheduler, phtw.locationIndex());
         this.intentStore = intentStore;
         this.callbackExecutor = callbackExecutor;
         this.running = running;
@@ -103,10 +108,10 @@ public final class IntentCommandService {
             phtw.wheelStore(), phtw.tailIndex(), phtw.locationIndex(), this.persistence);
         this.updaterService = new IntentUpdater(intentStore, scheduler,
             phtw.locationIndex(), catalog, this.persistence,
-            phtw.promotionDaemon(), config.hotBoundaryMs());
+            phtw.promotionDaemon(), this.reconciler, config.hotBoundaryMs());
         this.canceler = new IntentCanceler(intentStore, scheduler, phtw.promotionDaemon(),
             phtw.locationIndex(), phtw.wheelStore(), phtw.tailIndex(), metricsCollector,
-            traceStore, this.persistence, this::dispatchCallback);
+            traceStore, this.persistence, this.reconciler, this::dispatchCallback);
     }
 
     public void registerCallbackHandler(CallbackHandler handler) {
@@ -157,6 +162,14 @@ public final class IntentCommandService {
     public boolean fireNow(String intentId) {
         ensureRunning();
         return updaterService.fireNow(intentId);
+    }
+
+    /**
+     * promote 侧冷↔热 reconcile(round 14):委托 {@link ColdHotReconciler}——P1-2 协议的
+     * 单一权威实现,协议语义见其类 javadoc。供 LoomqEngine 的 promote 回调调用。
+     */
+    public void reconcilePromotion(Intent intent, SlotLocation loc) {
+        reconciler.rollbackPromoteHotLoad(intent, loc);
     }
 
     private void dispatchCallback(Intent intent, CallbackHandler.EventType eventType, Throwable error) {

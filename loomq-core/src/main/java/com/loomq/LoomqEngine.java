@@ -45,6 +45,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -171,21 +172,19 @@ public class LoomqEngine implements AutoCloseable {
             );
 
             // 初始化冷→热提升 daemon:到点把冷 Intent 从磁盘载入内存并调度
-            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, (intent, loc) -> {
-                if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
-                    intentStore.upsert(intent);          // 幂等:已在内存则跳过
-                    scheduler.schedule(intent);
-                    // P1-2: promote↔cold-command(cancelCold/updateCold)TOCTOU 收口(promote 侧)。
-                    // promote 读槽→落地期间若发生冷取消,索引已迁移到 CANCELED 槽或被移除;若发生
-                    // 冷改期,索引已指向新调度槽。复核不匹配则回滚热载,杜绝 ghost 投递/旧内容热载。
-                    // 与 cancelCold/updateCold 末尾的 store 复查形成双向清理,确定性关闭竞态窗口
-                    // (两可见动作 upsert 与 index.put 有全序,后到者必见先到者)。
-                    SlotLocation after = locationIndex.get(intent.getIntentId());
-                    if (after == null || !after.equals(loc)) {
-                        scheduler.removeFromSchedule(intent);
-                        intentStore.delete(intent.getIntentId());
-                        logger.warn("Promotion rolled back for intent {} (raced with cold cancel/update)",
-                            intent.getIntentId());
+            // (匿名类而非 lambda:回调体内引用 final 字段 commandService,而其赋值在下方——
+            // javac 定值分析对 lambda 引用未初始化 blank final 报错,匿名类方法体不受限;
+            // 回调仅 start() 后触发,届时 commandService 恒非空。)
+            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, new BiConsumer<>() {
+                @Override
+                public void accept(Intent intent, SlotLocation loc) {
+                    if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
+                        intentStore.upsert(intent);          // 幂等:已在内存则跳过
+                        scheduler.schedule(intent);
+                        // P1-2 → round 14:promote 侧 TOCTOU 复核收口至 ColdHotReconciler(单一权威
+                        // 实现,经命令服务委托;索引失配/已清即回滚热载,杜绝 ghost 投递/旧内容热载)。
+                        // commandService 字段在下方赋值,回调仅 start() 后触发,此处恒非空。
+                        commandService.reconcilePromotion(intent, loc);
                     }
                 }
             }, wheelConfig.promotionLeadMs());
@@ -448,8 +447,13 @@ public class LoomqEngine implements AutoCloseable {
     /**
      * 立即触发 Intent
      *
+     * <p>冷 Intent(round 14):不在内存热窗口(>hotBoundaryMs 未提升或超 day 视界落 tail)
+     * 时同样生效——磁盘槽 executeAt 改写为 now 并 DURABLE 落新槽(per-id 冷锁串行化),
+     * 随后立即热载调度,下个扫描 tick 投递。与热路径一致不校验 deadline;
+     * 不存在/已终态/冷槽不可读时返回 false。</p>
+     *
      * @param intentId Intent ID
-     * @return true 如果成功触发
+     * @return true 如果成功触发;不存在或已终态时为 false(冷槽不可读亦为 false)
      */
     public boolean fireNow(String intentId) {
         return runDrained(() -> commandService.fireNow(intentId));
