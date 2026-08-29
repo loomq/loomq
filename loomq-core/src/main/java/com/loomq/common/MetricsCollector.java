@@ -14,7 +14,7 @@ public class MetricsCollector {
 
     private final PrecisionTierMetricsRegistry tierMetrics;
 
-    // 唤醒/finalize/cohort flush 延迟指标
+    // finalize/cohort flush 延迟指标
     private final LatencyMetricsRegistry latencyMetrics;
 
     public MetricsCollector() {

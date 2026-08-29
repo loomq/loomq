@@ -176,7 +176,7 @@ LoomQ 内核**不**负责以下职责，它们留给上层 shell（如未来的 
 
 - 不内置 HTTP / gRPC 传输层。
 - 不做集群复制、leader 选举、租约与 fencing。
-- 冷 Intent（超过 60min 热窗口）支持**取消**，但暂不支持冷改期 / 冷 fireNow。
+- 冷 Intent（超过 60min 热窗口）支持**取消**与**改期**（`updateIntent`，round 13），暂不支持冷 fireNow。
 - 单节点内核定位；`REPLICATED` 为多副本能力预留。
 
 ---
@@ -185,7 +185,7 @@ LoomQ 内核**不**负责以下职责，它们留给上层 shell（如未来的 
 
 - **loomqex shell** — HTTP / gRPC 传输层 + 集群复制 + 租约 / 选举。
 - **REPLICATED 落地** — 真正的多副本确认。
-- **冷操作补全** — 冷改期 / 冷 fireNow。
+- **冷操作补全** — 冷 fireNow（冷取消/冷改期已实现）。
 - **SlotCodec 改按 name 持久化** — 解除枚举 ordinal 耦合（当前新增档位必须追加到枚举末尾）。
 
 ---

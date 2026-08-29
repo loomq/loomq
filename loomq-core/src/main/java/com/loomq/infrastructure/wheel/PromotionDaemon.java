@@ -130,7 +130,7 @@ public final class PromotionDaemon implements AutoCloseable {
                 intent = store.readSlot(h.loc());
             }
             if (intent == null || intent.getStatus().isTerminal()) return;
-            // 把读槽用的 loc 传给回调,供其做提升后复核(P1-2:与 cancelCold 的 TOCTOU 收口)。
+            // 把读槽用的 loc 传给回调,供其做提升后复核(P1-2:与 cancelCold/updateCold 的 TOCTOU 收口)。
             onHotPromotion.accept(intent, h.loc());
         } catch (Exception ex) {
             log.error("promote failed for {}", h.intentId(), ex);

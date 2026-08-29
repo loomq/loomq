@@ -175,15 +175,17 @@ public class LoomqEngine implements AutoCloseable {
                 if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
                     intentStore.upsert(intent);          // 幂等:已在内存则跳过
                     scheduler.schedule(intent);
-                    // P1-2: promote↔cancelCold TOCTOU 收口(promote 侧)。promote 读槽→落地
-                    // 期间若发生冷取消,索引已迁移到 CANCELED 槽或被移除。复核不匹配则回滚
-                    // 热载,杜绝 ghost 投递。与 cancelCold 末尾的 store 复查形成双向清理,
-                    // 确定性关闭竞态窗口(两可见动作 upsert 与 index.put 有全序,后到者必见先到者)。
+                    // P1-2: promote↔cold-command(cancelCold/updateCold)TOCTOU 收口(promote 侧)。
+                    // promote 读槽→落地期间若发生冷取消,索引已迁移到 CANCELED 槽或被移除;若发生
+                    // 冷改期,索引已指向新调度槽。复核不匹配则回滚热载,杜绝 ghost 投递/旧内容热载。
+                    // 与 cancelCold/updateCold 末尾的 store 复查形成双向清理,确定性关闭竞态窗口
+                    // (两可见动作 upsert 与 index.put 有全序,后到者必见先到者)。
                     SlotLocation after = locationIndex.get(intent.getIntentId());
                     if (after == null || !after.equals(loc)) {
                         scheduler.removeFromSchedule(intent);
                         intentStore.delete(intent.getIntentId());
-                        logger.warn("Promotion rolled back for intent {} (raced with cold cancel)", intent.getIntentId());
+                        logger.warn("Promotion rolled back for intent {} (raced with cold cancel/update)",
+                            intent.getIntentId());
                     }
                 }
             }, wheelConfig.promotionLeadMs());
@@ -460,7 +462,14 @@ public class LoomqEngine implements AutoCloseable {
      *
      * @param intentId Intent ID
      * @param updater  修改函数
-     * @return 更新后的 Intent；不存在时返回 empty
+     * @return 更新后的 Intent；不存在或冷槽不可读时返回 empty;冷 Intent 现已支持更新与改期
+     *         (已终态冷 Intent 亦返回 empty;热 Intent 已终态则返回未修改副本 no-op)
+     *
+     * <p><b>冷 Intent(round 13):</b>Intent 不在内存热窗口(>hotBoundaryMs 未提升或超 day 视界
+     * 落 tail)时同样生效:经磁盘槽位读-改-写(per-id 串行化),DURABLE 落新槽;统一重注册
+     * promotion cohort 作安全网(窗口内外皆注册,到点见热副本则幂等 no-op),改期后进入
+     * 热窗口的还会立即热载调度。返回 empty 表示不存在(或并发取消
+     * 已生效);终态冷 Intent 返回 empty。</p>
      */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater) {
         return runDrained(() -> commandService.updateIntent(intentId, updater, null));
@@ -472,7 +481,8 @@ public class LoomqEngine implements AutoCloseable {
      * @param intentId Intent ID
      * @param updater 修改函数
      * @param newExecuteAt 新的执行时间，传 null 表示不调整调度
-     * @return 更新后的 Intent；不存在时返回 empty
+     * @return 更新后的 Intent；不存在或冷槽不可读时返回 empty;冷 Intent 现已支持更新与改期
+     *         (已终态冷 Intent 亦返回 empty;热 Intent 已终态则返回未修改副本 no-op)
      */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater, Instant newExecuteAt) {
         return runDrained(() -> commandService.updateIntent(intentId, updater, newExecuteAt));

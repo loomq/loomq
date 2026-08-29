@@ -20,7 +20,8 @@ import org.slf4j.LoggerFactory;
  * 终态经 persistTerminalInPlace 原地覆写,reclaimTerminal 在 awaitCommit 后定向回收。
  * multiSlotIntents/tombstoneIds/pendingReclaims/maxRevisions 仅本类可触碰;
  * 其他组件经 maxRevisionOf / markColdCancelTombstone / discardTerminalBooking /
- * trackMaxRevision 四缝访问(终审修正:冷取消 wheel 路径经第四缝推进 revision 种子)。
+ * trackMaxRevision / acquireColdLock / releaseColdLock / readColdSlot 七缝访问
+ * (round 13 增冷改期三缝)。
  */
 final class WheelPersistence {
 
@@ -62,6 +63,20 @@ final class WheelPersistence {
      */
     private final ConcurrentHashMap<String, Long> maxRevisions =
         new ConcurrentHashMap<>();
+
+    /**
+     * 冷路径(冷取消/冷改期 round 13)按 intentId 串行化的细粒度锁注册表(共享单主)。
+     *
+     * <p>wheel 路径:wheelStore.readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient
+     * 副本,无法阻塞并发写;按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径同持此锁
+     * (round 13):冷改期的 tailIndex.put 与冷取消的 remove 交错,会让被取消 Intent 以更高
+     * revision 复活(remove 的布尔门控盖不住"remove 后 put"窗口)。锁对象在 synchronized 块的
+     * finally 中以 identity 校验移除,只删自己放入的对象,避免误删后到者的锁。</p>
+     *
+     * <p>兄弟组件(IntentCanceler/IntentUpdater)经 {@link #acquireColdLock} /
+     * {@link #releaseColdLock} 两缝使用,禁止直接持有注册表引用。</p>
+     */
+    private final ConcurrentHashMap<String, Object> coldWriteLocks = new ConcurrentHashMap<>();
 
     WheelPersistence(WheelStore wheelStore, TailIndex tailIndex,
                      GroupCommitBarrier commitBarrier, IntentLocationIndex locationIndex) {
@@ -202,8 +217,9 @@ final class WheelPersistence {
 
     /**
      * 恢复注入与活映射读取的缝——恒等实现见计划缝方法表，禁止增删操作。
-     * 兄弟组件可触达成员共四个:maxRevisionOf / markColdCancelTombstone /
-     * discardTerminalBooking / trackMaxRevision(冷取消 wheel 路径推进种子)。
+     * 兄弟组件可触达成员共七个:maxRevisionOf / markColdCancelTombstone /
+     * discardTerminalBooking / trackMaxRevision(round 13 增 acquireColdLock /
+     * releaseColdLock / readColdSlot 冷改期三缝)。
      */
     Long maxRevisionOf(String intentId) {
         return maxRevisions.get(intentId);
@@ -217,5 +233,24 @@ final class WheelPersistence {
     void discardTerminalBooking(String intentId) {
         pendingReclaims.remove(intentId);
         multiSlotIntents.remove(intentId);
+    }
+
+    /** 冷路径 per-id 互斥进:computeIfAbsent 取稳定锁对象(契约见 coldWriteLocks)。 */
+    Object acquireColdLock(String intentId) {
+        return coldWriteLocks.computeIfAbsent(intentId, k -> new Object());
+    }
+
+    /** 冷路径 per-id 互斥出:identity 校验 computeIfPresent,只移除自己放入的锁对象。 */
+    void releaseColdLock(String intentId, Object lock) {
+        coldWriteLocks.computeIfPresent(intentId, (k, v) -> v == lock ? null : v);
+    }
+
+    /**
+     * 冷路径读缝:按索引槽位读 Intent(wheel 直读 / tail 键读)。
+     * 返回 null 表示槽位缺失/损坏(防御解码,promote 同款,不抛异常)。
+     * 调用方须持 {@link #acquireColdLock} 串行化读-改-写。
+     */
+    Intent readColdSlot(String intentId, SlotLocation loc) {
+        return loc.inTail() ? tailIndex.readById(intentId) : wheelStore.readSlot(loc);
     }
 }

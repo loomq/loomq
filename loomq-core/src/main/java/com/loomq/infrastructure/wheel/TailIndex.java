@@ -143,6 +143,18 @@ public final class TailIndex implements AutoCloseable {
         }
     }
 
+    /**
+     * 按 intentId 读取当前 tail 记录并解码(冷改期读路径,round 13)。
+     * 返回 null 表示无记录或解码失败(CRC 损坏——防御解码,promoteInto/promote 同款,不抛异常)。
+     * 只读,不加 appendLock:byId 是并发容器,记录内容(byte[])不可变,并发 put 下读到旧或新
+     * 完整记录均安全。
+     */
+    public Intent readById(String intentId) {
+        TailRecord r = byId.get(intentId);
+        if (r == null) return null;
+        return SlotCodec.decodeSafe(r.encodedSlot());
+    }
+
     /** 从 fromMs(含)起按 executeAtMs 升序扫描 tail 项(快照迭代器)。 */
     public Iterator<TailEntry> scanFrom(long fromMs) {
         List<TailEntry> acc = new ArrayList<>();

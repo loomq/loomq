@@ -13,29 +13,18 @@ import com.loomq.spi.CallbackHandler;
 import com.loomq.store.IntentStore;
 import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
-import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Intent 取消路径（round 10 自 IntentCommandService 拆出）:热取消(synchronized(intent) 串行化
- * 状态迁移) + 冷取消(locationIndex 定位磁盘槽,coldCancelLocks 按 intentId 细粒度串行化)。
+ * 状态迁移) + 冷取消(locationIndex 定位磁盘槽,冷锁注册表迁 WheelPersistence 共享
+ * (冷改期 round 13 同锁))。
  * 回调派发经 CallbackDispatcher 端口回调 facade(锁外派发 + I5 防御性快照时序原样)。
  */
 final class IntentCanceler {
 
     private static final Logger logger = LoggerFactory.getLogger(IntentCanceler.class);
-
-    /**
-     * 冷取消按 intentId 串行化的细粒度锁注册表。
-     *
-     * <p>wheel 路径专用:wheelStore.readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient
-     * 副本,无法阻塞并发取消。改为按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径不进此表
-     * ——其并发由 tailIndex.remove 的布尔返回值门控(appendLock 仅串行单次 append,不串行
-     * remove→awaitCommit→metric++ 序列)。锁对象在 synchronized 块的 finally 中以 identity 校验
-     * 移除(computeIfPresent),只删自己放入的对象,避免误删后到者的锁。</p>
-     */
-    private final ConcurrentHashMap<String, Object> coldCancelLocks = new ConcurrentHashMap<>();
 
     private final IntentStore intentStore;
     private final PrecisionScheduler scheduler;
@@ -165,10 +154,12 @@ final class IntentCanceler {
      * awaitCommit);槽位缺失/损坏时返回 false,不谎报未持久化的取消。
      *
      * <ul>
-     *   <li>tail:追加 TOMBSTONE 到 run 文件 + awaitCommit 强制落盘;以 TailIndex.remove 返回值门控 ——
- *       remove 返回 false 表示已被并发取消者移除(已追加 tombstone),直接返回 false 不重复计数。
- *       appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需布尔门控</li>
-     *   <li>wheel:按 intentId 串行化(computeIfAbsent 锁)→ 锁内重读索引取最新槽 → 读槽解码 →
+     *   <li>tail:round 13 起同持 per-id 冷锁(与冷改期 tailIndex.put 串行,防复活)——布尔门控保留作
+     *       纵深防御;追加 TOMBSTONE 到 run 文件 + awaitCommit 强制落盘;以 TailIndex.remove 返回值门控 ——
+     *       remove 返回 false 表示已被并发取消者移除(已追加 tombstone),直接返回 false 不重复计数。
+     *       appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需布尔门控</li>
+     *   <li>wheel:按 intentId 串行化(per-id 冷锁,注册表现居 `WheelPersistence` 冷锁缝,与冷改期
+     *       updateCold 共享)→ 锁内重读索引取最新槽 → 读槽解码 →
      *       transitionTo(CANCELED) + incrementRevision → 写新槽(recovery 按 max revision
      *       去重,terminal 跳过)→ 索引指向新 CANCELED 槽(在 awaitCommit 之前,杜绝在途 promote 复活)
      *       + awaitCommit。串行化保证后到者重读得到先到者写入的 CANCELED 槽(terminal)→ transitionTo
@@ -183,22 +174,30 @@ final class IntentCanceler {
         }
         SlotLocation terminalLoc = null;
         if (loc.inTail()) {
-            // tail 路径:TailIndex.remove 返回 false 表示该 intent 已被并发取消者移除(已追加 tombstone)。
-            // 此时不可谎报成功或重复计数 —— 直接返回 false(镜像 wheel 路径第二取消者行为)。
-            // appendLock 仅串行单次 append,不串行 remove→awaitCommit→metric++ 序列,故需此布尔门控。
-            if (!tailIndex.remove(intentId)) {
-                return false;
+            // round 13:tail 路径同持 per-id 冷锁——冷改期的 tailIndex.put 与本路径 remove 交错
+            // 会让被取消 Intent 以更高 revision 复活;布尔门控保留作纵深防御。
+            Object lock = persistence.acquireColdLock(intentId);
+            synchronized (lock) {
+                try {
+                    // tail 路径:TailIndex.remove 返回 false 表示该 intent 已被并发取消者移除(已追加 tombstone)。
+                    // 此时不可谎报成功或重复计数 —— 直接返回 false(镜像 wheel 路径第二取消者行为)。
+                    if (!tailIndex.remove(intentId)) {
+                        return false;
+                    }
+                    persistence.awaitDurableCommit();           // cancel 恒 DURABLE:确保 tombstone 落盘
+                    terminalLoc = loc;
+                    // 冷取消 = 追加 TOMBSTONE:run 文件中残留到 compaction。按多槽墓碑语义保护
+                    // revision 种子映射(C4-1)——磁盘痕迹未清,同 id 重建须抬升到历史最高之上。
+                    persistence.markColdCancelTombstone(intentId);
+                } finally {
+                    persistence.releaseColdLock(intentId, lock);
+                }
             }
-            persistence.awaitDurableCommit();               // cancel 恒 DURABLE:确保 tombstone 落盘
-            terminalLoc = loc;
-            // 冷取消 = 追加 TOMBSTONE:run 文件中残留到 compaction。按多槽墓碑语义保护
-            // revision 种子映射(C4-1)——磁盘痕迹未清,同 id 重建须抬升到历史最高之上。
-            persistence.markColdCancelTombstone(intentId);
         } else {
             // wheel 路径:readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient 副本,
             // 并发取消互不阻塞 → double-write + double 计数。按 intentId 串行化:第二个取消者
             // 串行进入后重读索引拿到先到者写入的 CANCELED 新槽(terminal)→ transitionTo 抛 ISE → 返回 false。
-            Object lock = coldCancelLocks.computeIfAbsent(intentId, k -> new Object());
+            Object lock = persistence.acquireColdLock(intentId);
             synchronized (lock) {
                 try {
                     // 必须在锁内重读索引:锁外拿到的 loc 是先到者写新槽前的旧槽位,指向 SCHEDULED 旧槽
@@ -236,10 +235,8 @@ final class IntentCanceler {
                     terminalLoc = canceledLoc;
                     persistence.awaitDurableCommit();       // cancel 恒 DURABLE
                 } finally {
-                    // 只移除自己放入的锁对象,避免误删后到者的锁(computeIfPresent + identity)。
-                    // 后到者若通过 computeIfAbsent 拿到本锁对象(先到者尚未移除),会串行等待;其 cleanup
-                    // 时若 map 仍持有同一对象则移除,若已被先到者移除或被更新者的新锁替换则 no-op。
-                    coldCancelLocks.computeIfPresent(intentId, (k, v) -> v == lock ? null : v);
+                    // identity 校验移除,见 releaseColdLock 契约。
+                    persistence.releaseColdLock(intentId, lock);
                 }
             }
         }

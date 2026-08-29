@@ -215,7 +215,7 @@ stateDiagram-v2
 - `IntentLocationIndex`：纯内存 `intentId → SlotLocation` 映射（恢复时重建，槽即当前态）。是冷 Intent 一切磁盘定位的入口。
 - `PromotionDaemon`：镜像 `CohortManager` 的 cohort 唤醒模型，单 platform 线程睡到 `executeAt - promotionLeadMs`（默认提前 60s），唤醒时**先复核索引**（`latest == handle.loc` 才继续——冷取消写入新 CANCELED 槽并改指索引后，旧 handle 直接作废，杜绝复活），再从 wheel 读槽（tail 则按 executeAtMs 扫描匹配 intentId）→ 非终态才回调 `onHotPromotion` → 幂等 `intentStore.upsert` + `scheduler.schedule`。
 - **冷取消**：`cancelIntent` 对不在内存的 Intent 走 `cancelCold`——tail 路径追加 TOMBSTONE + `awaitCommit`（以 `TailIndex.remove` 返回值门控并发）；wheel 路径按 intentId 细粒度锁串行化"重读索引 → 读槽 → transitionTo(CANCELED) → 写新槽 → **索引先指向新槽** → awaitCommit"，后到者重读到 terminal 态返回 false，杜绝 double-write。
-- **冷改期 / 冷 fireNow 未实现**：`updateIntent` 仅作用于内存热 Intent（冷 Intent 返回 `Optional.empty`）；`fireNow` 对冷 Intent 返回 false。不要对上层暴露这两个能力。
+- **冷 fireNow 未实现**：`updateIntent` 支持冷改期（round 13：per-id 冷锁经 WheelPersistence 共享、复用 persistToWheel 写协议、cohort 安全网注册 + P1-2 post-check）；`fireNow` 对冷 Intent 返回 false。不要对上层暴露冷 fireNow 能力。
 
 ## 6. 恢复：WheelRecovery
 
@@ -287,7 +287,7 @@ LoomqEngine.createIntent (虚拟线程异步)
 1. **无生命周期治理**：`WheelStore` 非终态 append + 终态单槽回收，陈旧槽由 recovery 去重处理（无 ghost 投递）；`BucketReclaimer` 定期删除过期且无引用的桶文件（默认保留期 = horizon + 1 天）；`TailIndex` run 文件超阈值时触发 compaction（默认 512MB）；`WheelRecovery` 启动时**全量物化**所有槽到内存 HashMap（O(N)），数据量大时恢复耗时与内存压力可观。
 2. **桶容量与溢出链**：每桶固定 `slotsPerBucket`（默认 1024）槽。活跃在途超桶容量时经溢出链 spill 到下一层更粗档（SEC→MIN→HOUR→DAY），仅整条链都满（DAY 满）才抛 `SlotOverflowException`。上限只能在初始化时经 `WheelConfig` 调整，运行期不可变。
 3. **`IntentTraceStore` 非注入路径**：`PrecisionScheduler` 的无参构造仍 `new IntentTraceStore()`，非 `LoomqEngine` 创建的调度器实例不共享引擎级 trace store。`MetricsCollector` 已改为引擎注入（无 `getInstance()`）。
-4. **冷操作不完整**：冷 Intent 支持取消，但**不支持改期与 fireNow**（见 §5.4）。
+4. **冷操作不完整**：冷 Intent 支持取消与改期（round 13），**不支持 fireNow**（见 §5.4）。
 5. **intentId / payload 尺寸约束**：槽内 intentId ≤ 24B、payload ≤ 210B（超出抛 `SlotOverflowException`）；tail run 记录 intentId ≤ 255B。超长标识需上层自行散列。
 
 ## 11. 源码包结构导览（`com.loomq`）

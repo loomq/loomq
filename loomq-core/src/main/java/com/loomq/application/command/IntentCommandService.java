@@ -58,7 +58,7 @@ public final class IntentCommandService {
     /** 更新/立即触发路径组件(round 10 自本类拆出):updateIntent ×2 重载、fireNow。 */
     private final IntentUpdater updaterService;
 
-    /** 取消路径组件(round 10 自本类拆出):热取消 + 冷取消(coldCancelLocks 锁表随迁)。 */
+    /** 取消路径组件(round 10 自本类拆出):热取消 + 冷取消(冷锁注册表现居 WheelPersistence,与 updateCold 共享)。 */
     private final IntentCanceler canceler;
 
     /**
@@ -102,7 +102,8 @@ public final class IntentCommandService {
             config.groupCommitIntervalMs(), config.hotBoundaryMs(), catalog,
             phtw.wheelStore(), phtw.tailIndex(), phtw.locationIndex(), this.persistence);
         this.updaterService = new IntentUpdater(intentStore, scheduler,
-            phtw.locationIndex(), catalog, this.persistence);
+            phtw.locationIndex(), catalog, this.persistence,
+            phtw.promotionDaemon(), config.hotBoundaryMs());
         this.canceler = new IntentCanceler(intentStore, scheduler, phtw.promotionDaemon(),
             phtw.locationIndex(), phtw.wheelStore(), phtw.tailIndex(), metricsCollector,
             traceStore, this.persistence, this::dispatchCallback);

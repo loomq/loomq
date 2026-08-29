@@ -22,7 +22,7 @@ final class StatePersistence {
     private final MetricsCollector metrics;
 
     StatePersistence(MetricsCollector metrics) {
-        this.metrics = metrics;
+        this.metrics = java.util.Objects.requireNonNull(metrics, "metrics");
     }
 
     void setSink(StateChangeSink sink) {
