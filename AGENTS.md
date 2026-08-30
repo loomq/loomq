@@ -52,7 +52,7 @@ Tests are categorized with `@Tag` annotations. Maven Surefire uses `groups`/`exc
 ```
 loomq-core (embeddable kernel, zero HTTP/JSON deps)
     ├── LoomqEngine           — builder-pattern entry point
-    ├── PrecisionScheduler    — builder-pattern entry point(门面:生命周期 + 调度入口 + 组装)
+    ├── PrecisionScheduler    — facade entry point(门面:生命周期 + 调度入口 + 组装)
     │   ├── ScanCoordinator    — 事件驱动/fixed-rate 扫描 + 过期分频检查 + pause 语义
     │   ├── DispatchPipeline   — 档位级消费循环 + permit 跨档借用(AdapTBF,releasePermit/decrementBorrowed 配对单所有者)+ 背压状态
     │   ├── SettlementEngine   — 结算/重试/死信/过期终态化 + I5 collect-then-defer 收口(DeferredOutcome/flushOutcome)

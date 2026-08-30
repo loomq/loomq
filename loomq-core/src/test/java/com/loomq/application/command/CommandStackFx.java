@@ -40,14 +40,23 @@ import java.util.function.LongSupplier;
  */
 final class CommandStackFx implements AutoCloseable {
 
-    /** 装配旋钮(null 成员按注释取默认)。 */
+    /** 装配旋钮(null 成员按注释取默认)。deliveryHandler:null → 默认 DEAD_LETTER 完成态桩。 */
     record Options(LongSupplier clock,
                    BiConsumer<Intent, SlotLocation> onHotPromotion,
                    boolean seedMaxRevisions,
-                   boolean startScheduler) {
+                   boolean startScheduler,
+                   DeliveryHandler deliveryHandler) {
         Options {
             clock = clock != null ? clock : System::currentTimeMillis;
             onHotPromotion = onHotPromotion != null ? onHotPromotion : (i, l) -> { };
+            deliveryHandler = deliveryHandler != null ? deliveryHandler
+                : intent -> CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.DEAD_LETTER);
+        }
+
+        /** T2(C18-2) 前的 4 参便捷构造:deliveryHandler 取默认桩——既有调用面源兼容。 */
+        Options(LongSupplier clock, BiConsumer<Intent, SlotLocation> onHotPromotion,
+                boolean seedMaxRevisions, boolean startScheduler) {
+            this(clock, onHotPromotion, seedMaxRevisions, startScheduler, null);
         }
     }
 
@@ -82,8 +91,7 @@ final class CommandStackFx implements AutoCloseable {
         AtomicBoolean running = new AtomicBoolean(true);
         AtomicLong seq = new AtomicLong();
         mc = new MetricsCollector();
-        scheduler = new PrecisionScheduler(memStore, intent ->
-            CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
+        scheduler = new PrecisionScheduler(memStore, options.deliveryHandler(), null);
         daemon = new PromotionDaemon(store, tail, idx, options.clock(),
             options.onHotPromotion(), PROMOTION_LEAD_MS);
         svc = new IntentCommandService(memStore, scheduler,
@@ -93,6 +101,21 @@ final class CommandStackFx implements AutoCloseable {
             new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, HOT_BOUNDARY_MS,
                 PrecisionTierCatalog.defaultCatalog()),
             new IntentTraceStore());
+        // r18 T2 实测偏差:计划未预见 CommandStackFx 缺 sink 接线——StatePersistence 无默认
+        // sink,结算链 persistStateChange/persistTerminal 对磁盘空转,重试落盘/终态覆写不可见。
+        // 镜像 LoomqEngine 匿名 sink(经命令服务守卫门面,persistIfFresh 回传 fresh 信号),
+        // 使夹具磁盘行为与信号链和真实引擎一致。
+        scheduler.setStateChangeSink(new com.loomq.application.scheduler.StateChangeSink() {
+            @Override public void persist(Intent intent) {
+                svc.persistStateChangePutOnly(intent);
+            }
+            @Override public boolean persistIfFresh(Intent intent) {
+                return svc.persistStateChangePutOnly(intent);
+            }
+            @Override public void persistTerminalInPlace(Intent intent) { svc.persistTerminalInPlace(intent); }
+            @Override public void awaitCommit() { svc.awaitDurableCommit(); }
+            @Override public void reclaimTerminal(String intentId) { svc.reclaimTerminal(intentId); }
+        });
         barrier.start();
         daemon.start();
         if (options.startScheduler()) {
@@ -102,8 +125,13 @@ final class CommandStackFx implements AutoCloseable {
 
     /** 冷 Intent 落 wheel(+2h,revision=1,不进 memStore);seedMaxRevisions=true 时按 recovery 语义种子。 */
     Intent plantColdWheel(String id, Map<String, String> tags) {
+        return plantColdWheel(id, tags, options.clock().getAsLong() + 2 * 60 * 60 * 1000L);
+    }
+
+    /** 冷 Intent 落 wheel(指定 executeAt,revision=1,不进 memStore);seedMaxRevisions=true 时按 recovery 语义种子。 */
+    Intent plantColdWheel(String id, Map<String, String> tags, long executeAtMs) {
         Intent cold = new Intent(id);
-        cold.setExecuteAt(Instant.ofEpochMilli(options.clock().getAsLong() + 2 * 60 * 60 * 1000L));
+        cold.setExecuteAt(Instant.ofEpochMilli(executeAtMs));
         cold.setPrecisionTier(PrecisionTier.STANDARD);
         cold.transitionTo(IntentStatus.SCHEDULED);
         cold.incrementRevision();

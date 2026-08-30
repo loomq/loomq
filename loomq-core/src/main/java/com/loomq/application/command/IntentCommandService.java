@@ -241,8 +241,13 @@ public final class IntentCommandService {
      *
      * <p>锁序:调用方(StatePersistence.persistStateChange)在 synchronized(intent) 内调用——
      * intent 监视器 → 冷锁,与命令族守卫同序,无死锁环。</p>
+     *
+     * <p><b>C18-2(r18) fresh 信号</b>:@return false = 守卫判 stale 跳过(未写盘,revision 已
+     * 回滚);true = 已写盘。信号经 LoomqEngine 匿名 sink 的 persistIfFresh 透传结算链,
+     * stale 中止重排与内存镜像(见 SettlementEngine.scheduleRetryOrHonorReschedule 的
+     * persist-first 政策)。</p>
      */
-    public void persistStateChangePutOnly(Intent intent) {
+    public boolean persistStateChangePutOnly(Intent intent) {
         String intentId = intent.getIntentId();
         // StatePersistence.persistStateChange 已预 increment → writeRev = 当前 revision;
         // 守卫判据单一成文于 WheelPersistence.writeFreshUnderColdLock(round 16 原语收口)。
@@ -255,21 +260,21 @@ public final class IntentCommandService {
             // 还原到 base——杜绝 skip 后平局副本被当 fresh 的 revision 洗白。
             intent.rollbackRevision(intent.getRevision() - 1);
         }
+        return fresh;
     }
 
     /**
-     * 终态原地覆写（非阻塞 mmap）：把 locationIndex 指向的最新槽覆写为终态，不追加新槽。
-     * 单槽 Intent 排队待回收（WheelPersistence 内部 pendingReclaims 队列），落盘后由 reclaimTerminal 清空；多槽只覆写不回收。
-     * 无索引或 tail 时回退追加（tail 超视界非回收路径）。失败由调用方按 I6 吞掉。
+     * 终态原地覆写门面:协议与簿记语义(单槽 pendingReclaims / 多槽墓碑 / 回退追加 / F4
+     * 冷锁互斥)以 {@link WheelPersistence#persistTerminalInPlace} 为唯一成文点。调用契约:
+     * 失败由调用方按 I6 吞掉;awaitCommit 由调用方在锁外完成。
      */
     public void persistTerminalInPlace(Intent intent) {
         persistence.persistTerminalInPlace(intent);
     }
 
     /**
-     * 终态槽回收（须在 awaitCommit 之后调用）：先清 locationIndex（终态不索引，杜绝 freed 槽被
-     * stale 别名误复用），单槽清空入 free-list 复用；多槽保留 tombstone。无论单多槽都清理
-     * WheelPersistence 内部的多槽登记（multiSlotIntents），避免集合泄漏。
+     * 终态槽回收门面:语义以 {@link WheelPersistence#reclaimTerminal} 为唯一成文点。
+     * 调用契约关键句:须在 awaitCommit 之后调用(C2-1 定向索引移除 / C4-1 墓碑守卫不变)。
      */
     public void reclaimTerminal(String intentId) {
         persistence.reclaimTerminal(intentId);
@@ -283,6 +288,14 @@ public final class IntentCommandService {
     /** 恢复期由 WheelRecovery 注入:intentId → 磁盘历史最高 revision(含终态墓碑与跨视界 tail)。 */
     public void markMaxRevisions(Map<String, Long> revisions) {
         persistence.markMaxRevisions(revisions);
+    }
+
+    /**
+     * 恢复期由 WheelRecovery 注入:磁盘上存在终态墓碑(多槽墓碑/tail 终态,不回收)的 intentId
+     * (C18-1,r18)。C4-1 语义见 {@link WheelPersistence#markTombstones}。
+     */
+    public void markTombstones(Set<String> ids) {
+        persistence.markTombstones(ids);
     }
 
     /**

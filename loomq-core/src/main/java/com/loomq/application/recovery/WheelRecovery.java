@@ -113,6 +113,9 @@ public final class WheelRecovery {
         // 3. Process only the max-revision winner per intentId
         int hot = 0, cold = 0;
         Set<String> multiSlot = new HashSet<>();
+        // C18-1(r18): 磁盘上存在终态墓碑(多槽墓碑/tail 终态,不回收)的 intentId,
+        // 经 markTombstones 注入命令服务 tombstoneIds,保护种子映射(C4-1)。
+        Set<String> tombstonedIds = new HashSet<>();
         // 每个 intentId 的磁盘历史最高 revision(供 createIntent 重建路径种子 revision,
         // 避免重建的新 Intent 从 0 起步被旧终态墓碑遮蔽)。含终态/非终态/跨视界 tail。
         Map<String, Long> maxRevisions = new HashMap<>();
@@ -131,6 +134,18 @@ public final class WheelRecovery {
                     // 磁盘上(参与 max-revision 去重),种子映射必须随之保留。
                 } else {
                     maxRevisions.put(id, intent.getRevision());
+                    // C18-1a(r18): 终态多槽胜者也补标 multiSlot——overdue 变体(P0-2 经
+                    // overwriteSlot 直接终态化)不产生任何进程内簿记,count>1 时陈旧兄弟槽
+                    // 留盘,同进程重建→终态→回收→再重建的链条在本进程内即可复现遮蔽;补标后
+                    // 重建终态 !singleSlot → tombstoneIds.add → 永久保护。
+                    if (count > 1) {
+                        multiSlot.add(id);
+                    }
+                    // C18-1b(r18): wheel count>1 墓碑 + tail 终态(count==1 也落入本臂,
+                    // 与 persistTerminalInPlace tail 分支的进程内语义对齐)→ 注入墓碑集,
+                    // 保护 maxRevisions 种子映射不被后续单槽 incarnation 终态回收移除(C4-1)。
+                    // wheel count==1 单槽已被上方 freeSlot、磁盘无残留,不需注入(与既有注释一致)。
+                    tombstonedIds.add(id);
                 }
                 continue;
             }
@@ -180,6 +195,6 @@ public final class WheelRecovery {
         }
 
         log.info("WheelRecovery: hotRestored={}, coldRegistered={}, multiSlot={}", hot, cold, multiSlot.size());
-        return new WheelRecoveryReport(hot, cold, multiSlot, maxRevisions);
+        return new WheelRecoveryReport(hot, cold, multiSlot, maxRevisions, tombstonedIds);
     }
 }

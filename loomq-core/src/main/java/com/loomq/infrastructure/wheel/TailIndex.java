@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,12 +62,14 @@ public final class TailIndex implements AutoCloseable {
     private final Object appendLock = new Object();
 
     /**
-     * 自上次 flush 起是否有新 append。GroupCommitBarrier 每周期无条件调 flush():
-     * 无写时跳过 syscall(消除每周期空 force),有写时 force(true)——append-only 增长
-     * 文件的长度元数据必须随字节一起落盘(force(false)=fdatasync 语义不保证 size,
-     * 非 Linux/延迟分配文件系统上 DURABLE 的 tail 记录可能因文件短于预期而丢失)。
+     * run 文件 append 完成计数(C18-4,r18;镜像 WheelStore.Bucket P1-4 单调计数器。
+     * TailIndex 写侧 put/remove/promoteInto 已全部串行于 {@link #appendLock},无需 Bucket
+     * 为并发 memcpy 写者设计的 RW 锁,appendLock 互斥 force 临界区即可)。appendRecord 写
+     * 完成后 +1——字节写完严格先于计数(程序序):计数值 n 覆盖的字节必已在文件内。
      */
-    private volatile boolean dirty = false;
+    private final AtomicLong appendCount = new AtomicLong();
+    /** 已被 force 覆盖的前缀计数。flush 的 check+force+publish 原子于 appendLock,永不虚报。 */
+    private volatile long flushedAppendCount = 0;
 
     /** 上次 loadRun 是否遇到中段结构损坏(未知 type 字节)。true 时禁止截断尾部。 */
     private boolean lastLoadCorrupted = false;
@@ -223,15 +226,34 @@ public final class TailIndex implements AutoCloseable {
         return promoted;
     }
 
-    /** 强制 run 文件缓冲写落盘(GroupCommitBarrier 在 ack DURABLE 写者前调用)。 */
+    /**
+     * 强制 run 文件缓冲写落盘(GroupCommitBarrier 在 ack DURABLE 写者前调用)。
+     *
+     * <p>C18-4(r18): 旧 volatile boolean dirty 存在 lost-update——flush 的 check→force→clear
+     * 不持 appendLock,clear 与并发 append 的置位交错会丢标志 → DURABLE 虚假确认。
+     * 改单调计数 + appendLock 互斥:check+force+publish 原子于 append;无锁快路径保持
+     * "无写跳过 syscall"。正确性:flush 的 before 读取先于 force syscall → 计入 before 的
+     * 所有字节必已在 force 快照内 → {@code flushedAppendCount = before} 永不虚报;before
+     * 之后 increment 的 append 不被本次发布,下一轮 flush 覆盖 → 无丢失、无虚报。
+     * compaction 换 channel 不重置计数(至多多 force 一次,无害)。</p>
+     */
     public void flush() {
-        if (!dirty) return;   // 无 tail 写:跳过 syscall(barrier 每周期都会调用)
-        try {
-            runChannel.force(true);
-            dirty = false;
-        } catch (IOException e) {
-            throw new RuntimeException("flush tail run file failed: " + runFile, e);
+        if (appendCount.get() == flushedAppendCount) return;   // 无锁快路径(无 tail 写跳过 syscall)
+        synchronized (appendLock) {                            // C18-4: check+force+publish 原子于 append
+            long before = appendCount.get();
+            if (before == flushedAppendCount) return;
+            try {
+                runChannel.force(true);
+                flushedAppendCount = before;                   // 只发布"本次 force 前已完成的写"
+            } catch (IOException e) {
+                throw new RuntimeException("flush tail run file failed: " + runFile, e);
+            }
         }
+    }
+
+    /** 白盒测试缝(镜像 WheelStore.Bucket.hasUnflushed):run 文件是否存在未 force 覆盖的 append。 */
+    boolean hasUnflushed() {
+        return appendCount.get() > flushedAppendCount;
     }
 
     public int size() {
@@ -289,7 +311,7 @@ public final class TailIndex implements AutoCloseable {
             Files.move(compactFile, runFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             runChannel = FileChannel.open(runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
             channelClosed = false;
-            dirty = false;   // 新通道无缓冲写
+            // C18-4: 不重置 append 计数——compact 文件已 force,计数落后至多多 force 一次,无害。
 
             log.info("Tail compaction: {} bytes -> {} bytes ({} live entries)",
                 fileSize, Files.size(runFile), byId.size());
@@ -425,7 +447,7 @@ public final class TailIndex implements AutoCloseable {
         buf.flip();
         try {
             while (buf.hasRemaining()) runChannel.write(buf);
-            dirty = true;   // 写完成后置位:并发 flush 读到 true 即覆盖本次写入
+            appendCount.incrementAndGet();   // C18-4: 写完成严格先于计数(程序序,见 flush javadoc)
         } catch (IOException e) {
             throw new RuntimeException("append tail run record failed: " + runFile, e);
         }

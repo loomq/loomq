@@ -34,17 +34,25 @@ final class StatePersistence {
         metrics.incrementPersistFailures();
     }
 
-    /** revision 递增 + 非阻塞 put;须在 synchronized(intent) 内调用以维持 I2/I3 原子性。 */
-    void persistStateChange(Intent intent) {
+    /**
+     * revision 递增 + 守卫式非阻塞 put;须在 synchronized(intent) 内调用以维持 I2/I3 原子性。
+     *
+     * <p>C18-2(r18): 返回 sink 的 fresh 信号——sink null → true(无 sink 视作 fresh);
+     * 持久化异常 → countFailure + <b>true</b>(I6 容错不变:失败 ≠ stale,维持"容错继续"
+     * 语义,不阻断结算链);否则透传 {@link StateChangeSink#persistIfFresh} 的裁决。
+     * false = 守卫判 stale 跳过(未写盘,revision 已回滚),调用方据此中止重排与内存镜像。</p>
+     */
+    boolean persistStateChange(Intent intent) {
         intent.incrementRevision();
         StateChangeSink s = sink;
-        if (s == null) return;
+        if (s == null) return true;
         try {
-            s.persist(intent);
+            return s.persistIfFresh(intent);
         } catch (Exception e) {
             metrics.incrementPersistFailures();
             logger.error("persistStateChange failed for intent {} (revision {}): {}",
                 intent.getIntentId(), intent.getRevision(), e.getMessage(), e);
+            return true;
         }
     }
 

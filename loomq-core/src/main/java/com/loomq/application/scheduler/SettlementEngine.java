@@ -210,10 +210,13 @@ final class SettlementEngine implements DeliverySettlement {
                         }
                         traceStore.recordFailure(intent.getIntentId(), "RETRY", null);
                         long oldExecuteAtMs = executeAtMs(intent);
-                        scheduleRetryOrHonorReschedule(intent, tier, oldExecuteAtMs);
-                        // I5: schedule() 移到锁外 (deferred)
-                        outcome.markPersisted();
-                        outcome.markReschedule();
+                        // C18-2: stale skip → 中止重排与内存镜像(outcome 不置 persisted/reschedule,
+                        // flushOutcome 不再 rescheduler.schedule——投递义务由冷写者权威副本接管)
+                        if (scheduleRetryOrHonorReschedule(intent, tier, oldExecuteAtMs)) {
+                            // I5: schedule() 移到锁外 (deferred)
+                            outcome.markPersisted();
+                            outcome.markReschedule();
+                        }
                         break;
                     }
 
@@ -270,10 +273,12 @@ final class SettlementEngine implements DeliverySettlement {
                     "Intent dead-lettered after max attempts: id={}", snap -> o -> o.onDeadLettered(snap), outcome);
             } else {
                 long oldExecuteAtMs = executeAtMs(intent);
-                scheduleRetryOrHonorReschedule(intent, intent.getPrecisionTier(), oldExecuteAtMs);
-                // I5: schedule() 移到锁外 (deferred)
-                outcome.markPersisted();
-                outcome.markReschedule();
+                // C18-2: stale skip → 中止重排与内存镜像(同 finalizeIntent RETRY 分支)
+                if (scheduleRetryOrHonorReschedule(intent, intent.getPrecisionTier(), oldExecuteAtMs)) {
+                    // I5: schedule() 移到锁外 (deferred)
+                    outcome.markPersisted();
+                    outcome.markReschedule();
+                }
             }
         }
         // 锁外收尾:awaitCommit → reclaimTerminal → 观察器通知 → 重排程(顺序固定)
@@ -361,10 +366,24 @@ final class SettlementEngine implements DeliverySettlement {
 
     /**
      * 重试/改期结算收口:在途改期尊重 + backoff 重排程
-     * (finalizeIntent RETRY 与 handleDeliveryFailure 共用)。调用方须持 intent 锁,
-     * 并在返回后置 needReschedule/persisted。
+     * (finalizeIntent RETRY 与 handleDeliveryFailure 共用)。调用方须持 intent 锁。
+     *
+     * <p><b>C18-2(r18) persist-first</b>:先落盘拿 fresh 信号,再镜像内存——W4 stale skip
+     * 后中止重排与内存镜像(镜像 W1-W3"skip→中止/委托冷路径"政策)。stale 意味着在途投递
+     * 副本已被并发冷写者推进/取消,权威在磁盘;此时 updateStoreBestEffort 会经
+     * ConcurrentIntentStore.update 的无条件 upsert 复活被 demote 的副本、以 stale 内容覆写
+     * 冷写者刚重热的权威副本,rescheduler.schedule 则让 stale 副本反复幽灵投递。
+     * stale 中止后:磁盘保持冷写者最新态(权威),不 awaitCommit(无新写);投递义务由冷写者
+     * 接管(窗口内 upsert+schedule 自愈;窗口外本就不该有热副本,promote 到点再载;cancel
+     * 子情形中止即正确语义);活副本 revision 已被 F3 回滚,结算任务结束后废弃即可。
+     * 观察器 onDeliveryFailed 在 handleDeliveryException 已先行通知(投递确实失败),不受影响。
+     * expiryIndex.unindex 两态都做(幂等清理)。fresh 分支的镜像携带 increment 后 revision
+     * (顺带修正旧序"镜像 revision 落后一拍"的漂移)。</p>
+     *
+     * @return fresh 信号(C18-2):false = 守卫判 stale(未写盘,revision 已回滚),
+     *         调用方不得 markPersisted/markReschedule;true = 已落盘(或 I6 失败,容错继续)。
      */
-    private void scheduleRetryOrHonorReschedule(Intent intent, PrecisionTier tier, long oldExecuteAtMs) {
+    private boolean scheduleRetryOrHonorReschedule(Intent intent, PrecisionTier tier, long oldExecuteAtMs) {
         // 在途改期尊重:投递期间用户改期会把活对象 executeAt 置为将来时刻并 DURABLE
         // 持久化(更新在重试路径确定生效)。判据:任何"将来时刻"必是用户改期——未被
         // 改期的在途 intent 的 executeAt 恒 ≤ now(scanDue 只摘到期条目),故无需精度
@@ -372,25 +391,33 @@ final class SettlementEngine implements DeliverySettlement {
         Instant now = Instant.now();
         if (intent.getExecuteAt().isAfter(now)) {
             intent.transitionTo(IntentStatus.SCHEDULED);
-            updateStoreBestEffort(intent);
-            // 重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,否则崩溃恢复
-            // 按旧 executeAt 槽恢复,重试链静默丢失。
-            // (I6 容错下持久化失败仅记 persistFailures,不阻塞调度)
-            persistence.persistStateChange(intent);
+            // C18-2 persist-first:重排程是新的调度承诺而非中间态——必须 DURABLE 落盘,
+            // 否则崩溃恢复按旧 executeAt 槽恢复,重试链静默丢失。
+            // (I6 容错下持久化失败仅记 persistFailures 并视作 fresh,不阻塞调度)
+            boolean fresh = persistence.persistStateChange(intent);
             expiryIndex.unindex(intent.getIntentId(), oldExecuteAtMs);
-            logger.info("Honoring mid-flight reschedule for intent={}, executeAt={} (no backoff)",
-                intent.getIntentId(), intent.getExecuteAt());
-            return;
+            if (fresh) {
+                updateStoreBestEffort(intent);
+                logger.info("Honoring mid-flight reschedule for intent={}, executeAt={} (no backoff)",
+                    intent.getIntentId(), intent.getExecuteAt());
+            } else {
+                logger.info("Mid-flight reschedule persist skipped (stale copy, disk authoritative): intent={}",
+                    intent.getIntentId());
+            }
+            return fresh;
         }
         long delayMs = retryPolicy.backoffDelayMs(intent);
         logger.info("Scheduling redelivery for intent={}, attempt={}, delay={}ms",
             intent.getIntentId(), intent.getAttempts(), delayMs);
         intent.setExecuteAt(Instant.now().plusMillis(delayMs));
         intent.transitionTo(IntentStatus.SCHEDULED);
-        updateStoreBestEffort(intent);
-        // 同上:重排程必须 DURABLE 落盘
-        persistence.persistStateChange(intent);
+        // C18-2 persist-first(同上):stale 中止镜像与重排,杜绝幽灵投递
+        boolean fresh = persistence.persistStateChange(intent);
         expiryIndex.unindex(intent.getIntentId(), oldExecuteAtMs);
+        if (fresh) {
+            updateStoreBestEffort(intent);
+        }
+        return fresh;
     }
 
     /**

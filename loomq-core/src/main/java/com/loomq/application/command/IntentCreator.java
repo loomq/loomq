@@ -181,10 +181,9 @@ final class IntentCreator {
      * (不加 revision 复核);临界区内 awaitCommit 与 cancelCold 既有契约一致
      * (per-id 锁非监视器,VT 可正常 unmount)。</p>
      *
-     * <p>F5 残留记档(round 16):「冷命令先手」窄窗平局仍在——冷命令的完整临界区若落于
-     * create persist(R1)与补偿段之间,补偿可与冷命令同 revision 平局;后到补偿终态覆写
-     * 胜出,归属语义与 F4 残留同构(创建已失败,补偿 CANCELED 即磁盘权威)。R8 式 revision
-     * 种子(补偿前将 revision 抬到磁盘历史最高之上)属行为变更,评估移交 r18 审计轮。</p>
+     * <p>F5 残留收口(r18 C18-3):「冷命令先手」窄窗平局已由补偿段冷锁内 R8 式 revision
+     * 种子关闭(见方法体种子注释)——补偿 CANCELED 严格高于一切先手写。残留仅剩"终态 vs
+     * 后到冷写"归属(与 F4 同构,冷命令锁内重读索引见终态槽即拒绝,安全收敛)。</p>
      */
     private void compensateCancel(Intent intent) {
         try {
@@ -211,6 +210,15 @@ final class IntentCreator {
                     logger.error("Rollback locationIndex.remove failed for intent {}", intent.getIntentId(), ex);
                 }
                 try {
+                    // C18-3(r18): 冷锁内重读磁盘历史最高 revision 并种子——冷命令在 create persist
+                    // 与本补偿段之间先手时,补偿与冷写同 revision 平局,恢复按扫描序仲裁可能复活
+                    // SCHEDULED;种子后 increment 使 CANCELED 严格高于一切先手写,平局变确定性
+                    // 胜出(F5 残留收口)。无先手写时 histMax == R_create,seed 等价 no-op,
+                    // 补偿 revision 不变(R_create+1)。R8 先例:本文件 createIntent 种子段。
+                    Long histMax = persistence.maxRevisionOf(intent.getIntentId());
+                    if (histMax != null && histMax >= intent.getRevision()) {
+                        intent.seedRevision(histMax);
+                    }
                     intent.transitionTo(IntentStatus.CANCELED);
                     intent.incrementRevision();
                     persistence.persistToWheel(intent, true);

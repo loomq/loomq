@@ -68,7 +68,7 @@ public final class WheelStore implements AutoCloseable {
         loadExistingBuckets();
     }
 
-    /** 启动时从磁盘载入已存在的桶(镜像 SimpleWalWriter.loadExistingSegments)。 */
+    /** 启动时从磁盘载入已存在的桶。 */
     private void loadExistingBuckets() {
         for (WheelTier tier : WheelTier.values()) {
             Path dir = Paths.get(config.dataDir(), tier.name().toLowerCase());

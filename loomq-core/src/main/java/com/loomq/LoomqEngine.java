@@ -209,10 +209,15 @@ public class LoomqEngine implements AutoCloseable {
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
             scheduler.setStateChangeSink(new StateChangeSink() {
                 @Override public void persist(Intent intent) {
-                    // F2(round 15): 投递重试/改期持久化走冷锁复核守卫——stale 副本跳过落盘,
-                    // 杜绝与并发冷写者同 revision 双写。F6(round 15 终审):守卫即
-                    // persistStateChangePutOnly 本体(门面唯一持久化写口),Guarded 变体已删。
+                    // C18-2(r18) 起为接口抽象方法的桥接兜底(StatePersistence 已改走
+                    // persistIfFresh);守卫即 persistStateChangePutOnly 本体(F6/round 15
+                    // 终审:门面唯一持久化写口),返回值在此丢弃。
                     commandService.persistStateChangePutOnly(intent);
+                }
+                @Override public boolean persistIfFresh(Intent intent) {
+                    // C18-2(r18): W4 skip 信号回传——stale(未写盘,revision 已回滚)返回
+                    // false,结算链中止重排与内存镜像(杜绝幽灵投递/权威覆写)。
+                    return commandService.persistStateChangePutOnly(intent);
                 }
                 @Override public void persistTerminalInPlace(Intent intent) { commandService.persistTerminalInPlace(intent); }
                 @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
@@ -280,6 +285,13 @@ public class LoomqEngine implements AutoCloseable {
             // 遮蔽重建的新 Intent(静默丢失)。
             if (!recoveryReport.maxRevisions().isEmpty()) {
                 commandService.markMaxRevisions(recoveryReport.maxRevisions());
+            }
+
+            // C18-1(r18): 恢复期注入磁盘终态墓碑 id 集——这些 id 的 maxRevisions 种子映射不可在
+            // 后续单槽 incarnation 终态回收时移除(C4-1),否则同进程重建×终态回收后再重建被旧
+            // 墓碑遮蔽(重启静默丢失)。兑现 WheelPersistence.tombstoneIds javadoc 的恢复注入承诺。
+            if (!recoveryReport.tombstonedIds().isEmpty()) {
+                commandService.markTombstones(recoveryReport.tombstonedIds());
             }
 
             // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)

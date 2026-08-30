@@ -21,7 +21,7 @@ import org.slf4j.LoggerFactory;
  * multiSlotIntents/tombstoneIds/pendingReclaims/maxRevisions 仅本类可触碰;
  * 兄弟组件经簿记缝访问(列举不计数,免得每次加缝改这行):maxRevisionOf /
  * markColdCancelTombstone / discardTerminalBooking / trackMaxRevision /
- * markMultiSlot / markMaxRevisions(恢复期经命令服务注入) /
+ * markMultiSlot / markMaxRevisions / markTombstones(恢复期经命令服务注入) /
  * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝) / writeFreshUnderColdLock(round 16 增守卫原语)。
  *
  * <p><b>F2 冷锁序列化点(round 15;round 16 原语收口)</b>:per-id 冷锁现覆盖<b>既有 Intent
@@ -64,7 +64,8 @@ class WheelPersistence {
      * 追加新槽）,参与 recovery 的 max-revision 去重——因此本进程内的 {@link #maxRevisions}
      * 种子映射必须随之保留,不可在后续单槽 incarnation 终态回收时移除;否则同进程重建从
      * 0 起步,重启被旧墓碑遮蔽(静默丢失)。一旦置位,进程内不清理(墓碑何时被桶文件过期
-     * 回收无从得知;重启后由 WheelRecovery 重新从磁盘扫描注入)。
+     * 回收无从得知;重启后由 WheelRecovery
+     * 经 {@link #markTombstones} 重新从磁盘扫描注入——C18-1,r18 兑现本承诺)。
      */
     private final Set<String> tombstoneIds = ConcurrentHashMap.newKeySet();
     /** 终态原地覆写后的待回收记录：终态槽在 awaitCommit 落盘后清空。 */
@@ -255,6 +256,14 @@ class WheelPersistence {
         revisions.forEach((id, rev) -> maxRevisions.merge(id, rev, Math::max));
     }
 
+    /**
+     * 恢复期由 WheelRecovery 注入:磁盘上存在终态墓碑(多槽墓碑/tail 终态,不回收)的 intentId。
+     * C4-1:这些 id 的 maxRevisions 种子映射不可在后续单槽 incarnation 终态回收时移除。
+     */
+    void markTombstones(Set<String> ids) {
+        tombstoneIds.addAll(ids);
+    }
+
     /** 记录某 intentId 的最新持久化 revision(写路径调用,维持活映射)。 */
     void trackMaxRevision(Intent intent) {
         maxRevisions.merge(intent.getIntentId(), intent.getRevision(), Math::max);
@@ -269,10 +278,8 @@ class WheelPersistence {
     }
 
     /**
-     * 恢复注入与活映射读取的缝——恒等实现见计划缝方法表，禁止增删操作。
-     * 兄弟组件可触达成员(列举不计数):maxRevisionOf / markColdCancelTombstone /
-     * discardTerminalBooking / trackMaxRevision / markMultiSlot / markMaxRevisions /
-     * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝) / writeFreshUnderColdLock(round 16 增守卫原语)。
+     * 恢复注入与活映射读取的缝——缝方法清单以类头"兄弟组件经簿记缝访问"段为唯一成文点,
+     * 此处不复述(r18 A10 去重,悬空规范性引用已移除并归入类头)。
      */
     Long maxRevisionOf(String intentId) {
         return maxRevisions.get(intentId);
