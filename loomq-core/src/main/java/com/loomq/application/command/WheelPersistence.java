@@ -23,6 +23,25 @@ import org.slf4j.LoggerFactory;
  * markColdCancelTombstone / discardTerminalBooking / trackMaxRevision /
  * markMultiSlot / markMaxRevisions(恢复期经命令服务注入) /
  * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝)。
+ *
+ * <p><b>F2 冷锁序列化点(round 15)</b>:per-id 冷锁现覆盖<b>既有 Intent 的所有状态变更
+ * 持久化写者</b>——冷命令(updateCold/cancelCold/fireNowCold,锁内重读磁盘)与热命令写者
+ * (updateIntent/fireNow/cancelIntent 的提交段、投递重试路径的 persistStateChangePutOnly
+ * (F6 起为单一守卫门面)、终态原地覆写 persistTerminalInPlace(F4)、create 失败补偿段(F5)),
+ * 锁内复核
+ * {@code maxRevisionOf(id) < 本次写入 revision} 后原子写。例外:create 主写入路径(W8)不入
+ * 冷锁——其活跃副本预检 hasActiveDuplicate 为既有守卫域(冷锁外预检)。
+ * stale 热副本(磁盘已前进)由
+ * 命令族委托冷路径 fresh 重放、投递路径跳过落盘(磁盘最新态为权威;cancelCold 竞态子情形下
+ * 权威为 CANCELED 终态槽,不再投递)。锁序:热路径
+ * {@code synchronized(intent) → 冷锁};冷命令路径的临界区仅碰 transient 解码副本,不取
+ * intent 监视器(热守卫临界区 mutate 的是活对象,与此消歧——round 15 终审 d)
+ * ——无死锁环;awaitCommit 恒在 <b>intent 监视器</b>之外。冷命令路径在冷锁内 await 为
+ * round 13 既有契约(per-id 锁非监视器,VT 可正常 unmount)。投递终态路径
+ * persistTerminalInPlace 不走 revision 复核守卫(不加复核/不 skip——终态必落盘),但其
+ * index.get→overwriteSlot 平局窗口经冷锁互斥关闭(round 15 终审 F4);残留仅为"终态 vs
+ * 后到冷写"的语义归属——投递已发生,终态覆写胜出(冷命令锁内重读索引见终态槽即拒绝,
+ * 安全收敛),非恢复仲裁不确定。</p>
  */
 class WheelPersistence {
 
@@ -71,11 +90,23 @@ class WheelPersistence {
      * <p>wheel 路径:wheelStore.readSlot 每次返回新解码实例,synchronized(cold) 锁的是 transient
      * 副本,无法阻塞并发写;按 intentId 取一把稳定锁对象,串行化读-改-写。tail 路径同持此锁
      * (round 13):冷改期的 tailIndex.put 与冷取消的 remove 交错,会让被取消 Intent 以更高
-     * revision 复活(remove 的布尔门控盖不住"remove 后 put"窗口)。锁对象在 synchronized 块的
-     * finally 中以 identity 校验移除,只删自己放入的对象,避免误删后到者的锁。</p>
+     * revision 复活(remove 的布尔门控盖不住"remove 后 put"窗口)。</p>
      *
-     * <p>兄弟组件(IntentCanceler/IntentUpdater)经 {@link #acquireColdLock} /
-     * {@link #releaseColdLock} 两缝使用,禁止直接持有注册表引用。</p>
+     * <p><b>锁对象永不移除(round 15 F1)</b>:曾以"release 时 identity 校验移除、只删自己放入
+     * 的对象"回收锁对象,但该方案存在 waiter 竞态——等待者 B 已持 L1 引用阻塞在监视器上,
+     * 持有者 A release 移除注册表项后,新到者 C 经 {@code computeIfAbsent} 得到新对象 L2,
+     * B(L1)/C(L2) 同时进入同一 intentId 的临界区,F2"冷锁内复核-写原子"前提被击穿。
+     * 故 release 不再移除:注册表按去重后的 intentId 有界增长(与 {@link #maxRevisions} 同阶,
+     * 每条仅一个空 Object),换取临界区互斥严格成立。</p>
+     *
+     * <p>用户面:IntentUpdater / IntentCanceler / IntentCommandService 三兄弟——冷命令
+     * (updateCold/cancelCold/fireNowCold)、热命令守卫(W1 updateIntent/W2 fireNow/W3
+     * cancelIntent)、投递路径守卫(W4)、终态原地覆写(persistTerminalInPlace)与 create
+     * 失败补偿段(compensateCancel)皆持此锁——本注册表是<b>既有 Intent 的所有状态变更
+     * 持久化写者的序列化点</b>
+     * (create 主写入路径例外,见类头 W8 句)。</p>
+     *
+     * <p>兄弟组件经 {@link #acquireColdLock} / {@link #releaseColdLock} 两缝使用,禁止直接持有注册表引用。</p>
      */
     private final ConcurrentHashMap<String, Object> coldWriteLocks = new ConcurrentHashMap<>();
 
@@ -132,27 +163,41 @@ class WheelPersistence {
      * 终态原地覆写（非阻塞 mmap）：把 locationIndex 指向的最新槽覆写为终态，不追加新槽。
      * 单槽 Intent 排队待回收（pendingReclaims），落盘后由 reclaimTerminal 清空；多槽只覆写不回收。
      * 无索引或 tail 时回退追加（tail 超视界非回收路径）。失败由调用方按 I6 吞掉。
+     *
+     * <p><b>F4(round 15 终审): 全体纳入 per-id 冷锁互斥</b>——锁外 {@code locationIndex.get}
+     * 与冷写者 {@code index.put} 交错可产生 terminal R+1 / SCHEDULED R+1 同 revision 平局,
+     * 恢复按扫描序仲裁(与类头"无双写平局"旧表述矛盾)。临界区内无 revision 复核、无 skip
+     * 语义——终态必落盘;无 awaitCommit(回退追加分支的 persistToWheel 亦 durable=false,
+     * 非阻塞,可接受),awaitCommit 仍由调用方在锁外完成。可重入安全:W3 守卫临界区已持
+     * 同锁(F1 起锁对象不移除),同线程 synchronized 重入。</p>
      */
     void persistTerminalInPlace(Intent intent) {
         String id = intent.getIntentId();
-        SlotLocation loc = locationIndex.get(id);
-        if (loc == null || loc.inTail()) {
-            if (loc != null && loc.inTail()) {
-                // tail 终态:记录残留 run 文件(不回收,C3-3)→ 按墓碑语义保护种子映射
-                tombstoneIds.add(id);
-                pendingReclaims.put(id, new PendingReclaim(loc, false));
+        Object coldLock = acquireColdLock(id);
+        try {
+            synchronized (coldLock) {
+                SlotLocation loc = locationIndex.get(id);
+                if (loc == null || loc.inTail()) {
+                    if (loc != null && loc.inTail()) {
+                        // tail 终态:记录残留 run 文件(不回收,C3-3)→ 按墓碑语义保护种子映射
+                        tombstoneIds.add(id);
+                        pendingReclaims.put(id, new PendingReclaim(loc, false));
+                    }
+                    persistToWheel(intent, false);     // 回退追加；awaitCommit 由调用方在锁外完成
+                    return;
+                }
+                wheelStore.overwriteSlot(loc, SlotCodec.encode(intent));
+                trackMaxRevision(intent);              // R9: 终态原地覆写同样推进历史最高 revision
+                boolean singleSlot = !multiSlotIntents.contains(id);
+                if (!singleSlot) {
+                    // 多槽终态 → 磁盘保留墓碑(不回收),revision 种子映射须随之保留(C4-1)
+                    tombstoneIds.add(id);
+                }
+                pendingReclaims.put(id, new PendingReclaim(loc, singleSlot));
             }
-            persistToWheel(intent, false);     // 回退追加；awaitCommit 由调用方在锁外完成
-            return;
+        } finally {
+            releaseColdLock(id, coldLock);
         }
-        wheelStore.overwriteSlot(loc, SlotCodec.encode(intent));
-        trackMaxRevision(intent);              // R9: 终态原地覆写同样推进历史最高 revision
-        boolean singleSlot = !multiSlotIntents.contains(id);
-        if (!singleSlot) {
-            // 多槽终态 → 磁盘保留墓碑(不回收),revision 种子映射须随之保留(C4-1)
-            tombstoneIds.add(id);
-        }
-        pendingReclaims.put(id, new PendingReclaim(loc, singleSlot));
     }
 
     /**
@@ -241,9 +286,15 @@ class WheelPersistence {
         return coldWriteLocks.computeIfAbsent(intentId, k -> new Object());
     }
 
-    /** 冷路径 per-id 互斥出:identity 校验 computeIfPresent,只移除自己放入的锁对象。 */
+    /**
+     * 冷路径 per-id 互斥出(round 15 F1 起为空操作):锁对象不再移除——移除会让阻塞中的等待者
+     * 持旧锁对象、新到者经 computeIfAbsent 得新锁对象,两者同临界区并发(竞态推演与取舍见
+     * {@link #coldWriteLocks})。保留方法形态以维持 acquire/finally release 配对契约的可读性;
+     * 注册表随 intentId 永存,无需配对清理。
+     */
     void releaseColdLock(String intentId, Object lock) {
-        coldWriteLocks.computeIfPresent(intentId, (k, v) -> v == lock ? null : v);
+        // F1(round 15): 故意留空——绝不 coldWriteLocks.remove。identity 校验移除的旧实现
+        // 存在 waiter 竞态(见 coldWriteLocks javadoc),互斥正确性优先于注册表即时回收。
     }
 
     /**

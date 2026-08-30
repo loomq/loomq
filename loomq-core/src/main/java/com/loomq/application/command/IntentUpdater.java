@@ -24,6 +24,8 @@ import org.slf4j.LoggerFactory;
  * 冷路径(round 13/14):updateIntent 对冷 Intent 走 updateCold,fireNow 对冷 Intent 走 fireNowCold
  * (per-id 冷锁 + persistToWheel 写协议 + cohort 安全网;冷 fireNow 把 executeAt 改写为 now 后
  * 立即热载投递,不跑 IntentValidator——镜像热路径)。
+ * F2(round 15):热路径写槽前持 per-id 冷锁复核 revision(stale → 还原 + demote + 委托冷路径
+ * fresh 重放);投递路径守卫见 IntentCommandService.persistStateChangePutOnly(F6 起为单一守卫门)。
  * 非 final(round 14):测试桩子类覆写 routeColdAfterPersist 注入提交后路由失败。
  */
 class IntentUpdater {
@@ -80,6 +82,13 @@ class IntentUpdater {
      * 墓碑/DURABLE),锁外注册 promotion cohort 安全网并按需热载;成功返回更新后副本,校验失败
      * 抛 IAE 同热路径(副本未持久化,磁盘 untouched)。完整语义见 {@link #updateCold} javadoc。</p>
      *
+     * <p><b>stale 委托(round 15 F2)：</b>热副本可能是在途 promote 载入的旧 revision 副本,且磁盘
+     * 已被并发冷命令推进。提交段持 per-id 冷锁复核 revision:磁盘历史最高 revision 严格高于
+     * 本副本 base revision(即磁盘已前进)才判 stale;stale 时不落盘——还原调度字段 + demote +
+     * 自动委托 {@link #updateCold} 在磁盘 fresh 态上重放同一 updater,返回值基于 fresh 态
+     * (成功即更新生效);委托路径自身异常按其契约传播,不复活已 demote 的 stale 副本。
+     * 磁盘未前进则行为与既有热路径一致(直写新槽)。</p>
+     *
      * @param intentId     待更新 Intent ID
      * @param updater      变更消费者（热路径在 synchronized(intent) 内执行；冷路径在 per-id
      *                     冷锁内作用于 transient 解码副本，无 synchronized(intent) 监视器）
@@ -98,6 +107,8 @@ class IntentUpdater {
         boolean reschedule = false;
         boolean persisted = false;
         boolean removedForReschedule = false;
+        // F2(round 15): 冷锁复核检出磁盘已前进(stale)时置位——收口与 catch 守卫据此分派
+        boolean stale = false;
         // C4-5: 提升到 catch 作用域——updater 先变异后抛时,回滚须还原这些"更新前"值
         Instant oldExecuteAt = null;
         IntentStatus statusBeforeUpdater = null;
@@ -197,13 +208,47 @@ class IntentUpdater {
                 // 归一化放在校验之后，避免校验失败时仍然修改调用方传入的 Intent。
                 IntentCommandService.normalizePrecisionTier(precisionTierCatalog, intent);
 
-                intent.incrementRevision();
-                // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount，不 pin carrier）
-                persistence.persistStateChangePutOnly(intent);
-                persisted = true;
-                intentStore.update(intent);
+                // F2(round 15): per-id 冷锁内 revision 复核 + 原子写——磁盘历史最高 revision
+                // 严格高于本副本 base revision 说明本副本 stale(在途 promote 载入的旧副本被
+                // 并发冷命令推进过)。直写的双写论证(round 15 终审 g):diskMax==base+1 时带
+                // stale 内容直写与磁盘权威槽同 revision 双写,recovery 平票仲裁不确定(冷更新可
+                // 静默丢失);diskMax>base+1 时直写为更低 revision 的 stale 槽并偷指索引(进程内
+                // 读到 stale)。两情形守卫均覆盖。复核+increment+persist 必须同一冷锁临界区
+                // (检查-写原子);锁序 synchronized(intent) → 冷锁,冷临界区不取 intent 监视器
+                // (无死锁环);awaitCommit 仍在锁外。
+                Object coldLock = persistence.acquireColdLock(intentId);
+                try {
+                    synchronized (coldLock) {
+                        Long diskMax = persistence.maxRevisionOf(intentId);
+                        stale = diskMax != null && diskMax > intent.getRevision();
+                        if (!stale) {
+                            intent.incrementRevision();
+                            // 锁内仅非阻塞 put;DURABLE 等待移到锁外（VT 可正常 unmount，不 pin carrier）
+                            persistence.persistStateChangePutOnly(intent);
+                        }
+                    }
+                } finally {
+                    persistence.releaseColdLock(intentId, coldLock);
+                }
+                if (!stale) {
+                    persisted = true;
+                    intentStore.update(intent);
+                }
                 // I5: schedule/restore 移到锁外 (deferred)
                 // -- schedule() 有自己的 synchronized + 终态检查
+            }
+            if (stale) {
+                // F2(round 15): stale 热副本 → 还原调度字段 + demote + 委托冷路径 fresh 重放。
+                // updateCold 在冷锁内重读磁盘最新态并重放同一 updater(冷路径既有契约)。
+                // 归因(round 15 终审 c):stale 副本的主收口是本分支显式的
+                // reconciler.removeHotCopyIfPresent;routeColdAfterPersist 的 removeHotCopyIfStale
+                // 是竞态兜底(demote + 窗口内重热载)。内容变异不可回滚(C4-5),副本随即被 demote 弃用。
+                restoreSchedulingFields(intent, oldExecuteAt, statusBeforeUpdater, updatedAtBeforeUpdater,
+                    tierBeforeUpdater);
+                reconciler.removeHotCopyIfPresent(intentId);
+                logger.info("Hot update detected stale copy (disk advanced); delegating to cold path: id={}",
+                    intentId);
+                return updateCold(intentId, updater, newExecuteAt);
             }
             // DURABLE 等待在锁外完成（同调度器模式：锁内 put、锁外 awaitCommit）
             if (persisted) {
@@ -220,6 +265,11 @@ class IntentUpdater {
             // C4-4: I5 快照隔离——返回副本,调用方不得持有/变异内核活状态(与 findById 同纪律)
             return Optional.of(intent.copy());
         } catch (RuntimeException e) {
+            if (stale) {
+                // F2(round 15): stale 委托路径(updateCold)自身异常按其契约传播;此处禁止
+                // restore/reschedule——本副本已 demote,复活会留下与磁盘权威态分叉的 ghost。
+                throw e;
+            }
             if (persisted) {
                 // C4-2/C4-3 同款提交后保护：persistStateChangePutOnly 已把新状态写入 mmap +
                 // 索引，之后的 store.update/awaitCommit 失败不能回滚，否则内存旧、磁盘新，
@@ -249,21 +299,8 @@ class IntentUpdater {
                 return Optional.of(intent.copy());
             }
             logger.error("Failed to update intent: id={}", intentId, e);
-            // 回滚调度字段:executeAt/status/updatedAt/precisionTier 还原到 updater 前值。
-            // C4-5: updater 可能已变异这些字段后才抛异常——按"当前值"重排会把变异半应用
-            // (与"失败即还原"语义不符,见 BugUpdateUpdaterFailureTest)。
-            // 非调度字段(内容)的变异不可回滚(无更新前快照),属用户 updater 契约边界。
-            // 顺序:setExecuteAt/setPrecisionTier 会重写 updatedAt,须先执行,再由
-            // rollbackVolatileState 统一还原 status 与 updatedAt。
-            if (oldExecuteAt != null) {
-                intent.setExecuteAt(oldExecuteAt);
-            }
-            if (statusBeforeUpdater != null) {
-                // R28: precisionTier 也是调度字段(决定 cohort/桶路由),updater 污染后必须
-                // 还原,否则活对象残留 null/错误档,与磁盘(recovery 恢复值)短暂不一致。
-                intent.setPrecisionTier(tierBeforeUpdater);
-                intent.rollbackVolatileState(statusBeforeUpdater, updatedAtBeforeUpdater);
-            }
+            restoreSchedulingFields(intent, oldExecuteAt, statusBeforeUpdater, updatedAtBeforeUpdater,
+                tierBeforeUpdater);
             // 更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按原 executeAt
             // 重新调度——否则 intent 在 store 中为 SCHEDULED/DUE 却不在任何
             // bucket/cohort，静默永不投递直到重启恢复（投递延迟丢失）。
@@ -296,6 +333,28 @@ class IntentUpdater {
     }
 
     /**
+     * 提交前失败/stale 的调度字段还原(executeAt/status/updatedAt/precisionTier)。
+     * C4-5: updater 可能已变异这些字段后才失败——按"当前值"重排会把变异半应用
+     * (与"失败即还原"语义不符,见 BugUpdateUpdaterFailureTest)。
+     * 非调度字段(内容)的变异不可回滚(无更新前快照),属用户 updater 契约边界。
+     * 顺序:setExecuteAt/setPrecisionTier 会重写 updatedAt,须先执行,再由
+     * rollbackVolatileState 统一还原 status 与 updatedAt。
+     * F2(round 15):catch 回滚分支与 stale 委托分支共用本方法。
+     */
+    private void restoreSchedulingFields(Intent intent, Instant oldExecuteAt, IntentStatus statusBeforeUpdater,
+                                         Instant updatedAtBeforeUpdater, PrecisionTier tierBeforeUpdater) {
+        if (oldExecuteAt != null) {
+            intent.setExecuteAt(oldExecuteAt);
+        }
+        if (statusBeforeUpdater != null) {
+            // R28: precisionTier 也是调度字段(决定 cohort/桶路由),updater 污染后必须
+            // 还原,否则活对象残留 null/错误档,与磁盘(recovery 恢复值)短暂不一致。
+            intent.setPrecisionTier(tierBeforeUpdater);
+            intent.rollbackVolatileState(statusBeforeUpdater, updatedAtBeforeUpdater);
+        }
+    }
+
+    /**
      * 重排程摘除收口:状态白名单校验 + removeFromSchedule(claimed 判别)+ 告警。
      * 收敛 updateIntent 两处孪生分支(状态白名单→摘除→CLAIMED_SKIP_WARN 逻辑曾各自漂移)。
      */
@@ -323,6 +382,10 @@ class IntentUpdater {
      * 则在途投递即为 fireNow 语义等价(不改写 executeAt/不落盘,防重复投递);认领成功则
      * executeAt=now + revision+1 + DURABLE 落盘。提交后失败不回滚(C4-3:restore + 返回 true,
      * 磁盘 @now 槽为权威);提交前失败回滚 executeAt/revision 并 restore + 返回 false。
+     * F2(round 15):提交段持 per-id 冷锁复核 revision——磁盘已前进(stale 热副本)→ demote +
+     * 委托 {@link #fireNowCold} 从磁盘 fresh 态重放(executeAt=now + 立即热载,布尔契约同冷路径);
+     * 磁盘未前进则行为不变。stale 委托路径的异常按 fireNowCold 契约处理:fireNowCold 自身失败
+     * 已内含为返回 false,逸出异常按原样透传不额外上抛包装,亦不触发本方法回滚。
      * 冷 Intent 走 {@link #fireNowCold}(round 14)。
      */
     boolean fireNow(String intentId) {
@@ -346,18 +409,35 @@ class IntentUpdater {
         long oldRevision = 0;
         boolean wasScheduled = false;
         boolean persisted = false;
+        // F2(round 15): 冷锁复核检出磁盘已前进(stale)时置位——收口与 catch 守卫据此分派
+        boolean stale = false;
         try {
             synchronized (intent) {
                 oldExecuteAt = intent.getExecuteAt();
                 oldRevision = intent.getRevision();
                 wasScheduled = scheduler.removeFromSchedule(intent);
                 if (wasScheduled) {
-                    intent.setExecuteAt(Instant.now());
-                    intent.incrementRevision();
-                    // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount）
-                    persistence.persistStateChangePutOnly(intent);
-                    persisted = true;
-                    intentStore.update(intent);
+                    // F2(round 15): 冷锁内 revision 复核 + 原子写(镜像 updateIntent 守卫)。
+                    // 复核+setExecuteAt+increment+persist 同一冷锁临界区;锁序 intent 监视器 → 冷锁。
+                    Object coldLock = persistence.acquireColdLock(intentId);
+                    try {
+                        synchronized (coldLock) {
+                            Long diskMax = persistence.maxRevisionOf(intentId);
+                            stale = diskMax != null && diskMax > intent.getRevision();
+                            if (!stale) {
+                                intent.setExecuteAt(Instant.now());
+                                intent.incrementRevision();
+                                // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount）
+                                persistence.persistStateChangePutOnly(intent);
+                            }
+                        }
+                    } finally {
+                        persistence.releaseColdLock(intentId, coldLock);
+                    }
+                    if (!stale) {
+                        persisted = true;
+                        intentStore.update(intent);
+                    }
                     // I5: restore 移到锁外 (deferred)
                 } else {
                     // 已被 scanDue CAS 认领（索引条目已消耗），在途投递即为 fireNow 的效果。
@@ -367,6 +447,17 @@ class IntentUpdater {
                     logger.debug("fireNow: intent {} already claimed by scanDue; in-flight delivery serves as fire-now",
                         intentId);
                 }
+            }
+            if (stale) {
+                // F2(round 15): 磁盘已前进——本副本 stale。CAS 认领已消耗(schedule 条目已摘除):
+                // demote 本副本,委托冷 fireNow 从磁盘 fresh 态重放(executeAt=now + 立即热载),
+                // 杜绝 stale 内容投递/同 revision 双写。fireNowCold 复用 routeColdAfterPersist
+                // (upsert fresh + removeHotCopyIfStale 收口)。stale 分支无字段变异(setExecuteAt/
+                // increment 在 !stale 内),无需回滚。
+                reconciler.removeHotCopyIfPresent(intentId);
+                logger.info("Hot fireNow detected stale copy (disk advanced); delegating to cold path: id={}",
+                    intentId);
+                return fireNowCold(intentId);
             }
             // DURABLE 等待在锁外完成（同调度器模式：锁内 put、锁外 awaitCommit）
             if (persisted) {
@@ -382,6 +473,11 @@ class IntentUpdater {
                 : "Intent already in-flight; fireNow served by in-flight delivery: id={}", intentId);
             return true;
         } catch (RuntimeException e) {
+            if (stale) {
+                // F2(round 15): fireNowCold 自身失败已内含为返回 false;异常传播到此处属预期外,
+                // 按原样透传(不额外包装)并禁止 restore——本副本已 demote,复活会留下 ghost。
+                throw e;
+            }
             logger.error("Failed to fire intent: id={}", intentId, e);
             if (persisted) {
                 // C4-3: 提交后失败(SCHEDULED@now 已入 mmap,索引已指向新槽)——回滚 executeAt/
@@ -495,7 +591,8 @@ class IntentUpdater {
      * 语义同热路径)。</p>
      *
      * <p><b>锁外路由</b>:cohort 安全网注册(窗口内外统一,见 {@link #routeColdAfterPersist})→
-     * 窗口内热载 → P1-2 post-check(round 14 收口至 {@link ColdHotReconciler})。</p>
+     * 窗口内热载 → P1-2 post-check(round 14 收口至 {@link ColdHotReconciler};竞态兜底——
+     * stale 副本的主收口是窗口内 fresh 副本 upsert 本身)。</p>
      *
      * <p><b>C4-2 提交后守卫(round 14 F4)</b>:persistToWheel 成功即提交——此后 awaitCommit 或
      * 锁外路由失败一律 warn 后按成功返回,不回滚 revision、不作废新槽(镜像热路径提交后分支)。
@@ -578,12 +675,15 @@ class IntentUpdater {
     }
 
     /**
-     * 冷改期锁外路由:cohort 安全网注册(窗口内外统一)+ 窗口内热载 + P1-2 post-check
-     * (round 14 收口至 ColdHotReconciler;update/fireNow 冷命令共用本路由)。
+     * 冷改期锁外路由:cohort 安全网注册(窗口内外统一)+ 窗口内热载 +
+     * P1-2 post-check(round 14 收口至 ColdHotReconciler;update/fireNow 冷命令共用本路由;
+     * post-check 为竞态兜底——stale 副本的主收口是窗口内 fresh 副本 upsert 本身)。
      *
-     * <p><b>为什么窗口内也注册 cohort(spec 4.4 安全网)</b>:promote 回调的复核回滚是
-     * 无条件按 id 删热副本——在途旧 promote(旧 cohort 已出队)与我们交错时可能误删刚热载的
-     * 新副本,而 post-check 时序上可能已错过(见 post-check 时序)。cohort 到点 promote:见热副本幂等
+     * <p><b>为什么窗口内也注册 cohort(spec 4.4 安全网)</b>:promote 回调的复核回滚是<b>条件
+     * 回滚</b>(round 15 终审 F2:索引失配且热副本 revision 不高于载入 revision 才回滚,判据以
+     * upsert 前捕获的载入 revision 为基准)——曾表述的"无条件按 id 删热副本、在途旧 promote
+     * 交错时误删刚热载新副本"窗口已被该守卫关闭。cohort 注册仍保留为自愈安全网:覆盖副本
+     * 彻底丢失(hot == null)与 post-check 时序错过的情形。cohort 到点 promote:见热副本幂等
      * no-op;副本丢失则从新槽重热载——系统自愈,不依赖 post-check 时序。窗口内注册的代价仅是
      * 到点一次幂等 no-op promote。</p>
      *

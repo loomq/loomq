@@ -21,7 +21,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * P1-2 认领窗口端到端测试：投递在途期间 fireNow/updateIntent 不得引发第二次投递。
+ * scanDue CAS 认领协议的认领窗口端到端测试：投递在途期间
+ * fireNow/updateIntent 不得引发第二次投递。
  *
  * <p>确定性设计：等 GateHandler 被调用即意味着 scanDue 的 CAS 已消耗索引（认领完成、
  * 投递在途），此时再调 fireNow/updateIntent 必然走认领分支。之后手动完成投递 Future，

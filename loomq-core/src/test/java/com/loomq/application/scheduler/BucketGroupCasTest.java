@@ -12,7 +12,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 /**
- * P1-2 CAS 认领机制测试。
+ * scanDue CAS 认领协议机制测试。
  *
  * <p>验证 scanDue 的原子认领:CAS 期望值从 BucketEntry.revisionAtAdd 取得(不可变快照),
  * 而非从可变 Intent 或当前索引状态读取。fireNow 重注册后 revision 递增,

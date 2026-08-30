@@ -167,9 +167,18 @@ public final class IntentCommandService {
     /**
      * promote 侧冷↔热 reconcile(round 14):委托 {@link ColdHotReconciler}——P1-2 协议的
      * 单一权威实现,协议语义见其类 javadoc。供 LoomqEngine 的 promote 回调调用。
+     *
+     * <p>round 15 终审 F2:{@code promotedRevision} 必须由调用方在 <b>upsert 之前</b>捕获传入
+     * ——回调 upsert 的 P 与后续热写者推进的是同一可变对象,reconcile 时 findByIdInternal 返回
+     * 的仍是 P,以 {@code promoted.getRevision()} 为判据对同引用恒 false(同对象盲区),推进后
+     * 的副本仍被误 demote。</p>
+     *
+     * @param intent           promote 热载副本(调用方已 upsert)
+     * @param loc              promote 读槽时的槽位
+     * @param promotedRevision 载入副本 upsert 前的 revision
      */
-    public void reconcilePromotion(Intent intent, SlotLocation loc) {
-        reconciler.rollbackPromoteHotLoad(intent, loc);
+    public void reconcilePromotion(Intent intent, SlotLocation loc, long promotedRevision) {
+        reconciler.rollbackPromoteHotLoad(intent, loc, promotedRevision);
     }
 
     private void dispatchCallback(Intent intent, CallbackHandler.EventType eventType, Throwable error) {
@@ -210,12 +219,46 @@ public final class IntentCommandService {
     }
 
     /**
-     * 状态变更持久化的 "put-only" 入口（供 PrecisionScheduler 在 synchronized(intent) 内调用）。
-     * 仅写 PHTW + 索引（非阻塞 mmap），不 awaitCommit——持久化等待由调度器在锁外调用
-     * {@link #awaitDurableCommit()} 完成，避免 VT 在 synchronized 内 park 导致 carrier pinning。
+     * 投递路径状态变更持久化的守卫门面(round 15):per-id 冷锁内复核 revision 后落盘。
+     * StatePersistence.persistStateChange 已先 incrementRevision——判据为 diskMax &gt;= 当前
+     * revision(已含本次递增):磁盘已到/超过本次写入 revision 说明内存副本 stale(在途投递
+     * 副本 + 并发冷写者推进),直写会与磁盘权威槽同 revision 双写。stale 时<b>跳过持久化</b>并
+     * warn:磁盘保留冷写者的最新态(权威;cancelCold 竞态子情形下权威为 CANCELED 终态槽,
+     * 不再投递),崩溃后按其恢复——优于双写平局。skip 同时回滚本次 increment
+     * ({@code rollbackRevision(revision - 1)},round 15 终审 F3):否则平局副本被当 fresh
+     * (revision 洗白),下次重试/热更新以 stale 内容确定性覆盖冷写者更新;回退后活对象
+     * revision 回 base,再 increment 仍命中守卫恒 skip,W1-W3 守卫仍判 stale → 委托冷路径。
+     *
+     * <p><b>F6(round 15 终审)单一守卫门</b>:本方法即守卫本体——曾并存零调用的裸写口与
+     * 独立的守卫变体,裸写口可绕过 stale 复核直达写槽,已合并:守卫实现移入本方法、守卫变体
+     * 删除。改名理由:门面只应存在一个持久化写口。投递重试/改期路径(LoomqEngine 的
+     * StateChangeSink.persist)经此落盘。
+     * 终态路径(persistTerminalInPlace)不守卫(不加复核/不 skip——终态必落盘;其平局窗口经
+     * 冷锁互斥关闭,见 WheelPersistence.persistTerminalInPlace)。重试/改期路径无
+     * reclaimTerminal 交互,skip 无回收副作用。</p>
+     *
+     * <p>锁序:调用方(StatePersistence.persistStateChange)在 synchronized(intent) 内调用——
+     * intent 监视器 → 冷锁,与命令族守卫同序,无死锁环。</p>
      */
     public void persistStateChangePutOnly(Intent intent) {
-        persistence.persistStateChangePutOnly(intent);
+        String intentId = intent.getIntentId();
+        Object lock = persistence.acquireColdLock(intentId);
+        try {
+            synchronized (lock) {
+                Long diskMax = persistence.maxRevisionOf(intentId);
+                if (diskMax != null && diskMax >= intent.getRevision()) {
+                    logger.warn("Delivery state-change persist skipped (stale copy, disk advanced): id={}, rev={}",
+                        intentId, intent.getRevision());
+                    // F3(round 15 终审): 回退 StatePersistence 已做的 increment,把活对象 revision
+                    // 还原到 base——杜绝 skip 后平局副本被当 fresh 的 revision 洗白。
+                    intent.rollbackRevision(intent.getRevision() - 1);
+                    return;
+                }
+                persistence.persistStateChangePutOnly(intent);
+            }
+        } finally {
+            persistence.releaseColdLock(intentId, lock);
+        }
     }
 
     /**

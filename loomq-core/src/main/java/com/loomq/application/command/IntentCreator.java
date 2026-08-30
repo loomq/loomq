@@ -174,6 +174,12 @@ final class IntentCreator {
     /**
      * Compensate cancel: rollback memory state + write CANCELED terminal revision.
      * Shared by createIntent / createIntents failure paths.
+     *
+     * <p>F5(round 15 终审): 补偿段(从 {@code locationIndex.remove} 到 {@code persistToWheel}
+     * 完成)包 per-id 冷锁互斥——无锁时补偿与并发冷命令可同 revision 平局 + 无条件 remove 抹索引;
+     * 串行化后并发冷命令锁内重读索引见 CANCELED 槽 → 当不存在收敛,安全。补偿语义保持
+     * (不加 revision 复核);临界区内 awaitCommit 与 cancelCold 既有契约一致
+     * (per-id 锁非监视器,VT 可正常 unmount)。</p>
      */
     private void compensateCancel(Intent intent) {
         try {
@@ -191,19 +197,26 @@ final class IntentCreator {
         } catch (Exception ex) {
             logger.error("Rollback promotionDaemon.remove failed for intent {}", intent.getIntentId(), ex);
         }
+        Object coldLock = persistence.acquireColdLock(intent.getIntentId());
         try {
-            locationIndex.remove(intent.getIntentId());
-        } catch (Exception ex) {
-            logger.error("Rollback locationIndex.remove failed for intent {}", intent.getIntentId(), ex);
-        }
-        try {
-            intent.transitionTo(IntentStatus.CANCELED);
-            intent.incrementRevision();
-            persistence.persistToWheel(intent, true);
-            logger.warn("Compensation cancel written for intent {}", intent.getIntentId());
-        } catch (Exception compEx) {
-            logger.error("Compensation cancel failed for intent {}; recovery may resurrect it",
-                intent.getIntentId(), compEx);
+            synchronized (coldLock) {
+                try {
+                    locationIndex.remove(intent.getIntentId());
+                } catch (Exception ex) {
+                    logger.error("Rollback locationIndex.remove failed for intent {}", intent.getIntentId(), ex);
+                }
+                try {
+                    intent.transitionTo(IntentStatus.CANCELED);
+                    intent.incrementRevision();
+                    persistence.persistToWheel(intent, true);
+                    logger.warn("Compensation cancel written for intent {}", intent.getIntentId());
+                } catch (Exception compEx) {
+                    logger.error("Compensation cancel failed for intent {}; recovery may resurrect it",
+                        intent.getIntentId(), compEx);
+                }
+            }
+        } finally {
+            persistence.releaseColdLock(intent.getIntentId(), coldLock);
         }
     }
 

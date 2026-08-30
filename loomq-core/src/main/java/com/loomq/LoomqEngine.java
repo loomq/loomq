@@ -179,12 +179,18 @@ public class LoomqEngine implements AutoCloseable {
                 @Override
                 public void accept(Intent intent, SlotLocation loc) {
                     if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
+                        // F2(round 15 终审): upsert 前捕获载入 revision——upsert 的 P 与后续热写者
+                        // 推进的是同一可变对象,复核须以载入时 revision 为判据基准,否则
+                        // hot.getRevision() > promoted.getRevision() 对同引用恒 false(同对象盲区),
+                        // 推进后的副本仍被误 demote。
+                        long promotedRevision = intent.getRevision();
                         intentStore.upsert(intent);          // 幂等:已在内存则跳过
                         scheduler.schedule(intent);
                         // P1-2 → round 14:promote 侧 TOCTOU 复核收口至 ColdHotReconciler(单一权威
-                        // 实现,经命令服务委托;索引失配/已清即回滚热载,杜绝 ghost 投递/旧内容热载)。
+                        // 实现,经命令服务委托;索引失配/已清且热副本 revision 不高于载入 revision
+                        // 才回滚热载——热写者推进后的新副本不误删,杜绝 ghost 投递/旧内容热载)。
                         // commandService 字段在下方赋值,回调仅 start() 后触发,此处恒非空。
-                        commandService.reconcilePromotion(intent, loc);
+                        commandService.reconcilePromotion(intent, loc, promotedRevision);
                     }
                 }
             }, wheelConfig.promotionLeadMs());
@@ -202,7 +208,12 @@ public class LoomqEngine implements AutoCloseable {
 
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
             scheduler.setStateChangeSink(new StateChangeSink() {
-                @Override public void persist(Intent intent) { commandService.persistStateChangePutOnly(intent); }
+                @Override public void persist(Intent intent) {
+                    // F2(round 15): 投递重试/改期持久化走冷锁复核守卫——stale 副本跳过落盘,
+                    // 杜绝与并发冷写者同 revision 双写。F6(round 15 终审):守卫即
+                    // persistStateChangePutOnly 本体(门面唯一持久化写口),Guarded 变体已删。
+                    commandService.persistStateChangePutOnly(intent);
+                }
                 @Override public void persistTerminalInPlace(Intent intent) { commandService.persistTerminalInPlace(intent); }
                 @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
                 @Override public void reclaimTerminal(String intentId) { commandService.reclaimTerminal(intentId); }

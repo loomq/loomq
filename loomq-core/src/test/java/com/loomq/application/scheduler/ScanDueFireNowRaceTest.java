@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 /**
- * P1-2 极端竞态测试:CAS 成功后 fireNow 不再重注册。
+ * scanDue CAS 认领协议极端竞态测试:CAS 成功后 fireNow 不再重注册。
  *
  * <p>场景:scanDue 的 CAS 认领成功(旧 revision 匹配),但在加入 dueIntents 前,
  * fireNow 介入。fireNow 的 removeFromSchedule 返回 false（索引条目已被 CAS 消耗），

@@ -21,6 +21,9 @@ import org.slf4j.LoggerFactory;
  * 状态迁移) + 冷取消(locationIndex 定位磁盘槽,冷锁注册表迁 WheelPersistence 共享
  * (冷改期/冷 fireNow round 13/14 同锁))。
  * 回调派发经 CallbackDispatcher 端口回调 facade(锁外派发 + I5 防御性快照时序原样)。
+ * F2(round 15):热取消写终态前持 per-id 冷锁复核 revision(stale → 回滚 transitionTo + demote
+ * + 委托冷取消;冷锁现为既有 Intent 的所有状态变更持久化写者的序列化点(create 主写入 W8
+ * 例外不入冷锁,见 WheelPersistence 类头),权威成文见 WheelPersistence 类头)。
  */
 final class IntentCanceler {
 
@@ -72,6 +75,12 @@ final class IntentCanceler {
      * <p>对于冷 Intent（不在内存 store 中）：经 locationIndex 定位磁盘槽，
      * 互斥写 CANCELED 终态槽。</p>
      *
+     * <p><b>stale 委托(round 15 F2)：</b>热副本可能是在途 promote 载入的旧 revision 副本,且磁盘
+     * 已被并发冷命令推进。终态提交段持 per-id 冷锁复核 revision:磁盘历史最高 revision 严格
+     * 高于本副本 base revision(即磁盘已前进)才判 stale;stale 时不覆写——回滚 transitionTo +
+     * demote + 自动委托 {@link #cancelCold} 在磁盘 fresh 态上取消(冷取消语义:无 CANCELLED
+     * 回调派发,best-effort 契约不变);磁盘未前进则行为与既有热路径一致(原地覆写终态)。</p>
+     *
      * @param intentId 待取消的 Intent ID
      * @return true 如果取消成功；false 如果 Intent 不存在或已处于终态
      */
@@ -88,6 +97,8 @@ final class IntentCanceler {
         // C4-2: 终态已提交标记——persistTerminalInPlace 成功(mmap)后置位,此后任何失败
         // 不得回滚内存(磁盘/内存分歧)。仅终态写入前的失败才走回滚分支。
         boolean terminalPersisted = false;
+        // F2(round 15): 冷锁复核检出磁盘已前进(stale)时置位——收口与 catch 守卫据此分派
+        boolean stale = false;
         try {
             Intent callbackSnapshot = null;
             synchronized (intent) {
@@ -97,7 +108,7 @@ final class IntentCanceler {
                 oldRevision = intent.getRevision();
 
                 // transitionTo 单独 try-catch：仅捕获状态机校验失败，
-                // 不会误吞 persistStateChangePutOnly / intentStore.update 抛出的 ISE。
+                // 不会误吞 persistTerminalInPlace / intentStore.update 抛出的 ISE。
                 try {
                     intent.transitionTo(IntentStatus.CANCELED);
                 } catch (IllegalStateException e) {
@@ -105,15 +116,42 @@ final class IntentCanceler {
                     return false;
                 }
                 scheduler.removeFromSchedule(intent);
-                intent.incrementRevision();
-                persistence.persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
-                terminalPersisted = true;         // 终态已提交(mmap):此后失败不回滚
-                intentStore.update(intent);
-                // 索引清理移交 reclaimTerminal 的定向移除(C2-1):终态提交后、awaitCommit 窗口内
-                // 并发重建可能已把索引指向新槽,此处无条件移除会抹掉新 incarnation 的索引。
-                traceStore.updateStatus(intentId, IntentStatus.CANCELED);
-                // I5: 锁内取快照，锁外派发
-                callbackSnapshot = intent.copy();
+                // F2(round 15): 冷锁内 revision 复核 + 原子写——磁盘已前进时本副本 stale,
+                // 原地覆写会以 stale 内容覆盖索引当前槽(冷写者刚写的新槽)。复核+increment+
+                // persistTerminalInPlace 同一冷锁临界区;锁序 intent 监视器 → 冷锁。
+                Object coldLock = persistence.acquireColdLock(intentId);
+                try {
+                    synchronized (coldLock) {
+                        Long diskMax = persistence.maxRevisionOf(intentId);
+                        stale = diskMax != null && diskMax > intent.getRevision();
+                        if (!stale) {
+                            intent.incrementRevision();
+                            persistence.persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
+                        }
+                    }
+                } finally {
+                    persistence.releaseColdLock(intentId, coldLock);
+                }
+                if (!stale) {
+                    terminalPersisted = true;         // 终态已提交(mmap):此后失败不回滚
+                    intentStore.update(intent);
+                    // 索引清理移交 reclaimTerminal 的定向移除(C2-1):终态提交后、awaitCommit 窗口内
+                    // 并发重建可能已把索引指向新槽,此处无条件移除会抹掉新 incarnation 的索引。
+                    traceStore.updateStatus(intentId, IntentStatus.CANCELED);
+                    // I5: 锁内取快照，锁外派发
+                    callbackSnapshot = intent.copy();
+                }
+            }
+
+            if (stale) {
+                // F2(round 15): stale 热副本 → 回滚 transitionTo(stale 分支 revision 未动,2 参足够)
+                // → demote → 委托冷取消(磁盘 fresh 态重放;其成功路径自带 removeHotCopyIfPresent
+                // 二次兜底)。注意:委托后走冷取消语义(无 CANCELLED 回调派发,best-effort 契约)。
+                intent.rollbackVolatileState(oldStatus, oldUpdatedAt);
+                reconciler.removeHotCopyIfPresent(intentId);
+                logger.info("Hot cancel detected stale copy (disk advanced); delegating to cold path: id={}",
+                    intentId);
+                return cancelCold(intentId);
             }
 
             // 锁外：等 group-commit 落盘后再回收终态槽（VT 可正常 unmount）
@@ -131,6 +169,11 @@ final class IntentCanceler {
             logger.info("Intent cancelled: id={}", intentId);
             return true;
         } catch (RuntimeException e) {
+            if (stale) {
+                // F2(round 15): stale 委托路径(cancelCold)自身异常原样传播;禁止回滚/restore
+                //(本副本已 demote)。
+                throw e;
+            }
             logger.error("Failed to cancel intent: id={}", intentId, e);
             if (terminalPersisted) {
                 // C4-2: 提交后失败(awaitCommit 超时/回调 REE/指标/store 更新)——磁盘已 CANCELED
@@ -232,7 +275,7 @@ final class IntentCanceler {
                     persistence.awaitDurableCommit();       // cancel 恒 DURABLE
                 }
             } finally {
-                // identity 校验移除,见 releaseColdLock 契约。
+                // F1(round 15): release 为空操作(锁对象不移除,防 waiter 竞态),保留配对形态。
                 persistence.releaseColdLock(intentId, lock);
             }
         }
