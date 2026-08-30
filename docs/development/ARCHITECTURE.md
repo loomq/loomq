@@ -73,7 +73,7 @@ flowchart TB
     Recovery --> PD
 ```
 
-引擎启动顺序（`LoomqEngine.start()`）：`WheelRecovery.recover()` → `GroupCommitBarrier.start()` → `PromotionDaemon.start()` → `PrecisionScheduler.start()`。关闭顺序相反，且 `wheelStore.close()` 前会先 `forceDirty()` 强制脏桶落盘。
+引擎启动顺序（`LoomqEngine.start()`）：`WheelRecovery.recover()` → `GroupCommitBarrier.start()` → `PromotionDaemon.start()` → `PrecisionScheduler.start()` → `BucketReclaimer.start()`。关闭顺序相反，且 `wheelStore.close()` 前会先 `forceDirty()` 强制脏桶落盘。
 
 ## 3. 核心概念
 
@@ -129,6 +129,8 @@ stateDiagram-v2
 | STANDARD | 500 ms | 500 ms | 50 | 20 | 100 ms | 3 | 800 | DURABLE |
 | MILLI | 1 ms | 1 ms | 100 | 1（单发） | 1 ms | 8 | 1600 | DURABLE |
 
+扫描模式按档位画像（`PrecisionTierProfile.adaptiveScan`）二分：**adaptive 档（ULTRA/MILLI）** 为事件驱动扫描（见 §4.3），表中"扫描间隔"语义是保底 tick 上限与背压 park 长度，非固定轮询周期；**fixed-rate 档（FAST/STANDARD）** 的"扫描间隔"即固定轮询周期。
+
 `batchSize=1` 的档位（ULTRA/FAST/MILLI）走单 Intent 消费循环；其余走 `drainTo` 批量消费循环，调用 `DeliveryHandler.deliverBatchAsync()`。
 
 ### 3.3 冷 / 热分层
@@ -154,7 +156,7 @@ stateDiagram-v2
 
 ### 4.3 扫描 → 派发 → 消费闭环
 
-1. 每档扫描线程按 `scanIntervalMs` 调 `scanAndDispatch(tier)`：`BucketGroup.scanDue(now)` 取出到期 Intent，塞入该档有界派发队列（容量 = `maxConcurrency × 16`）。
+1. 每档一个扫描线程，按 `PrecisionTierProfile.adaptiveScan` 二分启动：**adaptive 档（ULTRA/MILLI）** 单平台线程事件驱动——park 到最早桶 `executeAt` 精确唤醒、新桶写入经 bucket-add listener `unpark`、空表以 `scanIntervalMs × 100` 保底 tick 兜底、背压时以 `scanIntervalMs` 有界 park 重试；**fixed-rate 档（FAST/STANDARD）** 按 `scanIntervalMs` 固定频率触发。两档均以 `BucketGroup.scanDue(now)` 取出到期 Intent，塞入该档有界派发队列（容量 = `maxConcurrency × 16`）。
 2. offer 重试 3 次仍失败即**背压**：记录指标、通知观察器（`BackPressureException`）、把 Intent 放回桶等待下一扫描周期（状态保持 SCHEDULED，不丢）。
 3. 批量消费者从队列取任务 → `acquireWithBorrow()` 拿信号量 → `deliverAsync / deliverBatchAsync`（30s `orTimeout`）→ 在异步回调中释放 permit 并 `finalizeIntent`：
    - `SUCCESS` → DELIVERED → ACKED，落盘终态；
@@ -216,7 +218,7 @@ stateDiagram-v2
 - `PromotionDaemon`：镜像 `CohortManager` 的 cohort 唤醒模型，单 platform 线程睡到 `executeAt - promotionLeadMs`（默认提前 60s），唤醒时**先复核索引**（`latest == handle.loc` 才继续——冷取消写入新 CANCELED 槽并改指索引后，旧 handle 直接作废，杜绝复活），再从 wheel 读槽（tail 则按 executeAtMs 扫描匹配 intentId）→ 非终态才回调 `onHotPromotion` → 幂等 `intentStore.upsert` + `scheduler.schedule`。
 - **冷取消**：`cancelIntent` 对不在内存的 Intent 走 `cancelCold`——tail 路径追加 TOMBSTONE + `awaitCommit`（以 `TailIndex.remove` 返回值门控并发）；wheel 路径按 intentId 细粒度锁串行化"重读索引 → 读槽 → transitionTo(CANCELED) → 写新槽 → **索引先指向新槽** → awaitCommit"，后到者重读到 terminal 态返回 false，杜绝 double-write。
 - **冷改期/冷 fireNow（round 13/14）**：`updateIntent` 对冷 Intent 走 `updateCold`，`fireNow` 对冷 Intent 走 `fireNowCold`——per-id 冷锁经 WheelPersistence 共享、复用 persistToWheel 写协议、cohort 安全网注册；promote↔冷命令的 TOCTOU 双向清理收口至 command 包 `ColdHotReconciler` 单一权威实现。冷 fireNow 把 executeAt 改写为 now 后立即热载投递，不跑 IntentValidator（镜像热 fireNow 路径）。
-- **F2 冷锁序列化点（round 15）**：per-id 冷锁（注册表在 `WheelPersistence.coldWriteLocks`，round 15 终审 F1 起锁对象永不移除——防 waiter 竞态）升格为**既有 Intent 的所有状态变更持久化写者**的序列化点——除上述冷命令外，热命令写者（updateIntent/fireNow/cancelIntent 的提交段、投递重试路径 `persistStateChangePutOnly`（round 15 终审 F6 起为单一守卫门面）、终态原地覆写 `persistTerminalInPlace`（F4）、create 失败补偿段（F5））写槽前在冷锁内复核后原子写；复核判据的唯一权威成文见 `WheelPersistence` 类头 F2 段，此处不复述。create 主写入路径（W8）例外不入冷锁——其 hasActiveDuplicate 活跃副本预检为既有守卫域。stale 热副本（磁盘已前进）由命令族还原调度字段 + demote 后委托冷路径 fresh 重放、投递路径跳过落盘并回滚本次 increment（磁盘最新态为权威；cancelCold 竞态子情形下权威为 CANCELED 终态槽，不再投递）。锁序：热路径 `synchronized(intent) → 冷锁`，冷命令路径的临界区仅碰 transient 解码副本、不取 intent 监视器（热守卫临界区 mutate 的是活对象，与此消歧；无死锁环）；`awaitCommit` 恒在 **intent 监视器**之外。冷命令路径在冷锁内 await 为 round 13 既有契约（per-id 锁非监视器，VT 可正常 unmount）。投递终态路径 `persistTerminalInPlace` 不走 revision 复核守卫（不加复核/不 skip——终态必落盘），但其 index.get→overwriteSlot 同 revision 平局窗口经冷锁互斥关闭（round 15 终审 F4）；残留仅为"终态 vs 后到冷写"的语义归属（投递已发生，终态胜出），非恢复仲裁不确定。
+- **F2 冷锁序列化点（round 15）**：per-id 冷锁（注册表在 `WheelPersistence.coldWriteLocks`，round 15 终审 F1 起锁对象永不移除——防 waiter 竞态）升格为**既有 Intent 的所有状态变更持久化写者**的序列化点——除上述冷命令外，热命令写者按复核语义分两族（与 `WheelPersistence` 类头 F2 段成文一致）：**复核族(W1-W4)**——updateIntent/fireNow/cancelIntent 的提交段、投递重试路径 `persistStateChangePutOnly`（round 15 终审 F6 起为单一守卫门面）——统一经 `WheelPersistence.writeFreshUnderColdLock`（round 16 原语收口）在冷锁内复核后原子写，复核判据的唯一权威成文见该原语 javadoc（类头 F2 段为指向句，此处不复述）；**互斥族(F4/F5)**——终态原地覆写 `persistTerminalInPlace`（F4）与 create 失败补偿段 `compensateCancel`（F5）——持冷锁互斥但**不做 revision 复核**（终态必落盘/补偿语义保持），归属残留见各自 javadoc。create 主写入路径（W8）例外不入冷锁——其 hasActiveDuplicate 活跃副本预检为既有守卫域。stale 热副本（磁盘已前进）由命令族还原调度字段 + demote 后委托冷路径 fresh 重放、投递路径跳过落盘并回滚本次 increment（磁盘最新态为权威；cancelCold 竞态子情形下权威为 CANCELED 终态槽，不再投递）。锁序：热路径 `synchronized(intent) → 冷锁`，冷命令路径的临界区仅碰 transient 解码副本、不取 intent 监视器（热守卫临界区 mutate 的是活对象，与此消歧；无死锁环）；`awaitCommit` 恒在 **intent 监视器**之外。冷命令路径在冷锁内 await 为 round 13 既有契约（per-id 锁非监视器，VT 可正常 unmount）。投递终态路径 `persistTerminalInPlace` 不走 revision 复核守卫（不加复核/不 skip——终态必落盘），但其 index.get→overwriteSlot 同 revision 平局窗口经冷锁互斥关闭（round 15 终审 F4）；残留仅为"终态 vs 后到冷写"的语义归属（投递已发生，终态胜出），非恢复仲裁不确定。
 
 ## 6. 恢复：WheelRecovery
 
@@ -234,7 +236,7 @@ stateDiagram-v2
 
 ```
 LoomqEngine.createIntent (虚拟线程异步)
-  └─ IntentCommandService.createIntent
+  └─ IntentCommandService.createIntent → IntentCreator.createIntent
        1. transitionTo(SCHEDULED), incrementRevision
        2. resolveWalMode(ackMode)                     // DURABLE / ASYNC / (REPLICATED→DURABLE)
        3. persistToWheel:
@@ -248,7 +250,7 @@ LoomqEngine.createIntent (虚拟线程异步)
             └─ 冷: promotionDaemon.register(intentId, loc, executeAtMs)
 ```
 
-失败回滚只清理内存态（调度器/store/cohort/索引）；已落盘的 wheel/tail 写入不回滚——与 DURABLE 语义一致（写成功即持久，恢复会重建）。
+失败回滚清理内存态（调度器/store/cohort/索引）并**补写 CANCELED 补偿终态**（round 15 F5 `IntentCreator.compensateCancel`：持冷锁互斥、不加 revision 复核，经 `persistToWheel` 落盘）——恢复期 max-revision 去重据此不复活半创建 Intent；补偿之外的已落盘 wheel/tail 写入不回滚，与 DURABLE 语义一致（写成功即持久，恢复会重建）。
 
 ## 8. SPI 扩展点
 
@@ -294,15 +296,15 @@ LoomqEngine.createIntent (虚拟线程异步)
 | 包 | 内容 |
 |----|------|
 | 根包 | `LoomqEngine`（builder 入口）、`LoomqEngineFactory` |
-| `application.command` | `IntentCommandService`（统一命令入口） |
-| `application.scheduler` | `PrecisionScheduler`、`CohortManager`、`BucketGroupManager`/`BucketGroup`、`ResizableSemaphore` |
+| `application.command` | `IntentCommandService`（统一命令入口，create/update/cancel/fireNow 委派）、`IntentCreator`/`IntentUpdater`/`IntentCanceler`（三类命令组件）、`WheelPersistence`（PHTW 写协议 + 簿记 + 冷锁守卫原语 `writeFreshUnderColdLock`）、`ColdHotReconciler`（promote↔冷命令双向清理）、`CallbackDispatcher`（callback 派发端口） |
+| `application.scheduler` | `PrecisionScheduler`（门面）及组件：`ScanCoordinator`（事件驱动/固定频率扫描 + 过期分频）、`DispatchPipeline`（档位消费循环 + 跨档借用）、`SettlementEngine`（结算/重试/死信/过期）、`StatePersistence`（StateChangeSink 包装，I6 容错收口）、`CohortManager`、`BucketGroupManager`/`BucketGroup`、`ResizableSemaphore`；端口与叶子：`Rescheduler`、`DeliverySettlement`、`StateChangeSink`、`RetryPolicy`、`ObserverNotifier`、`ExpiryIndex`、`DispatchLagTracker`、`InFlightCounters`、`DeferredOutcome`、`ChronoscopeSnapshot` |
 | `application.recovery` | `WheelRecovery`、`WheelRecoveryReport` |
-| `domain.intent` | `Intent`、`IntentStatus`、`PrecisionTier(+Catalog/Profile)`、`AckMode`、`WalMode`、`RedeliveryPolicy` 等 |
-| `infrastructure.wheel` | PHTW 全栈：`WheelStore`/`WheelTier`/`WheelConfig`/`SlotCodec`、`TailIndex`、`GroupCommitBarrier`、`IntentLocationIndex`、`PromotionDaemon` |
-| `store` | `IntentStore`、`ConcurrentIntentStore`、`ReadOnlyIntentStoreView`、幂等记录 |
+| `domain.intent` | `Intent`、`IntentStatus`、`PrecisionTier(+Catalog/Profile)`、`AckMode`、`WalMode`、`ExpiredAction`、`Callback`、`RedeliveryPolicy` 等 |
+| `infrastructure.wheel` | PHTW 全栈：`WheelStore`/`WheelTier`/`WheelConfig`/`SlotCodec`、`TailIndex`、`GroupCommitBarrier`、`IntentLocationIndex`、`PromotionDaemon`、`BucketReclaimer`，及 `SlotLocation`/`SlotEntry`/`ColdHandle`/`TailEntry` 与 `SlotOverflowException`/`BucketClosedException` |
+| `store` | `IntentStore`、`ConcurrentIntentStore`、`ReadOnlyIntentStoreView`、幂等记录（`IdempotencyRecord`/`IdempotencyResult`） |
 | `spi` | `DeliveryHandler`、`CallbackHandler`、`IntentObserver`、`RedeliveryDecider`、`DeliveryContext` |
-| `config` | `SchedulerConfig` 等配置记录 |
-| `common` / `metrics` / `tracing` | 指标（`MetricsCollector` 及各 registry）、校验、`IntentTrace(Store)`、异常体系 |
+| `config` | `ConfigSupport`（properties 解析工具） |
+| `common` / `tracing` | 指标（`MetricsCollector` 与 `OperationalMetricsRegistry`/`LatencyMetricsRegistry`/`PrecisionTierMetricsRegistry` 三 registry、`Histogram`）、校验（`IntentValidator`）、异常体系（`common.exception`）、`IntentTrace(Store)`（`tracing` 包） |
 
 ### 指标导出(round 12 收敛)
 

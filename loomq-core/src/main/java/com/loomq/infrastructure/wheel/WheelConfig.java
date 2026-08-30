@@ -33,14 +33,14 @@ public record WheelConfig(
         requirePositive(compactionThresholdBytes, "compactionThresholdBytes");
     }
 
-    /** Convenience 7-arg constructor: defaults bucketRetentionMs and compactionThresholdBytes. */
+    /** 便捷 7 参构造:bucketRetentionMs 与 compactionThresholdBytes 取默认值。 */
     public WheelConfig(String dataDir, int horizonDays, int slotsPerBucket,
                        long groupCommitIntervalMs, long awaitCommitTimeoutMs,
                        long hotBoundaryMs, long promotionLeadMs) {
         this(dataDir, horizonDays, slotsPerBucket, groupCommitIntervalMs,
              awaitCommitTimeoutMs, hotBoundaryMs, promotionLeadMs,
-             (long) horizonDays * 24 * 60 * 60_000L + 24 * 60 * 60_000L,  // horizon + 1 day safety margin
-             512L * 1024 * 1024);  // 512 MB
+             (long) horizonDays * 24 * 60 * 60_000L + 24 * 60 * 60_000L,  // 视界 + 1 天安全余量
+             512L * 1024 * 1024);  // 512 MB(TailIndex run 文件 compaction 阈值)
     }
 
     public static WheelConfig defaultConfig() {

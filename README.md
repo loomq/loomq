@@ -18,7 +18,7 @@
 - **持久化内核，重启不丢** — 基于 PHTW（持久化分层时间轮：4 层 mmap 时间轮 + TailIndex）落盘，**无 WAL、无快照**，重启扫描重建。
 - **四档精度** — `MILLI`(1ms) / `ULTRA`(10ms) / `FAST`(50ms) / `STANDARD`(500ms)，按需取舍吞吐与触发精度。
 - **冷 / 热分层** — 60 分钟热窗口驻留内存；更远的冷 Intent 只落盘、不占内存，靠 `PromotionDaemon` 提前唤醒。
-- **虚拟线程并发 — 消费者/操作执行基于 Virtual Threads，无传统线程池调参；扫描/回收 daemon 为平台线程。
+- **虚拟线程并发** — 消费者/操作执行基于 Virtual Threads，无传统线程池调参；扫描/回收 daemon 为平台线程。
 - **崩溃恢复** — `WheelRecovery` 扫描重建，终态不补投，避免对下游产生过时事件。
 - **重试编排 + 死信 + 过期处理** — 内置重投退避、`DEAD_LETTER`、`EXPIRED` 分支。
 - **SPI 扩展点** — `DeliveryHandler` / `CallbackHandler` / `IntentObserver` / `RedeliveryDecider`，内核不内置任何投递机制。

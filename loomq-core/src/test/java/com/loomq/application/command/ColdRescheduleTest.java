@@ -36,8 +36,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 /**
  * 冷改期(round 13):updateIntent 对冷 Intent 生效。
- * 夹具镜像 CancelColdConcurrencyTest,但用真实时钟——updateCold 路由以
- * System.currentTimeMillis() 判热窗口,假时钟会把未来 Intent 判成过期。
+ * 夹具:共享 CommandStackFx(Options 真实时钟旋钮)——updateCold 路由以
+ * System.currentTimeMillis() 判热窗口,假时钟会把未来 Intent 判成过期,故不可用假时钟。
  */
 class ColdRescheduleTest {
     private static final long HOT_BOUNDARY_MS = 60L * 60_000L;

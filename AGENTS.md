@@ -30,6 +30,7 @@ mvn test -Dtest=ClassName#methodName  # single test method
 benchmark/scripts/benchmark.ps1          # Windows full suite
 benchmark/scripts/benchmark.ps1 -Quick   # quick validation
 ./benchmark/scripts/benchmark.sh         # Linux/macOS
+./benchmark/scripts/benchmark.sh --quick  # quick validation
 
 # Pre-push gate (same checks CI runs)
 make check                     # check-format + test
@@ -42,7 +43,7 @@ Tests are categorized with `@Tag` annotations. Maven Surefire uses `groups`/`exc
 | Tag | Maven Profile | What |
 |-----|--------------|------|
 | *(none)* | default / `fast-tests` | Fast unit tests, always run |
-| `slow` | `slow-tests` | PrecisionSchedulerTest, LoomqEnginePhtwRecoveryTest |
+| `slow` | `slow-tests` | 慢速竞态/恢复/背压测试(类级与方法级 `@Tag("slow")` 混合,如 PrecisionSchedulerTest、HotColdStraddleTest、LoomqEnginePhtwRecoveryTest;完整清单以 `mvn test -Pslow-tests` 实际运行为准) |
 | `integration` | `integration-tests` | Engine-level tests (mutation isolation, lock-free dispatch, recovery) |
 | `benchmark` | (included in `full-tests`) | Performance benchmarks |
 
@@ -70,9 +71,9 @@ loomq-core (embeddable kernel, zero HTTP/JSON deps)
     └── SPI interfaces        — DeliveryHandler, CallbackHandler, IntentObserver, RedeliveryDecider
 ```
 
-**Intent lifecycle:** CREATED → SCHEDULED → DUE → DISPATCHING → DELIVERED → ACKED (branches: CANCELLED, EXPIRED, DEAD_LETTERED)
+**Intent lifecycle:** CREATED → SCHEDULED → DUE → DISPATCHING → DELIVERED → ACKED (branches: CANCELED, EXPIRED, DEAD_LETTERED)
 
-**Four precision tiers:** ULTRA(10ms, 200 slots), FAST(50ms, 150 slots), STANDARD(500ms, 50 slots), MILLI(1ms) —— 事件驱动扫描,毫秒级触发(cohort 旁路直插桶).
+**Four precision tiers:** ULTRA(10ms, 200 slots), FAST(50ms, 150 slots), STANDARD(500ms, 50 slots), MILLI(1ms) —— `ULTRA`/`MILLI` 事件驱动自适应扫描,`FAST`/`STANDARD` 固定轮询;`MILLI` cohort 旁路直插桶,毫秒级触发.
 
 ## Key Design Decisions
 
