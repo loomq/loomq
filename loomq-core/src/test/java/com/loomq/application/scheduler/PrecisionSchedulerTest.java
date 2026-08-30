@@ -231,19 +231,6 @@ class PrecisionSchedulerTest {
         assertDoesNotThrow(() -> scheduler.restore(intent));
     }
 
-    // ========== unschedule() ==========
-
-    @Test
-    void unscheduleShouldDelegateToBucketGroupManager() {
-        DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
-        scheduler = new PrecisionScheduler(intentStore, handler, null);
-        Intent intent = new Intent("test-unsched");
-        intent.setExecuteAt(Instant.now().plusSeconds(60));
-        intent.transitionTo(IntentStatus.SCHEDULED);
-        scheduler.schedule(intent);
-        assertDoesNotThrow(() -> scheduler.unschedule(intent));
-    }
-
     // ========== Backpressure ==========
 
     @Test

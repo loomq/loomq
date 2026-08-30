@@ -2,7 +2,6 @@ package com.loomq.infrastructure.wheel;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import com.loomq.domain.intent.PrecisionTier;
 import org.junit.jupiter.api.Test;
 
 class WheelConfigTest {
@@ -12,25 +11,18 @@ class WheelConfigTest {
         assertEquals(30, c.horizonDays());
         assertEquals(1024, c.slotsPerBucket());
         assertEquals(1, c.groupCommitIntervalMs());
-        assertEquals(PrecisionTier.STANDARD, c.defaultTier());
     }
 
     @Test
     void rejectsNonPositiveHorizon() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 0, 1024, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", 0, 1024, 1, 10_000L, 60L * 60_000L, 60_000L));
     }
 
     @Test
     void rejectsBlankDataDir() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("  ", "shard-0", 30, 1024, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
-    }
-
-    @Test
-    void rejectsBlankShardId() {
-        assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "  ", 30, 1024, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("  ", 30, 1024, 1, 10_000L, 60L * 60_000L, 60_000L));
     }
 
     @Test
@@ -42,7 +34,7 @@ class WheelConfigTest {
     @Test
     void rejectsNonPositiveAwaitCommitTimeout() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 0, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", 30, 1024, 1, 0, 60L * 60_000L, 60_000L));
     }
 
     @Test
@@ -55,12 +47,12 @@ class WheelConfigTest {
     @Test
     void rejectsNonPositiveHotBoundary() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 10_000L, 0, 60_000L, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", 30, 1024, 1, 10_000L, 0, 60_000L));
     }
 
     @Test
     void rejectsNonPositivePromotionLead() {
         assertThrows(IllegalArgumentException.class,
-            () -> new WheelConfig("./data", "shard-0", 30, 1024, 1, 10_000L, 60L * 60_000L, 0, PrecisionTier.STANDARD));
+            () -> new WheelConfig("./data", 30, 1024, 1, 10_000L, 60L * 60_000L, 0));
     }
 }

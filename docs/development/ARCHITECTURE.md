@@ -268,14 +268,13 @@ LoomqEngine.createIntent (虚拟线程异步)
 | 配置键（properties） | 默认值 | 含义 |
 |------|------|------|
 | `wheel.data_dir` | `./data/wheel` | PHTW 数据根目录 |
-| `wheel.shard_id` | `shard-0` | 分片标识 |
 | `wheel.horizon_days` | `30` | day 轮视界（天） |
 | `wheel.slots_per_bucket` | `1024` | 每桶槽位数 |
 | `wheel.group_commit_interval_ms` | `1` | group-commit 周期（ASYNC 崩溃窗口上限） |
 | `wheel.await_commit_timeout_ms` | `10000` | DURABLE 等待超时（超时走内联 force 兜底） |
 | `wheel.hot_boundary_ms` | `3600000`（60min） | 冷/热分界（创建与恢复共用） |
 | `wheel.promotion_lead_ms` | `60000`（60s） | 冷→热提升提前量 |
-| `wheel.default_tier` | `STANDARD` | 默认精度档 |
+| `wheel.default_tier` | `STANDARD` | 引擎级默认精度档（经 LoomqEngineFactory 直读生效；WheelConfig 不再承载该语义） |
 | `wheel.bucket_retention_ms`（record-only） | `horizon + 1 天` | BucketReclaimer 桶文件保留期（超期且无引用时删除） |
 | `wheel.compaction_threshold_bytes`（record-only） | `536870912`（512MB） | TailIndex run 文件 compaction 阈值 |
 
@@ -296,7 +295,7 @@ LoomqEngine.createIntent (虚拟线程异步)
 |----|------|
 | 根包 | `LoomqEngine`（builder 入口）、`LoomqEngineFactory` |
 | `application.command` | `IntentCommandService`（统一命令入口） |
-| `application.scheduler` | `PrecisionScheduler`、`CohortManager`、`BucketGroupManager`/`BucketGroup`、`ResizableSemaphore`、`TierAdvisor` |
+| `application.scheduler` | `PrecisionScheduler`、`CohortManager`、`BucketGroupManager`/`BucketGroup`、`ResizableSemaphore` |
 | `application.recovery` | `WheelRecovery`、`WheelRecoveryReport` |
 | `domain.intent` | `Intent`、`IntentStatus`、`PrecisionTier(+Catalog/Profile)`、`AckMode`、`WalMode`、`RedeliveryPolicy` 等 |
 | `infrastructure.wheel` | PHTW 全栈：`WheelStore`/`WheelTier`/`WheelConfig`/`SlotCodec`、`TailIndex`、`GroupCommitBarrier`、`IntentLocationIndex`、`PromotionDaemon` |

@@ -3,26 +3,11 @@ package com.loomq.application.command;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.loomq.application.scheduler.PrecisionScheduler;
-import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
-import com.loomq.domain.intent.PrecisionTierCatalog;
-import com.loomq.infrastructure.wheel.GroupCommitBarrier;
-import com.loomq.infrastructure.wheel.IntentLocationIndex;
-import com.loomq.infrastructure.wheel.PromotionDaemon;
-import com.loomq.infrastructure.wheel.TailIndex;
-import com.loomq.infrastructure.wheel.WheelConfig;
-import com.loomq.infrastructure.wheel.WheelStore;
-import com.loomq.spi.DeliveryHandler.DeliveryResult;
-import com.loomq.store.ConcurrentIntentStore;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -46,49 +31,25 @@ class BugTailStaleRecordAfterWheelMigrationTest {
     @Test
     void wheelMigrationMustRemoveStaleTailRecord() throws Exception {
         AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L,
-            PrecisionTier.STANDARD);
-        try (WheelStore store = new WheelStore(cfg, clock::get);
-             TailIndex tail = new TailIndex(tmp, clock::get);
-             GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000)) {
-
-            IntentLocationIndex idx = new IntentLocationIndex();
-            ConcurrentIntentStore memStore = new ConcurrentIntentStore();
-            AtomicBoolean running = new AtomicBoolean(true);
-            AtomicLong seq = new AtomicLong();
-            MetricsCollector mc = new MetricsCollector();
-            PrecisionScheduler scheduler = new PrecisionScheduler(memStore, i ->
-                CompletableFuture.completedFuture(DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> {}, 60_000L);
-            ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
-            IntentCommandService svc = new IntentCommandService(
-                memStore, scheduler,
-                new IntentCommandService.PhtwStack(store, tail, barrier, idx, daemon),
-                mc, cb, running, seq, null,
-                new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, 60L * 60_000L,
-                    PrecisionTierCatalog.defaultCatalog()),
-                new com.loomq.tracing.IntentTraceStore());
-            barrier.start();
-            daemon.start();
-            scheduler.start();
+        try (CommandStackFx fx = new CommandStackFx(tmp,
+                new CommandStackFx.Options(clock::get, null, false, true))) {
 
             String id = "r21-tail-wheel-0001";
             Intent cold = new Intent(id);
             cold.setExecuteAt(Instant.ofEpochMilli(clock.get() + 40L * 24 * 3600 * 1000)); // +40d → 超 30d 视界
             cold.setPrecisionTier(PrecisionTier.STANDARD);
-            svc.createIntent(cold, AckMode.DURABLE);
-            assertEquals(1, tail.size(), "cold intent must land in tail (beyond day-wheel horizon)");
+            fx.svc().createIntent(cold, AckMode.DURABLE);
+            assertEquals(1, fx.tail().size(), "cold intent must land in tail (beyond day-wheel horizon)");
 
             // 模拟 PromotionDaemon 提升:载入内存 + 调度(真实提升路径即此两步)
-            memStore.save(cold);
-            scheduler.schedule(cold);
-            assertTrue(svc.fireNow(id), "promoted intent must be fire-now-able");
+            fx.memStore().save(cold);
+            fx.scheduler().schedule(cold);
+            assertTrue(fx.svc().fireNow(id), "promoted intent must be fire-now-able");
 
             // 修复前:wheel 新槽写入但 tail 旧记录残留(size 恒 1);
             // 修复后:tail→wheel 迁移清除旧记录,tail 归零。
-            assertEquals(0, tail.size(),
+            assertEquals(0, fx.tail().size(),
                 "tail→wheel migration must remove the stale tail record (leftover would resurrect on recovery)");
-            cb.shutdown();
         }
     }
 }

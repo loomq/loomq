@@ -29,10 +29,8 @@ final class PrecisionTierMetricsRegistry {
     private final Map<PrecisionTier, AtomicLong> backpressureEventsByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, Histogram> wakeupLatencyByTier = new EnumMap<>(PrecisionTier.class);
 
-    // 三级漏斗：offer_failed → backpressure_events → abandoned
+    // 队满 offer 失败与背压事件计数(retry/abandoned 恒零死指标已删,round 16)
     private final Map<PrecisionTier, AtomicLong> dispatchQueueOfferFailedByTier = new EnumMap<>(PrecisionTier.class);
-    private final Map<PrecisionTier, AtomicLong> dispatchQueueRetryByTier = new EnumMap<>(PrecisionTier.class);
-    private final Map<PrecisionTier, AtomicLong> dispatchQueueAbandonedByTier = new EnumMap<>(PrecisionTier.class);
 
     // 队列深度 gauge
     private final Map<PrecisionTier, AtomicLong> dispatchQueueSizeByTier = new EnumMap<>(PrecisionTier.class);
@@ -58,8 +56,6 @@ final class PrecisionTierMetricsRegistry {
             wakeupLatencyByTier.put(tier, new Histogram(LATENCY_BOUNDS));
 
             dispatchQueueOfferFailedByTier.put(tier, new AtomicLong(0));
-            dispatchQueueRetryByTier.put(tier, new AtomicLong(0));
-            dispatchQueueAbandonedByTier.put(tier, new AtomicLong(0));
             dispatchQueueSizeByTier.put(tier, new AtomicLong(0));
             milliFallbackByTier.put(tier, new AtomicLong(0));
             scannerParkByTier.put(tier, new AtomicLong(0));
@@ -68,16 +64,8 @@ final class PrecisionTierMetricsRegistry {
         }
     }
 
-    PrecisionTierCatalog precisionTierCatalog() {
-        return precisionTierCatalog;
-    }
-
     void incrementIntentByTier(PrecisionTier tier) {
         resolveCounter(intentByTier, tier).incrementAndGet();
-    }
-
-    void incrementIntentDueByTier(PrecisionTier tier) {
-        resolveCounter(intentDueByTier, tier).incrementAndGet();
     }
 
     void addIntentDueByTier(PrecisionTier tier, int count) {
@@ -115,14 +103,6 @@ final class PrecisionTierMetricsRegistry {
         resolveCounter(dispatchQueueOfferFailedByTier, tier).incrementAndGet();
     }
 
-    void incrementDispatchQueueRetry(PrecisionTier tier) {
-        resolveCounter(dispatchQueueRetryByTier, tier).incrementAndGet();
-    }
-
-    void incrementDispatchQueueAbandoned(PrecisionTier tier) {
-        resolveCounter(dispatchQueueAbandonedByTier, tier).incrementAndGet();
-    }
-
     void updateDispatchQueueSizeByTier(PrecisionTier tier, long size) {
         resolveCounter(dispatchQueueSizeByTier, tier).set(size);
     }
@@ -139,18 +119,6 @@ final class PrecisionTierMetricsRegistry {
 
     long getDispatchQueueOfferFailed(PrecisionTier tier) {
         return resolveCounter(dispatchQueueOfferFailedByTier, tier).get();
-    }
-
-    long getDispatchQueueRetry(PrecisionTier tier) {
-        return resolveCounter(dispatchQueueRetryByTier, tier).get();
-    }
-
-    long getDispatchQueueAbandoned(PrecisionTier tier) {
-        return resolveCounter(dispatchQueueAbandonedByTier, tier).get();
-    }
-
-    long getDispatchQueueSize(PrecisionTier tier) {
-        return resolveCounter(dispatchQueueSizeByTier, tier).get();
     }
 
     long calculateP95WakeupLatencyByTier(PrecisionTier tier) {
@@ -201,12 +169,6 @@ final class PrecisionTierMetricsRegistry {
     Map<PrecisionTier, Long> getIntentCountsByTier() {
         Map<PrecisionTier, Long> result = new EnumMap<>(PrecisionTier.class);
         intentByTier.forEach((tier, count) -> result.put(tier, count.get()));
-        return result;
-    }
-
-    Map<PrecisionTier, Long> getBucketSizesByTier() {
-        Map<PrecisionTier, Long> result = new EnumMap<>(PrecisionTier.class);
-        bucketSizeByTier.forEach((tier, count) -> result.put(tier, count.get()));
         return result;
     }
 
@@ -277,7 +239,7 @@ final class PrecisionTierMetricsRegistry {
         }
         sb.append("\n");
 
-        // 三级漏斗：backpressure 指标
+        // 背压指标(offer_failed → backpressure_events)
         sb.append("# HELP loomq_dispatch_queue_offer_failed_total Dispatch queue offer failures (queue full) by precision tier\n");
         sb.append("# TYPE loomq_dispatch_queue_offer_failed_total counter\n");
         for (PrecisionTier tier : precisionTierCatalog.supportedTiers()) {
@@ -296,28 +258,6 @@ final class PrecisionTierMetricsRegistry {
               .append(tier.name().toLowerCase())
               .append("\"} ")
               .append(resolveCounter(backpressureEventsByTier, tier).get())
-              .append("\n");
-        }
-        sb.append("\n");
-
-        sb.append("# HELP loomq_dispatch_queue_retry_total Semaphore acquisition retries by precision tier\n");
-        sb.append("# TYPE loomq_dispatch_queue_retry_total counter\n");
-        for (PrecisionTier tier : precisionTierCatalog.supportedTiers()) {
-            sb.append("loomq_dispatch_queue_retry_total{precision_tier=\"")
-              .append(tier.name().toLowerCase())
-              .append("\"} ")
-              .append(resolveCounter(dispatchQueueRetryByTier, tier).get())
-              .append("\n");
-        }
-        sb.append("\n");
-
-        sb.append("# HELP loomq_dispatch_queue_abandoned_total Batches abandoned after max retries by precision tier\n");
-        sb.append("# TYPE loomq_dispatch_queue_abandoned_total counter\n");
-        for (PrecisionTier tier : precisionTierCatalog.supportedTiers()) {
-            sb.append("loomq_dispatch_queue_abandoned_total{precision_tier=\"")
-              .append(tier.name().toLowerCase())
-              .append("\"} ")
-              .append(resolveCounter(dispatchQueueAbandonedByTier, tier).get())
               .append("\n");
         }
         sb.append("\n");

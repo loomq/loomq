@@ -165,8 +165,7 @@ class LoomqEnginePhtwIntegrationTest {
     @DisplayName("冷改期跨重启:改期后的 executeAt/内容在恢复后按新时间投递恰好一次")
     void coldRescheduleSurvivesRestartAndDeliversOnceAtNewTime() throws Exception {
         // hotBoundary=1s:+15s 冷(>1s);改期到 +8s(更新时仍冷);promotionLead=100ms——秒级完成 E2E
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 1_000L, 100L,
-            PrecisionTier.STANDARD);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L, 1_000L, 100L);
         String id = "intent_rst00000001";
         LoomqEngine engine = LoomqEngine.builder().wheelConfig(cfg)
             .deliveryHandler(it -> java.util.concurrent.CompletableFuture.completedFuture(
@@ -216,8 +215,7 @@ class LoomqEnginePhtwIntegrationTest {
     @DisplayName("冷 fireNow:立即热载投递恰好一次,内容保持")
     void coldFireNowDeliversImmediatelyOnce() throws Exception {
         // hotBoundary=1s:+3600s 冷;fireNow 后 executeAt=now → 立即热载投递
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 1_000L, 100L,
-            PrecisionTier.STANDARD);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L, 1_000L, 100L);
         String id = "intent_fnow0000001";
         CountDownLatch delivered = new CountDownLatch(1);
         AtomicInteger deliveryCount = new AtomicInteger();

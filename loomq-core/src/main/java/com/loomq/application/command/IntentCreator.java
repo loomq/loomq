@@ -180,6 +180,11 @@ final class IntentCreator {
      * 串行化后并发冷命令锁内重读索引见 CANCELED 槽 → 当不存在收敛,安全。补偿语义保持
      * (不加 revision 复核);临界区内 awaitCommit 与 cancelCold 既有契约一致
      * (per-id 锁非监视器,VT 可正常 unmount)。</p>
+     *
+     * <p>F5 残留记档(round 16):「冷命令先手」窄窗平局仍在——冷命令的完整临界区若落于
+     * create persist(R1)与补偿段之间,补偿可与冷命令同 revision 平局;后到补偿终态覆写
+     * 胜出,归属语义与 F4 残留同构(创建已失败,补偿 CANCELED 即磁盘权威)。R8 式 revision
+     * 种子(补偿前将 revision 抬到磁盘历史最高之上)属行为变更,评估移交 r18 审计轮。</p>
      */
     private void compensateCancel(Intent intent) {
         try {

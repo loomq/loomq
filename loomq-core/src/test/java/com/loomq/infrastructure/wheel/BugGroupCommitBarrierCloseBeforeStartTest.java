@@ -18,8 +18,8 @@ class BugGroupCommitBarrierCloseBeforeStartTest {
 
     @Test
     void closeBeforeStartMustShutdownInlineForceExecutor() throws Exception {
-        WheelConfig config = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L,
-            60L * 60_000L, 60_000L, null);
+        WheelConfig config = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L,
+            60L * 60_000L, 60_000L);
         GroupCommitBarrier barrier = new GroupCommitBarrier(
             new WheelStore(config, System::currentTimeMillis),
             new TailIndex(tmp, System::currentTimeMillis),

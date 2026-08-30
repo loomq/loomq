@@ -365,15 +365,6 @@ public class PrecisionScheduler {
     }
 
     /**
-     * 从调度桶中移除 Intent。
-     *
-     * @param intent Intent 实例
-     */
-    public void unschedule(Intent intent) {
-        bucketGroupManager.remove(intent);
-    }
-
-    /**
      * 恢复 Intent 到调度器。
      *
      * 恢复路径不走创建时的状态机约束，但保留 delay-based 路由：

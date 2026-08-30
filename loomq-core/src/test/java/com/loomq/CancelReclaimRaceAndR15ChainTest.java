@@ -45,8 +45,7 @@ class CancelReclaimRaceAndR15ChainTest {
         String id = "r15-race-0001";
         Path dir = tmp.resolve("race");
         // 10s 组提交间隔:拉开 awaitCommit 窗口,使重建确定性地落在窗口内
-        com.loomq.infrastructure.wheel.WheelConfig cfg = new com.loomq.infrastructure.wheel.WheelConfig(
-            dir.toString(), "t", 30, 16, 10_000L, 10_000L, 60L * 60_000L, 60_000L, null);
+        com.loomq.infrastructure.wheel.WheelConfig cfg = new com.loomq.infrastructure.wheel.WheelConfig(dir.toString(), 30, 16, 10_000L, 10_000L, 60L * 60_000L, 60_000L);
 
         try (LoomqEngine engine = LoomqEngine.builder()
                 .wheelConfig(cfg).nodeId("e1").deliveryHandler(SUCCESS).build()) {

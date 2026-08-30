@@ -53,14 +53,13 @@ public final class LoomqEngineFactory {
             logger.warn("Property loomq.walDir/loomq.wal.dir is deprecated; use loomq.dataDir");
         }
 
-        // 读 wheel.* 属性(horizonDays/slots/groupCommitInterval/awaitCommitTimeout/hotBoundary/promotionLead/defaultTier/shardId),
+        // 读 wheel.* 属性(horizonDays/slots/groupCommitInterval/awaitCommitTimeout/hotBoundary/promotionLead/defaultTier),
         // 再用顶层 dataDir 覆盖 wheel.data_dir(保持现行行为:顶层目录赢)
         WheelConfig wheelConfig = WheelConfig.fromProperties(props).withDataDir(dataDir);
         builder.wheelConfig(wheelConfig);
 
         // wheel.default_tier 显式配置 → 引擎级默认档(与 Builder.defaultTier 同语义)。
-        // 此前 WheelConfig.defaultTier 被 LoomqEngine 构造完全忽略(只读 builder.defaultTier,
-        // 工厂路径恒 null)——Properties 配置的默认档静默失效。
+        // (round 16 起 WheelConfig 不再承载 defaultTier 组件;本工厂直读属性是该语义的唯一载体。)
         String defaultTier = props.getProperty("wheel.default_tier", props.getProperty("wheel.defaultTier"));
         if (defaultTier != null && !defaultTier.isBlank()) {
             builder.defaultTier(PrecisionTier.fromString(defaultTier));

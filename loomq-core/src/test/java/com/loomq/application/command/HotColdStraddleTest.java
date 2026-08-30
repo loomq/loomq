@@ -40,10 +40,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -52,114 +50,23 @@ import org.junit.jupiter.api.io.TempDir;
 /**
  * F2 冷热写者 straddle 收口(round 15):热写者(updateIntent/fireNow/cancel)在 per-id 冷锁内
  * 复核 revision 后原子写;stale 热副本(在途 promote 旧副本被并发冷写者推进)委托冷路径
- * fresh 重放,杜绝同 revision 双写。夹具镜像 ColdRescheduleTest.Fx(真实组件、真实时钟)。
+ * fresh 重放,杜绝同 revision 双写。夹具为共享 CommandStackFx(真实组件、真实时钟,
+ * seedMaxRevisions=true——recovery 种子是 W1-W3 守卫复核的前提)。
  */
 class HotColdStraddleTest {
     private static final long HOT_BOUNDARY_MS = 60L * 60_000L;
     private static final long PROMOTION_LEAD_MS = 60_000L;
 
+    /** Straddle 场景固定旋钮:系统时钟 + recovery 种子(markMaxRevisions,守卫前提)+ 启动全件。 */
+    private static final CommandStackFx.Options STRADDLE_FX_OPTS =
+        new CommandStackFx.Options(System::currentTimeMillis, null, true, true);
+
     @TempDir Path tmp;
-
-    /** 测试夹具:promote 回调可注入(null = no-op);组件与 ColdRescheduleTest.Fx 同构。 */
-    private static final class Fx implements AutoCloseable {
-        final WheelStore store;
-        final TailIndex tail;
-        final GroupCommitBarrier barrier;
-        final IntentLocationIndex idx;
-        final ConcurrentIntentStore memStore;
-        final PrecisionScheduler scheduler;
-        final PromotionDaemon daemon;
-        final IntentCommandService svc;
-
-        Fx(Path dir, BiConsumer<Intent, SlotLocation> onHotPromotion) {
-            WheelConfig cfg = new WheelConfig(dir.toString(), "t", 30, 16, 1, 10_000L,
-                HOT_BOUNDARY_MS, PROMOTION_LEAD_MS, PrecisionTier.STANDARD);
-            store = new WheelStore(cfg, System::currentTimeMillis);
-            tail = new TailIndex(dir, System::currentTimeMillis);
-            barrier = new GroupCommitBarrier(store, tail, 1, 10_000);
-            idx = new IntentLocationIndex();
-            memStore = new ConcurrentIntentStore();
-            AtomicBoolean running = new AtomicBoolean(true);
-            AtomicLong seq = new AtomicLong();
-            scheduler = new PrecisionScheduler(memStore, intent ->
-                CompletableFuture.completedFuture(DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            daemon = new PromotionDaemon(store, tail, idx, System::currentTimeMillis,
-                onHotPromotion != null ? onHotPromotion : (i, l) -> { }, PROMOTION_LEAD_MS);
-            svc = new IntentCommandService(memStore, scheduler,
-                new IntentCommandService.PhtwStack(store, tail, barrier, idx, daemon),
-                new MetricsCollector(), java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor(),
-                running, seq, null,
-                new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, HOT_BOUNDARY_MS,
-                    PrecisionTierCatalog.defaultCatalog()),
-                new IntentTraceStore());
-            barrier.start();
-            daemon.start();
-            scheduler.start();
-        }
-
-        /** 冷 Intent 落 wheel(+2h,revision=1,不进 memStore),镜像 ColdRescheduleTest plant。
-         *  同时按 recovery 语义种子 maxRevisions(磁盘历史最高 revision)——W1-W3 守卫的
-         *  maxRevisionOf 复核缝读的是该簿记映射,真实冷写者经 trackMaxRevision 维护。 */
-        Intent plantColdWheel(String id, Map<String, String> tags) {
-            Intent cold = new Intent(id);
-            cold.setExecuteAt(Instant.now().plus(2, ChronoUnit.HOURS));
-            cold.setPrecisionTier(PrecisionTier.STANDARD);
-            cold.transitionTo(IntentStatus.SCHEDULED);
-            cold.incrementRevision();
-            if (tags != null) {
-                cold.setTags(tags);
-            }
-            SlotLocation loc = store.put(cold);
-            idx.put(cold.getIntentId(), loc);
-            svc.markMaxRevisions(Map.of(cold.getIntentId(), (long) cold.getRevision()));
-            return cold;
-        }
-
-        /** 冷写者推进磁盘:直写新槽(新内容)+ 索引改指 + maxRevisions 种子(模拟 updateCold
-         *  的完整磁盘效果:真实冷写者经 persistToWheel→trackMaxRevision 推进簿记映射)。 */
-        SlotLocation advanceDisk(Intent base, Map<String, String> tags) {
-            Intent newer = base.copy();
-            newer.setTags(tags);
-            newer.incrementRevision();
-            SlotLocation loc = store.put(newer);
-            idx.put(newer.getIntentId(), loc);
-            svc.markMaxRevisions(Map.of(newer.getIntentId(), (long) newer.getRevision()));
-            return loc;
-        }
-
-        /** 植入 stale 热副本(镜像在途 promote:upsert + schedule,旧 revision 副本)。 */
-        void plantStaleHot(Intent oldCopy) {
-            memStore.upsert(oldCopy);
-            scheduler.schedule(oldCopy);
-        }
-
-        /** 植入 hot 副本并进调度结构(磁盘与内存同 revision——fresh 场景)。 */
-        void plantHotSync(Intent copy) {
-            memStore.upsert(copy);
-            scheduler.schedule(copy);
-        }
-
-        IntentCommandService svc() { return svc; }
-
-        ConcurrentIntentStore memStore() { return memStore; }
-
-        IntentLocationIndex idx() { return idx; }
-
-        WheelStore store() { return store; }
-
-        @Override public void close() {
-            scheduler.stop();
-            daemon.close();
-            barrier.close();
-            tail.close();
-            store.close();
-        }
-    }
 
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W1:磁盘已前进 → 热 updateIntent 委托冷路径 fresh 重放,revision 线性无平局")
     void hotUpdateOnStaleCopyDelegatesToColdPath() {
-        try (Fx fx = new Fx(tmp.resolve("w1stale"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w1stale"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w1stale001", Map.of("v", "r0"));
             fx.advanceDisk(planted, Map.of("v", "r2"));
             fx.plantStaleHot(planted);   // 内存 stale 副本 R1(镜像在途 promote 载入)
@@ -184,7 +91,7 @@ class HotColdStraddleTest {
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W1 fresh 路径:磁盘未前进 → 行为与现状一致(直写新槽)")
     void hotUpdateOnFreshCopyWritesDirectly() {
-        try (Fx fx = new Fx(tmp.resolve("w1fresh"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w1fresh"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w1fresh01", Map.of("v", "r0"));
             fx.plantHotSync(planted);   // 内存副本 R1 = 磁盘 R1,fresh
 
@@ -202,7 +109,7 @@ class HotColdStraddleTest {
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W1:委托重放中 updater 抛 IAE → 原样传播,不复活 demote 的 stale 副本")
     void delegatedReplayFailurePropagatesWithoutResurrectingStaleCopy() {
-        try (Fx fx = new Fx(tmp.resolve("w1iaefail"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w1iaefail"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w1iaef001", Map.of("v", "r0"));
             fx.advanceDisk(planted, Map.of("v", "r2"));
             fx.plantStaleHot(planted);
@@ -234,7 +141,7 @@ class HotColdStraddleTest {
     }
 
     /** 全轮扫描取该 intentId 的最高 revision 槽内容——冷取消成功后索引已清,权威终态槽以此定位。 */
-    private static Intent maxRevisionSlotFor(Fx fx, String intentId) {
+    private static Intent maxRevisionSlotFor(CommandStackFx fx, String intentId) {
         Intent best = null;
         var slots = fx.store().scanSlotsFrom(Instant.now().minusSeconds(60));
         while (slots.hasNext()) {
@@ -250,7 +157,7 @@ class HotColdStraddleTest {
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W2:磁盘已前进 → 热 fireNow demote stale 副本并委托冷 fireNow")
     void hotFireNowOnStaleCopyDelegatesToColdFireNow() {
-        try (Fx fx = new Fx(tmp.resolve("w2stale"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w2stale"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w2stale001", Map.of("v", "r0"));
             fx.advanceDisk(planted, Map.of("v", "r2"));
             fx.plantStaleHot(planted);
@@ -271,7 +178,7 @@ class HotColdStraddleTest {
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W3:磁盘已前进 → 热 cancel 回滚 transitionTo 并委托冷取消")
     void hotCancelOnStaleCopyDelegatesToColdCancel() {
-        try (Fx fx = new Fx(tmp.resolve("w3stale"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w3stale"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w3stale001", Map.of("v", "r0"));
             fx.advanceDisk(planted, Map.of("v", "r2"));
             fx.plantStaleHot(planted);
@@ -293,7 +200,7 @@ class HotColdStraddleTest {
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W3 fresh 路径:磁盘未前进 → 热取消行为与现状一致(原地覆写终态)")
     void hotCancelOnFreshCopyPersistsTerminalInPlace() {
-        try (Fx fx = new Fx(tmp.resolve("w3fresh"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w3fresh"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w3fresh01", Map.of("v", "r0"));
             fx.plantHotSync(planted);
             SlotLocation plantedLoc = fx.idx().get("intent_w3fresh01");
@@ -315,7 +222,7 @@ class HotColdStraddleTest {
     @Test
     @org.junit.jupiter.api.DisplayName("F2 W4:投递重试持久化守卫——磁盘已到/超过本次 revision → 跳过;新鲜 → 落盘")
     void guardedDeliveryPersistSkipsStaleCopy() {
-        try (Fx fx = new Fx(tmp.resolve("w4guard"), null)) {
+        try (CommandStackFx fx = new CommandStackFx(tmp.resolve("w4guard"), STRADDLE_FX_OPTS)) {
             Intent planted = fx.plantColdWheel("intent_w4guard001", Map.of("v", "r0"));
             SlotLocation loc2 = fx.advanceDisk(planted, Map.of("v", "r2"));   // 磁盘 R2
 
@@ -358,7 +265,7 @@ class HotColdStraddleTest {
         int rounds = 50;
         for (int r = 0; r < rounds; r++) {
             String id = String.format("intent_f2seri%04d", r);
-            try (Fx fx = new Fx(tmp.resolve("seri" + r), null)) {
+            try (CommandStackFx fx = new CommandStackFx(tmp.resolve("seri" + r), STRADDLE_FX_OPTS)) {
                 Intent planted = fx.plantColdWheel(id, Map.of("v", "r0"));
                 // planted 是与写者共享的活对象(findByIdInternal 返回内部引用),竞态会推进其
                 // revision——基线必须在起跑前捕获,断言用快照值(R0+2)
@@ -484,8 +391,7 @@ class HotColdStraddleTest {
     @org.junit.jupiter.api.DisplayName("F4:投递终态原地覆写持 per-id 冷锁——覆写与冷命令临界区互斥,关闭 terminal/SCHEDULED 同 revision 平局窗")
     void persistTerminalInPlaceSerializesWithColdWriterOnColdLock() throws Exception {
         Path dir = tmp.resolve("f4tie");
-        WheelConfig cfg = new WheelConfig(dir.toString(), "t", 30, 16, 1, 10_000L,
-            HOT_BOUNDARY_MS, PROMOTION_LEAD_MS, PrecisionTier.STANDARD);
+        WheelConfig cfg = new WheelConfig(dir.toString(), 30, 16, 1, 10_000L, HOT_BOUNDARY_MS, PROMOTION_LEAD_MS);
         WheelStore store = new WheelStore(cfg, System::currentTimeMillis);
         TailIndex tail = new TailIndex(dir, System::currentTimeMillis);
         GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000);
@@ -618,8 +524,7 @@ class HotColdStraddleTest {
     @org.junit.jupiter.api.DisplayName("F5:create 失败补偿段(index.remove→persistToWheel)持 per-id 冷锁——补偿临界区与冷命令互斥,冷命令探针不得穿越")
     void compensateCancelSerializesOnColdLock() throws Exception {
         Path dir = tmp.resolve("f5comp");
-        WheelConfig cfg = new WheelConfig(dir.toString(), "t", 30, 16, 1, 10_000L,
-            HOT_BOUNDARY_MS, PROMOTION_LEAD_MS, PrecisionTier.STANDARD);
+        WheelConfig cfg = new WheelConfig(dir.toString(), 30, 16, 1, 10_000L, HOT_BOUNDARY_MS, PROMOTION_LEAD_MS);
         WheelStore store = new WheelStore(cfg, System::currentTimeMillis);
         TailIndex tail = new TailIndex(dir, System::currentTimeMillis);
         GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000);

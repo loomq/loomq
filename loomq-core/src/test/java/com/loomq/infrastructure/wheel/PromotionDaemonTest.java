@@ -17,7 +17,7 @@ class PromotionDaemonTest {
     @Test
     void shouldPromoteColdIntentAtExecuteAtMinusPromotionLead() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 30_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L, 60L * 60_000L, 30_000L);
         long leadMs = cfg.promotionLeadMs(); // 30s(非默认 60s,证明可配)
         AtomicReference<Intent> promoted = new AtomicReference<>();
         try (WheelStore store = new WheelStore(cfg, clock::get);
@@ -46,7 +46,7 @@ class PromotionDaemonTest {
     @Test
     void shouldRemoveColdRegistrationOnCancel() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 30_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L, 60L * 60_000L, 30_000L);
         long leadMs = cfg.promotionLeadMs();
         AtomicReference<Intent> promoted = new AtomicReference<>();
         try (WheelStore store = new WheelStore(cfg, clock::get);

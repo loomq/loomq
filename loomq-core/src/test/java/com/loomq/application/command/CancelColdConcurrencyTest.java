@@ -2,27 +2,13 @@ package com.loomq.application.command;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-import com.loomq.application.scheduler.PrecisionScheduler;
-import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
-import com.loomq.domain.intent.IntentStatus;
-import com.loomq.domain.intent.PrecisionTier;
-import com.loomq.domain.intent.PrecisionTierCatalog;
-import com.loomq.infrastructure.wheel.GroupCommitBarrier;
-import com.loomq.infrastructure.wheel.IntentLocationIndex;
-import com.loomq.infrastructure.wheel.PromotionDaemon;
-import com.loomq.infrastructure.wheel.SlotLocation;
-import com.loomq.infrastructure.wheel.TailIndex;
-import com.loomq.infrastructure.wheel.WheelConfig;
-import com.loomq.infrastructure.wheel.WheelStore;
-import com.loomq.store.ConcurrentIntentStore;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -38,41 +24,13 @@ class CancelColdConcurrencyTest {
     @Test
     void concurrentColdCancelDoesNotDoubleWrite() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD);
-        try (WheelStore store = new WheelStore(cfg, clock::get);
-             TailIndex tail = new TailIndex(tmp, clock::get);
-             GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000)) {
-
-            IntentLocationIndex idx = new IntentLocationIndex();
-            ConcurrentIntentStore memStore = new ConcurrentIntentStore();
-            AtomicBoolean running = new AtomicBoolean(true);
-            AtomicLong seq = new AtomicLong();
-            MetricsCollector mc = new MetricsCollector();
-            PrecisionScheduler scheduler = new PrecisionScheduler(memStore, intent ->
-                java.util.concurrent.CompletableFuture.completedFuture(
-                    com.loomq.spi.DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> {}, 60_000L);
-            ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
-
-            IntentCommandService svc = new IntentCommandService(
-                memStore, scheduler,
-                new IntentCommandService.PhtwStack(store, tail, barrier, idx, daemon),
-                mc, cb, running, seq, null,
-                new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, 60L * 60_000L,
-                    PrecisionTierCatalog.defaultCatalog()),
-                new com.loomq.tracing.IntentTraceStore());
-            barrier.start(); daemon.start(); scheduler.start();
+        try (CommandStackFx fx = new CommandStackFx(tmp,
+                new CommandStackFx.Options(clock::get, null, false, true))) {
 
             // 冷 Intent:executeAt 远超 60min → 落 wheel(非 tail),不在内存 store
-            Intent cold = new Intent("intent_cld00000001");
-            cold.setExecuteAt(Instant.ofEpochMilli(clock.get() + 2 * 60 * 60 * 1000L)); // +2h
-            cold.setPrecisionTier(PrecisionTier.STANDARD);
-            cold.transitionTo(IntentStatus.SCHEDULED);
-            cold.incrementRevision();
-            var loc = store.put(cold);
-            idx.put(cold.getIntentId(), loc); // 模拟 createIntent 已注册索引(冷,不进 memStore)
+            Intent cold = fx.plantColdWheel("intent_cld00000001", null);
 
-            long beforeCancelled = mc.getIntentsCancelledTotal();
+            long beforeCancelled = fx.mc().getIntentsCancelledTotal();
 
             int n = 8;
             CountDownLatch ready = new CountDownLatch(n);
@@ -84,7 +42,7 @@ class CancelColdConcurrencyTest {
                     pool.submit(() -> {
                         ready.countDown();
                         try { fire.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
-                        if (svc.cancelIntent(cold.getIntentId())) successes.incrementAndGet();
+                        if (fx.svc().cancelIntent(cold.getIntentId())) successes.incrementAndGet();
                         else failures.incrementAndGet();
                     });
                 }
@@ -94,17 +52,10 @@ class CancelColdConcurrencyTest {
                 assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
             }
 
-            try {
-                assertEquals(1, successes.get(), "exactly one concurrent cold cancel must succeed");
-                assertEquals(n - 1, failures.get(), "others must see terminal state and return false");
-                assertEquals(1L, mc.getIntentsCancelledTotal() - beforeCancelled,
-                    "cancel counter must increment exactly once (no double-count)");
-            } finally {
-                // scheduler/daemon 不在 try-with-resources 中,需显式关闭;
-                // barrier 由外层 try-with-resources 自动关闭,不再重复 close。
-                scheduler.stop();
-                daemon.close();
-            }
+            assertEquals(1, successes.get(), "exactly one concurrent cold cancel must succeed");
+            assertEquals(n - 1, failures.get(), "others must see terminal state and return false");
+            assertEquals(1L, fx.mc().getIntentsCancelledTotal() - beforeCancelled,
+                "cancel counter must increment exactly once (no double-count)");
         }
     }
 
@@ -116,42 +67,13 @@ class CancelColdConcurrencyTest {
     @Test
     void concurrentTailColdCancelDoesNotDoubleCount() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, PrecisionTier.STANDARD);
-        try (WheelStore store = new WheelStore(cfg, clock::get);
-             TailIndex tail = new TailIndex(tmp, clock::get);
-             GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 1, 10_000)) {
-
-            IntentLocationIndex idx = new IntentLocationIndex();
-            ConcurrentIntentStore memStore = new ConcurrentIntentStore();
-            AtomicBoolean running = new AtomicBoolean(true);
-            AtomicLong seq = new AtomicLong();
-            MetricsCollector mc = new MetricsCollector();
-            PrecisionScheduler scheduler = new PrecisionScheduler(memStore, intent ->
-                java.util.concurrent.CompletableFuture.completedFuture(
-                    com.loomq.spi.DeliveryHandler.DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail, idx, clock::get, (i, loc) -> {}, 60_000L);
-            ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
-
-            IntentCommandService svc = new IntentCommandService(
-                memStore, scheduler,
-                new IntentCommandService.PhtwStack(store, tail, barrier, idx, daemon),
-                mc, cb, running, seq, null,
-                new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, 60L * 60_000L,
-                    PrecisionTierCatalog.defaultCatalog()),
-                new com.loomq.tracing.IntentTraceStore());
-            barrier.start(); daemon.start(); scheduler.start();
+        try (CommandStackFx fx = new CommandStackFx(tmp,
+                new CommandStackFx.Options(clock::get, null, false, true))) {
 
             // 远期冷 Intent:executeAt > 30d 视界 → 落 tail(非 wheel),不在内存 store。
-            long execMs = clock.get() + 31L * 24 * 60 * 60 * 1000L; // +31 days
-            Intent cold = new Intent("intent_ctl00000001");
-            cold.setExecuteAt(Instant.ofEpochMilli(execMs));
-            cold.setPrecisionTier(PrecisionTier.STANDARD);
-            cold.transitionTo(IntentStatus.SCHEDULED);
-            cold.incrementRevision();
-            tail.put(cold);                                   // 落 tail run 文件
-            idx.put(cold.getIntentId(), SlotLocation.tail(execMs)); // 模拟 createIntent 已注册索引
+            Intent cold = fx.plantColdTail("intent_ctl00000001", null);
 
-            long beforeCancelled = mc.getIntentsCancelledTotal();
+            long beforeCancelled = fx.mc().getIntentsCancelledTotal();
 
             int n = 8;
             CountDownLatch ready = new CountDownLatch(n);
@@ -163,7 +85,7 @@ class CancelColdConcurrencyTest {
                     pool.submit(() -> {
                         ready.countDown();
                         try { fire.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
-                        if (svc.cancelIntent(cold.getIntentId())) successes.incrementAndGet();
+                        if (fx.svc().cancelIntent(cold.getIntentId())) successes.incrementAndGet();
                         else failures.incrementAndGet();
                     });
                 }
@@ -173,16 +95,11 @@ class CancelColdConcurrencyTest {
                 assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
             }
 
-            try {
-                assertEquals(1, successes.get(), "exactly one concurrent tail cold cancel must succeed");
-                assertEquals(n - 1, failures.get(),
-                    "others' tailIndex.remove must return false (already cancelled) → return false");
-                assertEquals(1L, mc.getIntentsCancelledTotal() - beforeCancelled,
-                    "cancel counter must increment exactly once on tail path (no double-count)");
-            } finally {
-                scheduler.stop();
-                daemon.close();
-            }
+            assertEquals(1, successes.get(), "exactly one concurrent tail cold cancel must succeed");
+            assertEquals(n - 1, failures.get(),
+                "others' tailIndex.remove must return false (already cancelled) → return false");
+            assertEquals(1L, fx.mc().getIntentsCancelledTotal() - beforeCancelled,
+                "cancel counter must increment exactly once on tail path (no double-count)");
         }
     }
 }

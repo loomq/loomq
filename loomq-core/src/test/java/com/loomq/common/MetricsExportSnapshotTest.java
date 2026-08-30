@@ -39,8 +39,6 @@ class MetricsExportSnapshotTest {
         assertTrue(prom.contains("loomq_scheduler_wakeup_latency_us_p95"));
         assertTrue(prom.contains("loomq_dispatch_queue_offer_failed_total{"));
         assertTrue(prom.contains("loomq_backpressure_events_total{"));
-        assertTrue(prom.contains("loomq_dispatch_queue_retry_total{"));
-        assertTrue(prom.contains("loomq_dispatch_queue_abandoned_total{"));
         assertTrue(prom.contains("loomq_dispatch_queue_size{"));
         assertTrue(prom.contains("loomq_dispatch_queue_lag_ms_p95"));
 
@@ -65,5 +63,7 @@ class MetricsExportSnapshotTest {
         assertFalse(prom.contains("loomq_webhook_"));
         assertFalse(prom.contains("loomq_bucket_intent_count"));
         assertFalse(prom.contains("loomq_ready_queue_size"));
+        assertFalse(prom.contains("loomq_dispatch_queue_retry_total"));
+        assertFalse(prom.contains("loomq_dispatch_queue_abandoned_total"));
     }
 }

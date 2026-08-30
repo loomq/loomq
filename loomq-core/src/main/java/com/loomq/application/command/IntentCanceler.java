@@ -117,21 +117,13 @@ final class IntentCanceler {
                 }
                 scheduler.removeFromSchedule(intent);
                 // F2(round 15): 冷锁内 revision 复核 + 原子写——磁盘已前进时本副本 stale,
-                // 原地覆写会以 stale 内容覆盖索引当前槽(冷写者刚写的新槽)。复核+increment+
-                // persistTerminalInPlace 同一冷锁临界区;锁序 intent 监视器 → 冷锁。
-                Object coldLock = persistence.acquireColdLock(intentId);
-                try {
-                    synchronized (coldLock) {
-                        Long diskMax = persistence.maxRevisionOf(intentId);
-                        stale = diskMax != null && diskMax > intent.getRevision();
-                        if (!stale) {
-                            intent.incrementRevision();
-                            persistence.persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
-                        }
-                    }
-                } finally {
-                    persistence.releaseColdLock(intentId, coldLock);
-                }
+                // 原地覆写会以 stale 内容覆盖索引当前槽(冷写者刚写的新槽)。判据单一成文于
+                // WheelPersistence.writeFreshUnderColdLock(round 16 原语收口)。
+                stale = !persistence.writeFreshUnderColdLock(intentId,
+                    intent.getRevision() + 1L, () -> {
+                        intent.incrementRevision();
+                        persistence.persistTerminalInPlace(intent);   // 原地覆写终态,不追加新槽(无索引/tail 时回退追加)
+                    });
                 if (!stale) {
                     terminalPersisted = true;         // 终态已提交(mmap):此后失败不回滚
                     intentStore.update(intent);

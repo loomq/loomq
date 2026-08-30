@@ -17,7 +17,7 @@ class SlotSpillTest {
     @TempDir Path tmp;
 
     private WheelConfig cfg(Path dir, int slotsPerBucket) {
-        return new WheelConfig(dir.toString(), "t", 30, slotsPerBucket, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        return new WheelConfig(dir.toString(), 30, slotsPerBucket, 1, 10_000L, 60L * 60_000L, 60_000L);
     }
 
     private static Intent intent(String id, AtomicLong clock, long executeAtMs) {

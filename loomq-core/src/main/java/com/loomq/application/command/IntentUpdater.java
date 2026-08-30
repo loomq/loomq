@@ -208,28 +208,18 @@ class IntentUpdater {
                 // 归一化放在校验之后，避免校验失败时仍然修改调用方传入的 Intent。
                 IntentCommandService.normalizePrecisionTier(precisionTierCatalog, intent);
 
-                // F2(round 15): per-id 冷锁内 revision 复核 + 原子写——磁盘历史最高 revision
-                // 严格高于本副本 base revision 说明本副本 stale(在途 promote 载入的旧副本被
-                // 并发冷命令推进过)。直写的双写论证(round 15 终审 g):diskMax==base+1 时带
-                // stale 内容直写与磁盘权威槽同 revision 双写,recovery 平票仲裁不确定(冷更新可
-                // 静默丢失);diskMax>base+1 时直写为更低 revision 的 stale 槽并偷指索引(进程内
-                // 读到 stale)。两情形守卫均覆盖。复核+increment+persist 必须同一冷锁临界区
-                // (检查-写原子);锁序 synchronized(intent) → 冷锁,冷临界区不取 intent 监视器
-                // (无死锁环);awaitCommit 仍在锁外。
-                Object coldLock = persistence.acquireColdLock(intentId);
-                try {
-                    synchronized (coldLock) {
-                        Long diskMax = persistence.maxRevisionOf(intentId);
-                        stale = diskMax != null && diskMax > intent.getRevision();
-                        if (!stale) {
-                            intent.incrementRevision();
-                            // 锁内仅非阻塞 put;DURABLE 等待移到锁外（VT 可正常 unmount，不 pin carrier）
-                            persistence.persistStateChangePutOnly(intent);
-                        }
-                    }
-                } finally {
-                    persistence.releaseColdLock(intentId, coldLock);
-                }
+                // F2(round 15): per-id 冷锁内 revision 复核 + 原子写,守卫判据单一成文于
+                // WheelPersistence.writeFreshUnderColdLock(round 16 原语收口)。
+                // 直写的双写论证(round 15 终审 g):diskMax==base+1 时带 stale 内容直写与
+                // 磁盘权威槽同 revision 双写,recovery 平票仲裁不确定(冷更新可静默丢失);
+                // diskMax>base+1 时直写为更低 revision 的 stale 槽并偷指索引(进程内读到
+                // stale)。两情形守卫均覆盖。
+                stale = !persistence.writeFreshUnderColdLock(intentId,
+                    intent.getRevision() + 1L, () -> {
+                        intent.incrementRevision();
+                        // 锁内仅非阻塞 put;DURABLE 等待移到锁外（VT 可正常 unmount，不 pin carrier）
+                        persistence.persistStateChangePutOnly(intent);
+                    });
                 if (!stale) {
                     persisted = true;
                     intentStore.update(intent);
@@ -417,23 +407,15 @@ class IntentUpdater {
                 oldRevision = intent.getRevision();
                 wasScheduled = scheduler.removeFromSchedule(intent);
                 if (wasScheduled) {
-                    // F2(round 15): 冷锁内 revision 复核 + 原子写(镜像 updateIntent 守卫)。
-                    // 复核+setExecuteAt+increment+persist 同一冷锁临界区;锁序 intent 监视器 → 冷锁。
-                    Object coldLock = persistence.acquireColdLock(intentId);
-                    try {
-                        synchronized (coldLock) {
-                            Long diskMax = persistence.maxRevisionOf(intentId);
-                            stale = diskMax != null && diskMax > intent.getRevision();
-                            if (!stale) {
-                                intent.setExecuteAt(Instant.now());
-                                intent.incrementRevision();
-                                // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount）
-                                persistence.persistStateChangePutOnly(intent);
-                            }
-                        }
-                    } finally {
-                        persistence.releaseColdLock(intentId, coldLock);
-                    }
+                    // F2(round 15): 冷锁内 revision 复核 + 原子写(镜像 updateIntent 守卫),判据
+                    // 单一成文于 WheelPersistence.writeFreshUnderColdLock(round 16 原语收口)。
+                    stale = !persistence.writeFreshUnderColdLock(intentId,
+                        intent.getRevision() + 1L, () -> {
+                            intent.setExecuteAt(Instant.now());
+                            intent.incrementRevision();
+                            // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount）
+                            persistence.persistStateChangePutOnly(intent);
+                        });
                     if (!stale) {
                         persisted = true;
                         intentStore.update(intent);

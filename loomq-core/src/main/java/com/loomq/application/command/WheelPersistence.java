@@ -22,26 +22,30 @@ import org.slf4j.LoggerFactory;
  * 兄弟组件经簿记缝访问(列举不计数,免得每次加缝改这行):maxRevisionOf /
  * markColdCancelTombstone / discardTerminalBooking / trackMaxRevision /
  * markMultiSlot / markMaxRevisions(恢复期经命令服务注入) /
- * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝)。
+ * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝) / writeFreshUnderColdLock(round 16 增守卫原语)。
  *
- * <p><b>F2 冷锁序列化点(round 15)</b>:per-id 冷锁现覆盖<b>既有 Intent 的所有状态变更
- * 持久化写者</b>——冷命令(updateCold/cancelCold/fireNowCold,锁内重读磁盘)与热命令写者
- * (updateIntent/fireNow/cancelIntent 的提交段、投递重试路径的 persistStateChangePutOnly
- * (F6 起为单一守卫门面)、终态原地覆写 persistTerminalInPlace(F4)、create 失败补偿段(F5)),
- * 锁内复核
- * {@code maxRevisionOf(id) < 本次写入 revision} 后原子写。例外:create 主写入路径(W8)不入
- * 冷锁——其活跃副本预检 hasActiveDuplicate 为既有守卫域(冷锁外预检)。
- * stale 热副本(磁盘已前进)由
- * 命令族委托冷路径 fresh 重放、投递路径跳过落盘(磁盘最新态为权威;cancelCold 竞态子情形下
- * 权威为 CANCELED 终态槽,不再投递)。锁序:热路径
- * {@code synchronized(intent) → 冷锁};冷命令路径的临界区仅碰 transient 解码副本,不取
- * intent 监视器(热守卫临界区 mutate 的是活对象,与此消歧——round 15 终审 d)
- * ——无死锁环;awaitCommit 恒在 <b>intent 监视器</b>之外。冷命令路径在冷锁内 await 为
- * round 13 既有契约(per-id 锁非监视器,VT 可正常 unmount)。投递终态路径
- * persistTerminalInPlace 不走 revision 复核守卫(不加复核/不 skip——终态必落盘),但其
- * index.get→overwriteSlot 平局窗口经冷锁互斥关闭(round 15 终审 F4);残留仅为"终态 vs
- * 后到冷写"的语义归属——投递已发生,终态覆写胜出(冷命令锁内重读索引见终态槽即拒绝,
- * 安全收敛),非恢复仲裁不确定。</p>
+ * <p><b>F2 冷锁序列化点(round 15;round 16 原语收口)</b>:per-id 冷锁现覆盖<b>既有 Intent
+ * 的所有状态变更持久化写者</b>——冷命令(updateCold/cancelCold/fireNowCold,锁内重读磁盘)
+ * 与热命令写者,后者按复核语义分两族:
+ * <ul>
+ * <li><b>复核族(W1-W4)</b>:updateIntent/fireNow/cancelIntent 的提交段、投递重试路径
+ *     persistStateChangePutOnly(F6 起为单一守卫门面)——统一经
+ *     {@link #writeFreshUnderColdLock} 在冷锁内复核后原子写;复核判据的唯一权威成文见
+ *     该方法 javadoc(此处不复述)。</li>
+ * <li><b>互斥族(F4/F5)</b>:终态原地覆写 persistTerminalInPlace(F4)与 create 失败补偿段
+ *     compensateCancel(F5)——持冷锁互斥但<b>不做 revision 复核</b>(终态必落盘/补偿语义
+ *     保持),归属残留见各自 javadoc。</li>
+ * </ul>
+ * 例外:create 主写入路径(W8)不入冷锁——其活跃副本预检 hasActiveDuplicate 为既有守卫域
+ * (冷锁外预检)。stale 热副本(磁盘已前进)由命令族委托冷路径 fresh 重放、投递路径跳过落盘
+ * (磁盘最新态为权威;cancelCold 竞态子情形下权威为 CANCELED 终态槽,不再投递)。
+ * 锁序:热路径 {@code synchronized(intent) → 冷锁};冷命令路径的临界区仅碰 transient 解码
+ * 副本,不取 intent 监视器(热守卫临界区 mutate 的是活对象,与此消歧——round 15 终审 d)
+ * ——无死锁环;awaitCommit 恒在 <b>intent 监视器</b>之外(复核族经原语 javadoc 契约强制;
+ * 冷命令路径在冷锁内 await 为 round 13 既有契约,per-id 锁非监视器,VT 可正常 unmount)。
+ * 互斥族残留:F4 平局窗已由冷锁互斥关闭(round 15 终审 F4),残留仅为"终态 vs 后到冷写"
+ * 的语义归属——投递已发生,终态覆写胜出(冷命令锁内重读索引见终态槽即拒绝,安全收敛),
+ * 非恢复仲裁不确定;F5 同构残留见 IntentCreator.compensateCancel javadoc。</p>
  */
 class WheelPersistence {
 
@@ -151,9 +155,12 @@ class WheelPersistence {
     }
 
     /**
-     * 状态变更持久化的 "put-only" 入口（供 PrecisionScheduler 在 synchronized(intent) 内调用）。
-     * 仅写 PHTW + 索引（非阻塞 mmap），不 awaitCommit——持久化等待由调度器在锁外调用
-     * {@link #awaitDurableCommit()} 完成，避免 VT 在 synchronized 内 park 导致 carrier pinning。
+     * 状态变更持久化的 "put-only" 入口:仅写 PHTW + 索引(非阻塞 mmap),不 awaitCommit。
+     * 调用方 = IntentCommandService 守卫门(经 {@link #writeFreshUnderColdLock} 复核)与
+     * IntentUpdater W1/W2 守卫临界区(write 回调体内),均在 per-id 冷锁内执行。
+     * DURABLE 等待由调用方在 intent 监视器与冷锁之外完成(投递路径:StatePersistence.awaitCommit
+     * → IntentCommandService.awaitDurableCommit → {@link #awaitDurableCommit()}),
+     * 避免 VT 在锁内 park 导致 carrier pinning。
      */
     void persistStateChangePutOnly(Intent intent) {
         persistToWheel(intent, false);   // durable=false → 跳过 awaitCommit，仅 put
@@ -265,7 +272,7 @@ class WheelPersistence {
      * 恢复注入与活映射读取的缝——恒等实现见计划缝方法表，禁止增删操作。
      * 兄弟组件可触达成员(列举不计数):maxRevisionOf / markColdCancelTombstone /
      * discardTerminalBooking / trackMaxRevision / markMultiSlot / markMaxRevisions /
-     * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝)。
+     * acquireColdLock / releaseColdLock / readColdSlot(round 13 增冷改期三缝) / writeFreshUnderColdLock(round 16 增守卫原语)。
      */
     Long maxRevisionOf(String intentId) {
         return maxRevisions.get(intentId);
@@ -279,6 +286,33 @@ class WheelPersistence {
     void discardTerminalBooking(String intentId) {
         pendingReclaims.remove(intentId);
         multiSlotIntents.remove(intentId);
+    }
+
+    /**
+     * 既有 Intent 状态变更持久化写者的单一守卫原语(W1-W4 唯一实现):per-id 冷锁内复核
+     * 磁盘历史最高 revision,判据 {@code diskMax != null && diskMax >= writeRev} → stale,
+     * 跳过 write 返回 false;fresh 执行 write 返回 true。
+     * writeRev 约定 = 本次的写入 revision:W1-W3(increment 族)传 base+1;
+     * W4(StatePersistence 已预 increment)传当前值。
+     * 复核+写原子于同一冷锁临界区;临界区内禁止 awaitCommit(调用方锁外等待,防 VT pin);
+     * 锁序:调用方已持 intent 监视器 → 本冷锁;冷命令路径的临界区不取 intent 监视器,无死锁环。
+     * stale 政策(还原/demote/委托冷路径 fresh 重放/skip+warn/revision 回滚)由调用方在
+     * 返回 false 后处置——本原语只裁决"写或不写",不承载语义。
+     */
+    boolean writeFreshUnderColdLock(String intentId, long writeRev, Runnable write) {
+        Object coldLock = acquireColdLock(intentId);
+        try {
+            synchronized (coldLock) {
+                Long diskMax = maxRevisionOf(intentId);
+                if (diskMax != null && diskMax >= writeRev) {
+                    return false;
+                }
+                write.run();
+                return true;
+            }
+        } finally {
+            releaseColdLock(intentId, coldLock);
+        }
     }
 
     /** 冷路径 per-id 互斥进:computeIfAbsent 取稳定锁对象(契约见 coldWriteLocks)。 */

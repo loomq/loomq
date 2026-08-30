@@ -2,29 +2,15 @@ package com.loomq.application.command;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.loomq.application.scheduler.PrecisionScheduler;
-import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
-import com.loomq.domain.intent.PrecisionTierCatalog;
-import com.loomq.infrastructure.wheel.GroupCommitBarrier;
-import com.loomq.infrastructure.wheel.IntentLocationIndex;
-import com.loomq.infrastructure.wheel.PromotionDaemon;
 import com.loomq.infrastructure.wheel.SlotLocation;
 import com.loomq.infrastructure.wheel.TailIndex;
-import com.loomq.infrastructure.wheel.WheelConfig;
-import com.loomq.infrastructure.wheel.WheelStore;
-import com.loomq.spi.DeliveryHandler.DeliveryResult;
-import com.loomq.store.ConcurrentIntentStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -66,43 +52,21 @@ class BugCreateCrashOnCorruptTailEntryTest {
         Files.write(runFile, all);
 
         // 3. 重开:loadRun 保留结构完整的损坏槽(与恢复侧防御解码跳过的是同一形态)
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L,
-            PrecisionTier.STANDARD);
-        try (WheelStore store = new WheelStore(cfg, clock::get);
-             TailIndex tail2 = new TailIndex(tmp, clock::get);
-             GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail2, 1, 10_000)) {
-
-            IntentLocationIndex idx = new IntentLocationIndex();
-            ConcurrentIntentStore memStore = new ConcurrentIntentStore();
-            AtomicBoolean running = new AtomicBoolean(true);
-            AtomicLong seq = new AtomicLong();
-            MetricsCollector mc = new MetricsCollector();
-            PrecisionScheduler scheduler = new PrecisionScheduler(memStore, i ->
-                CompletableFuture.completedFuture(DeliveryResult.DEAD_LETTER), null);
-            PromotionDaemon daemon = new PromotionDaemon(store, tail2, idx, clock::get, (i, loc) -> {}, 60_000L);
-            ExecutorService cb = Executors.newVirtualThreadPerTaskExecutor();
-            IntentCommandService svc = new IntentCommandService(
-                memStore, scheduler,
-                new IntentCommandService.PhtwStack(store, tail2, barrier, idx, daemon),
-                mc, cb, running, seq, null,
-                new IntentCommandService.CommandConfig(PrecisionTier.STANDARD, 1L, 60L * 60_000L,
-                    PrecisionTierCatalog.defaultCatalog()),
-                new com.loomq.tracing.IntentTraceStore());
-            barrier.start();
-            daemon.start();
+        //    本测试不启动 scheduler(原装配即无 scheduler.start),经旋钮保留该时序差异。
+        try (CommandStackFx fx = new CommandStackFx(tmp,
+                new CommandStackFx.Options(clock::get, null, false, false))) {
 
             // 恢复侧索引状态:损坏条目被恢复跳过,索引残留指向损坏记录占据的键
-            idx.put("r21-corrupt-0001", SlotLocation.tail(execMs));
+            fx.idx().put("r21-corrupt-0001", SlotLocation.tail(execMs));
 
             // 修复前:hasActiveDuplicate 解码损坏槽 → CRC ISE 穿透 createIntent;
             // 修复后:跳过损坏条目 → 判无活重复 → 创建成功。
             Intent fresh = new Intent("r21-corrupt-0001");
             fresh.setExecuteAt(Instant.ofEpochMilli(execMs));
             fresh.setPrecisionTier(PrecisionTier.STANDARD);
-            long s = svc.createIntent(fresh, AckMode.DURABLE);
+            long s = fx.svc().createIntent(fresh, AckMode.DURABLE);
             assertTrue(s > 0,
                 "create must succeed once the corrupt tail entry is skipped (was: CRC ISE crashing the create)");
-            cb.shutdown();
         }
     }
 }

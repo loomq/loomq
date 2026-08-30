@@ -219,10 +219,12 @@ public final class IntentCommandService {
     }
 
     /**
-     * 投递路径状态变更持久化的守卫门面(round 15):per-id 冷锁内复核 revision 后落盘。
-     * StatePersistence.persistStateChange 已先 incrementRevision——判据为 diskMax &gt;= 当前
-     * revision(已含本次递增):磁盘已到/超过本次写入 revision 说明内存副本 stale(在途投递
-     * 副本 + 并发冷写者推进),直写会与磁盘权威槽同 revision 双写。stale 时<b>跳过持久化</b>并
+     * 投递路径状态变更持久化的守卫门面(round 15;round 16 判据收口至
+     * {@link WheelPersistence#writeFreshUnderColdLock}):per-id 冷锁内复核 revision 后落盘。
+     * StatePersistence.persistStateChange 已先 incrementRevision——writeRev = 当前 revision
+     * (已含本次递增),判据单点见原语 javadoc:磁盘已到/超过本次写入 revision 说明内存副本
+     * stale(在途投递副本 + 并发冷写者推进),直写会与磁盘权威槽同 revision 双写。stale 时
+     * <b>跳过持久化</b>并
      * warn:磁盘保留冷写者的最新态(权威;cancelCold 竞态子情形下权威为 CANCELED 终态槽,
      * 不再投递),崩溃后按其恢复——优于双写平局。skip 同时回滚本次 increment
      * ({@code rollbackRevision(revision - 1)},round 15 终审 F3):否则平局副本被当 fresh
@@ -242,22 +244,16 @@ public final class IntentCommandService {
      */
     public void persistStateChangePutOnly(Intent intent) {
         String intentId = intent.getIntentId();
-        Object lock = persistence.acquireColdLock(intentId);
-        try {
-            synchronized (lock) {
-                Long diskMax = persistence.maxRevisionOf(intentId);
-                if (diskMax != null && diskMax >= intent.getRevision()) {
-                    logger.warn("Delivery state-change persist skipped (stale copy, disk advanced): id={}, rev={}",
-                        intentId, intent.getRevision());
-                    // F3(round 15 终审): 回退 StatePersistence 已做的 increment,把活对象 revision
-                    // 还原到 base——杜绝 skip 后平局副本被当 fresh 的 revision 洗白。
-                    intent.rollbackRevision(intent.getRevision() - 1);
-                    return;
-                }
-                persistence.persistStateChangePutOnly(intent);
-            }
-        } finally {
-            persistence.releaseColdLock(intentId, lock);
+        // StatePersistence.persistStateChange 已预 increment → writeRev = 当前 revision;
+        // 守卫判据单一成文于 WheelPersistence.writeFreshUnderColdLock(round 16 原语收口)。
+        boolean fresh = persistence.writeFreshUnderColdLock(intentId, intent.getRevision(),
+            () -> persistence.persistStateChangePutOnly(intent));
+        if (!fresh) {
+            logger.warn("Delivery state-change persist skipped (stale copy, disk advanced): id={}, rev={}",
+                intentId, intent.getRevision());
+            // F3(round 15 终审): 回退 StatePersistence 已做的 increment,把活对象 revision
+            // 还原到 base——杜绝 skip 后平局副本被当 fresh 的 revision 洗白。
+            intent.rollbackRevision(intent.getRevision() - 1);
         }
     }
 

@@ -165,60 +165,6 @@ public class MetricsCollector {
         return tierMetrics.getBackpressureEventsByTier();
     }
 
-    /**
-     * 计算指定精度档位的 P50 唤醒延迟
-     */
-    public long calculateP50WakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateP50WakeupLatencyByTier(tier);
-    }
-
-    /**
-     * 计算指定精度档位的 P75 唤醒延迟
-     */
-    public long calculateP75WakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateP75WakeupLatencyByTier(tier);
-    }
-
-    /**
-     * 计算指定精度档位的 P90 唤醒延迟
-     */
-    public long calculateP90WakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateP90WakeupLatencyByTier(tier);
-    }
-
-    /**
-     * 计算指定精度档位的 P95 唤醒延迟
-     */
-    public long calculateP95WakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateP95WakeupLatencyByTier(tier);
-    }
-
-    /**
-     * 计算指定精度档位的 P99 唤醒延迟
-     */
-    public long calculateP99WakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateP99WakeupLatencyByTier(tier);
-    }
-
-    /**
-     * 计算指定精度档位的 P99.9 唤醒延迟
-     */
-    public long calculateP999WakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateP999WakeupLatencyByTier(tier);
-    }
-
-    public long calculateMaxWakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateMaxWakeupLatencyByTier(tier);
-    }
-
-    public long calculateMeanWakeupLatencyByTier(PrecisionTier tier) {
-        return tierMetrics.calculateMeanWakeupLatencyByTier(tier);
-    }
-
-    public long getWakeupLatencySampleCountByTier(PrecisionTier tier) {
-        return tierMetrics.getWakeupLatencySampleCountByTier(tier);
-    }
-
     public long getDispatchQueueOfferFailed(PrecisionTier tier) {
         return tierMetrics.getDispatchQueueOfferFailed(tier);
     }
@@ -228,15 +174,15 @@ public class MetricsCollector {
      */
     public LatencySnapshot getWakeupLatencySnapshot(PrecisionTier tier) {
         return new LatencySnapshot(
-            calculateP50WakeupLatencyByTier(tier),
-            calculateP75WakeupLatencyByTier(tier),
-            calculateP90WakeupLatencyByTier(tier),
-            calculateP95WakeupLatencyByTier(tier),
-            calculateP99WakeupLatencyByTier(tier),
-            calculateP999WakeupLatencyByTier(tier),
-            calculateMaxWakeupLatencyByTier(tier),
-            calculateMeanWakeupLatencyByTier(tier),
-            getWakeupLatencySampleCountByTier(tier)
+            tierMetrics.calculateP50WakeupLatencyByTier(tier),
+            tierMetrics.calculateP75WakeupLatencyByTier(tier),
+            tierMetrics.calculateP90WakeupLatencyByTier(tier),
+            tierMetrics.calculateP95WakeupLatencyByTier(tier),
+            tierMetrics.calculateP99WakeupLatencyByTier(tier),
+            tierMetrics.calculateP999WakeupLatencyByTier(tier),
+            tierMetrics.calculateMaxWakeupLatencyByTier(tier),
+            tierMetrics.calculateMeanWakeupLatencyByTier(tier),
+            tierMetrics.getWakeupLatencySampleCountByTier(tier)
         );
     }
 

@@ -45,7 +45,7 @@ class GroupCommitBarrierTest {
     @Test
     void closeDrainsInFlightAwaitCommit() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 60_000L, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 60_000L, 10_000L, 60L * 60_000L, 60_000L);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 60_000, 10_000)) {
@@ -87,7 +87,7 @@ class GroupCommitBarrierTest {
     @Test
     void awaitCommitTimeoutFallsBackToInlineForce() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 60_000L, 50L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 60_000L, 50L, 60L * 60_000L, 60_000L);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 60_000, 50)) {
@@ -120,7 +120,7 @@ class GroupCommitBarrierTest {
     @Test
     void awaitCommitTimeoutFallbackDoesNotOverpublishConcurrentTicket() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 60_000L, 50L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 60_000L, 50L, 60L * 60_000L, 60_000L);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get);
              GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 60_000, 50)) {
@@ -167,7 +167,7 @@ class GroupCommitBarrierTest {
     @Test
     void inlineForceFailureMustNotPublishFrontier() throws Exception {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 60_000L, 200L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 60_000L, 200L, 60L * 60_000L, 60_000L);
         WheelStore store = new WheelStore(cfg, clock::get);
         TailIndex tail = new TailIndex(tmp, clock::get);
         GroupCommitBarrier barrier = new GroupCommitBarrier(store, tail, 60_000, 200);
