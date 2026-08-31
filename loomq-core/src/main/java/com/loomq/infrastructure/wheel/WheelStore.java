@@ -51,6 +51,9 @@ public final class WheelStore implements AutoCloseable {
     /** 空槽模板:status=0。free 时整槽清零,readSlot/isOccupied 据此判空。 */
     private static final byte[] EMPTY_SLOT = new byte[SlotCodec.SLOT_SIZE];
 
+    /** Test-only: deleteBucket 在关闭旧桶之后、删除文件之前触发(TOCTOU 重建桶测试用)。 */
+    volatile Runnable testBeforeFileDeleteHook;
+
     public WheelStore(WheelConfig config, LongSupplier clock) {
         this.config = config;
         this.clock = clock;
@@ -277,6 +280,18 @@ public final class WheelStore implements AutoCloseable {
         Bucket b = wheels.get(tier).remove(bucketKey);
         if (b == null) return;
         b.close();
+        if (testBeforeFileDeleteHook != null) {
+            testBeforeFileDeleteHook.run();
+        }
+        // TOCTOU 守卫:close 之后、删文件之前,同 key 桶可能已被并发 put() 重建
+        // (computeIfAbsent 安装新桶、重新打开文件,BucketReclaimer 的引用快照是 stale 的)。
+        // 此时删文件会命中新桶的落盘文件——新 Intent 的槽字节随文件消失,重启静默丢失。
+        // 仅当 map 中该 key 已无其他桶对象时才删除文件。
+        if (wheels.get(tier).get(bucketKey) != null) {
+            log.warn("Skip deleting bucket file {}/{}: recreated concurrently after map removal",
+                tier, bucketKey);
+            return;
+        }
         try {
             Files.deleteIfExists(Paths.get(config.dataDir(), tier.name().toLowerCase(),
                 String.format("%020d.bin", bucketKey)));

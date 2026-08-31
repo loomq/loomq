@@ -56,4 +56,28 @@ class LoomqEngineConfigHookTest {
         b.close();
         // 两个引擎都能正常启停即通过(废弃别名仍可用)
     }
+
+    /**
+     * A4:工厂路径的 wheel.default_tier 必须生效。此前 LoomqEngine 构造只读
+     * builder.defaultTier(工厂路径恒 null),WheelConfig.defaultTier 被完全忽略
+     * ——Properties 配置的默认档静默失效,createIntent 沿用 intent 自带档位。
+     */
+    @Test
+    void wheelDefaultTierPropertyIsHonored() throws Exception {
+        java.util.Properties props = new java.util.Properties();
+        props.setProperty("loomq.dataDir", tmp.resolve("d").toString());
+        props.setProperty("wheel.default_tier", "FAST");
+        LoomqEngine engine = LoomqEngineFactory.createFromProperties(props);
+        engine.start();
+        try {
+            Intent it = new Intent("intent_cfg_tier0001");
+            it.setExecuteAt(Instant.now().plusSeconds(30));
+            it.setPrecisionTier(PrecisionTier.STANDARD); // 显式 STANDARD;引擎默认档应覆盖为 FAST
+            engine.createIntent(it, AckMode.ASYNC).join();
+            assertEquals(PrecisionTier.FAST, it.getPrecisionTier(),
+                "wheel.default_tier=FAST must be honored as the engine-level default tier");
+        } finally {
+            engine.close();
+        }
+    }
 }

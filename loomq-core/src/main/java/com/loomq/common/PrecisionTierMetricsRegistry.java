@@ -22,6 +22,7 @@ final class PrecisionTierMetricsRegistry {
     private final Map<PrecisionTier, AtomicLong> intentDueByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> bucketSizeByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> scanDurationSamplesByTier = new EnumMap<>(PrecisionTier.class);
+    private final Map<PrecisionTier, AtomicLong> scanCountByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> backpressureEventsByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, ConcurrentHashMap<Integer, AtomicLong>> wakeupLatencyByTier = new EnumMap<>(PrecisionTier.class);
     private final Map<PrecisionTier, AtomicLong> wakeupLatencySampleCountByTier = new EnumMap<>(PrecisionTier.class);
@@ -51,6 +52,7 @@ final class PrecisionTierMetricsRegistry {
             intentDueByTier.put(tier, new AtomicLong(0));
             bucketSizeByTier.put(tier, new AtomicLong(0));
             scanDurationSamplesByTier.put(tier, new AtomicLong(0));
+            scanCountByTier.put(tier, new AtomicLong(0));
             backpressureEventsByTier.put(tier, new AtomicLong(0));
             wakeupLatencyByTier.put(tier, new ConcurrentHashMap<>());
             wakeupLatencySampleCountByTier.put(tier, new AtomicLong(0));
@@ -99,6 +101,12 @@ final class PrecisionTierMetricsRegistry {
 
     void recordScanDurationByTier(PrecisionTier tier, long durationMs) {
         resolveCounter(scanDurationSamplesByTier, tier).addAndGet(durationMs);
+        resolveCounter(scanCountByTier, tier).incrementAndGet();
+    }
+
+    /** 扫描次数（scanAndDispatch 执行次数，测试/诊断用）。 */
+    long getScanSampleCount(PrecisionTier tier) {
+        return resolveCounter(scanCountByTier, tier).get();
     }
 
     void recordWakeupLatencyByTier(PrecisionTier tier, long latencyMs) {

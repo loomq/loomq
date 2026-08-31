@@ -118,6 +118,11 @@ public class MetricsCollector {
         tierMetrics.recordScanDurationByTier(tier, durationMs);
     }
 
+    /** 指定档位 scanAndDispatch 累计执行次数（诊断/测试用）。 */
+    public long getScanSampleCountByTier(PrecisionTier tier) {
+        return tierMetrics.getScanSampleCount(tier);
+    }
+
     /**
      * 记录指定精度档位的唤醒延迟
      * 同时记录到手工分桶，供 P95/P99/P99.9 近似计算使用

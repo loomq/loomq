@@ -117,7 +117,16 @@ public final class WheelRecovery {
                 try {
                     intent.transitionTo(terminal);
                     intent.incrementRevision();
-                    SlotLocation newLoc = store.put(intent);   // 写终态 revision
+                    // 终态原地覆写,不分配新槽:原实现 store.put 会为过期 executeAt 分配新槽,
+                    // 旧 SCHEDULED 槽残留(stale 兄弟),同 id 槽数恒为 2 → 终态槽因 count>1
+                    // 永不回收,只能等桶文件过期(31 天)被 BucketReclaimer 删除;tail 来源的
+                    // 过期条目还会在 wheel 里写一个过去时刻的槽而 tail 条目原样残留。
+                    // 原地覆写:单槽即终态,下次重启 terminal+count==1 即被 freeSlot 回收自愈。
+                    if (e.loc().inTail()) {
+                        tail.put(intent);   // tail 条目覆盖为终态(revision 递增,重放后序生效)
+                    } else {
+                        store.overwriteSlot(e.loc(), SlotCodec.encode(intent));
+                    }
                     metricsCollector.incrementRecoveryOverdue();
                     log.warn("Recovery: intent {} overdue (execMs={} < now={}); marked {}",
                         id, execMs, nowMs, terminal);

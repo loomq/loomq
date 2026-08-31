@@ -291,17 +291,10 @@ public class LoomqEngine implements AutoCloseable {
         started.set(false);
         logger.info("Shutting down LoomqEngine...");
 
-        // 停止桶回收 daemon(在 wheelStore 关闭前停止)
-        bucketReclaimer.close();
-
-        // 停止提升 daemon
-        promotionDaemon.close();
-
-        // 停止调度器(内部排空在途投递)
-        scheduler.stop();
-
-        // P1-7: 先关操作执行器,等在途 createIntent 排空,避免后续 wheelStore/tail 关闭后
-        // 仍有 createIntent 写已关闭的 MemorySegment 抛 ISE。
+        // P1-8: 先关操作执行器,等在途 createIntent 排空——否则在途 create 越过
+        // ensureRunning 后,其调度/注册会落到已停止的 scheduler/promotionDaemon
+        // (register/schedule 不查 running),intent 落盘却永不投递,直到重启。
+        // 须在 daemon/scheduler 停止之前完成,使在途 create 仍能正常完成调度。
         operationExecutor.shutdown();
         try {
             if (!operationExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
@@ -311,6 +304,15 @@ public class LoomqEngine implements AutoCloseable {
             operationExecutor.shutdownNow();
             Thread.currentThread().interrupt();
         }
+
+        // 停止桶回收 daemon(在 wheelStore 关闭前停止)
+        bucketReclaimer.close();
+
+        // 停止提升 daemon
+        promotionDaemon.close();
+
+        // 停止调度器(内部排空在途投递)
+        scheduler.stop();
 
         // 停止存储后台清理线程
         intentStore.shutdown();

@@ -168,8 +168,27 @@ public final class TailIndex implements AutoCloseable {
                     TailRecord r = byId.get(intentId);
                     if (r == null) continue; // 并发 remove 已摘除
                     if (r.executeAtMs() > horizon) continue; // 并发 re-PUT 到更远的 ms
-                    Intent it = SlotCodec.decode(r.encodedSlot());
-                    store.put(it); // mmap memcpy,持锁期间开销可忽略
+                    Intent it;
+                    try {
+                        // P1-6 同款防御:tail 记录无 isTorn 预检(wheel 槽有),一条 CRC 损坏即让
+                        // decode 抛异常中断整个 promoteInto(recover 第一步)→ 引擎起不来。
+                        // 损坏条目跳过并告警,与 WheelRecovery 尾部扫描的防御解码保持一致。
+                        it = SlotCodec.decode(r.encodedSlot());
+                    } catch (RuntimeException dex) {
+                        log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId, dex);
+                        continue;
+                    }
+                    try {
+                        // R6: DAY 桶满（溢出链终点）防护——engine.start 的恢复流程第一步
+                        // 即 promoteInto，异常穿透会让引擎每次重启都在同一条目上失败（被砖）。
+                        // 保留 tail 条目（不 tombstone、不移除），待 DAY 桶随投递回收后
+                        // 下次恢复再试；运行期 createIntent 同条件失败有补偿路径，恢复期
+                        // 选择"引擎可启动 + 延迟投递"优于"启动失败"。
+                        store.put(it); // mmap memcpy,持锁期间开销可忽略
+                    } catch (SlotOverflowException e) {
+                        log.error("promoteInto: day wheel full, keeping tail entry for intent {} (retry on next recovery)", intentId, e);
+                        continue;
+                    }
                     appendRecord(TYPE_TOMBSTONE, intentId, r.executeAtMs(), null);
                     applyRemove(intentId);
                     promoted++;

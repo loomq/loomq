@@ -147,6 +147,16 @@ public final class IntentCommandService {
     public long createIntent(Intent intent, AckMode ackMode) {
         ensureRunning();
         IntentValidator.validate(intent);
+        // R6: 同一 intentId 双活副本 → 双投递内容分叉 + store 条目来回覆写 + 磁盘残留
+        // 非终态 stale 槽（recovery 按 max revision 去重，败者槽永不回收，桶容量永久
+        // 泄漏，I1 破坏）。locationIndex 是"活 intent"登记表；磁盘终态（含补偿 CANCELED）
+        // 的 intent 允许同 id 重建（幂等重试）。检查在补偿路径之外——否则失败补偿会把
+        // 已存在的 intent 覆写成 CANCELED。并发同 id 创建仍有预检 TOCTOU 窗口，由调用方
+        // 序列化（与 checkIdempotency 同纪律）。
+        if (hasActiveDuplicate(intent.getIntentId())) {
+            throw new IllegalArgumentException(
+                "duplicate intentId: " + intent.getIntentId() + " already active");
+        }
 
         long seq = sequenceNumber.incrementAndGet();
 
@@ -250,8 +260,28 @@ public final class IntentCommandService {
             IntentValidator.validate(intent);
         }
 
-        WalMode effectiveMode = resolveWalMode(intents.get(0), ackMode);
-        boolean durable = effectiveMode == WalMode.DURABLE;
+        // R6: 批量创建预检——与已有活 intent 冲突或批内重复 intentId → 写盘前整体拒绝。
+        // 预检失败不触发补偿（补偿只对已写入条目生效），避免把已存在的 intent 覆写为
+        // CANCELED。
+        java.util.Set<String> seenIds = new java.util.HashSet<>(intents.size());
+        for (Intent intent : intents) {
+            if (!seenIds.add(intent.getIntentId()) || hasActiveDuplicate(intent.getIntentId())) {
+                throw new IllegalArgumentException(
+                    "duplicate intentId: " + intent.getIntentId() + " already active");
+            }
+        }
+
+        // 逐条解析持久化语义：整批的耐久性不能由首条 intent 决定——混合批次（如首条
+        // ASYNC、后条 DURABLE）会让 DURABLE 条目跳过 awaitCommit，崩溃即丢失。
+        // 任一条 DURABLE 即整批 awaitCommit 一次（barrier ticket 覆盖所有已入 mmap 的写入，
+        // ASYNC 条目顺带落盘无害）。
+        boolean durable = false;
+        for (Intent intent : intents) {
+            if (resolveWalMode(intent, ackMode) == WalMode.DURABLE) {
+                durable = true;
+                break;
+            }
+        }
         List<Long> seqs = new ArrayList<>(intents.size());
         List<SlotLocation> locs = new ArrayList<>(intents.size());
         int written = 0;
@@ -289,6 +319,7 @@ public final class IntentCommandService {
             throw new RuntimeException("Batch createIntent persistence failed; " + written + " intents compensated", e);
         }
 
+        RuntimeException schedulingFailure = null;
         for (int i = 0; i < intents.size(); i++) {
             Intent intent = intents.get(i);
             try {
@@ -301,10 +332,19 @@ public final class IntentCommandService {
                 }
                 metricsCollector.incrementIntentsCreated();
             } catch (Exception e) {
+                // 不中断循环：其余 intent 已在 phase 1 持久化（wheel/tail 磁盘权威），
+                // 跳过调度会留下"已提交但本进程不投递、仅重启后恢复"的不一致尾巴。
+                // 补偿失败的条目并继续调度剩余条目，循环结束后统一向调用方报告首个失败。
                 logger.error("Post-persist scheduling failed for intent {}", intent.getIntentId(), e);
                 compensateCancel(intent);
-                throw new RuntimeException("Post-persist scheduling failed for intent " + intent.getIntentId(), e);
+                if (schedulingFailure == null) {
+                    schedulingFailure = new RuntimeException(
+                        "Post-persist scheduling failed for intent " + intent.getIntentId(), e);
+                }
             }
+        }
+        if (schedulingFailure != null) {
+            throw schedulingFailure;
         }
         return seqs;
     }
@@ -336,6 +376,8 @@ public final class IntentCommandService {
         }
 
         boolean reschedule = false;
+        boolean persisted = false;
+        boolean removedForReschedule = false;
         try {
             synchronized (intent) {
                 if (intent.getStatus().isTerminal()) {
@@ -358,6 +400,8 @@ public final class IntentCommandService {
                             // 旧内容，更新仅在重试/崩溃恢复路径确定生效（见方法 javadoc）。
                             logger.warn(CLAIMED_SKIP_WARN, intentId);
                             reschedule = false;
+                        } else {
+                            removedForReschedule = true;
                         }
                     } else {
                         logger.warn("Cannot reschedule intent {} in {} state; keeping original schedule", intentId, st);
@@ -379,6 +423,7 @@ public final class IntentCommandService {
                             boolean wasScheduled = scheduler.removeFromSchedule(intent, oldExecuteAt);
                             if (wasScheduled) {
                                 reschedule = true;
+                                removedForReschedule = true;
                             } else {
                                 logger.warn(CLAIMED_SKIP_WARN, intentId);
                             }
@@ -393,10 +438,16 @@ public final class IntentCommandService {
                 }
 
                 intent.incrementRevision();
-                persistIntentState(intent, AckMode.DURABLE);
+                // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount，不 pin carrier）
+                persistStateChangePutOnly(intent);
+                persisted = true;
                 intentStore.update(intent);
                 // I5: schedule/restore 移到锁外 (deferred)
                 // -- schedule() 有自己的 synchronized + 终态检查
+            }
+            // DURABLE 等待在锁外完成（同调度器模式：锁内 put、锁外 awaitCommit）
+            if (persisted) {
+                awaitDurableCommit();
             }
             // I5: schedule/restore 在锁外调用
             if (reschedule) {
@@ -409,6 +460,18 @@ public final class IntentCommandService {
             return Optional.of(intent);
         } catch (RuntimeException e) {
             logger.error("Failed to update intent: id={}", intentId, e);
+            // 回滚：更新失败但调度结构已摘除（updater 抛异常或持久化失败）→ 按当前
+            // executeAt 重新调度——否则 intent 在 store 中为 SCHEDULED 却不在任何
+            // bucket/cohort，静默永不投递直到重启恢复（投递延迟丢失）。
+            if (removedForReschedule && intent.getStatus() == IntentStatus.SCHEDULED) {
+                try {
+                    scheduler.schedule(intent);
+                } catch (Exception re) {
+                    logger.error(
+                        "Failed to re-schedule intent {} after update failure; it will not be delivered until restart",
+                        intentId, re);
+                }
+            }
             throw e;
         }
     }
@@ -453,7 +516,7 @@ public final class IntentCommandService {
                 oldRevision = intent.getRevision();
 
                 // transitionTo 单独 try-catch：仅捕获状态机校验失败，
-                // 不会误吞 persistIntentState / intentStore.update 抛出的 ISE。
+                // 不会误吞 persistStateChangePutOnly / intentStore.update 抛出的 ISE。
                 try {
                     intent.transitionTo(IntentStatus.CANCELED);
                 } catch (IllegalStateException e) {
@@ -610,6 +673,7 @@ public final class IntentCommandService {
         Instant oldExecuteAt = null;
         long oldRevision = 0;
         boolean wasScheduled = false;
+        boolean persisted = false;
         try {
             synchronized (intent) {
                 oldExecuteAt = intent.getExecuteAt();
@@ -618,7 +682,9 @@ public final class IntentCommandService {
                 if (wasScheduled) {
                     intent.setExecuteAt(Instant.now());
                     intent.incrementRevision();
-                    persistIntentState(intent, AckMode.DURABLE);
+                    // 锁内仅非阻塞 put；DURABLE 等待移到锁外（VT 可正常 unmount）
+                    persistStateChangePutOnly(intent);
+                    persisted = true;
                     intentStore.update(intent);
                     // I5: restore 移到锁外 (deferred)
                 } else {
@@ -629,6 +695,10 @@ public final class IntentCommandService {
                     logger.debug("fireNow: intent {} already claimed by scanDue; in-flight delivery serves as fire-now",
                         intentId);
                 }
+            }
+            // DURABLE 等待在锁外完成（同调度器模式：锁内 put、锁外 awaitCommit）
+            if (persisted) {
+                awaitDurableCommit();
             }
             // I5: restore 在锁外调用 (restore() 有终态检查)
             if (wasScheduled) {
@@ -690,7 +760,7 @@ public final class IntentCommandService {
     /**
      * PHTW 写协议:locate→(inTail? tail.put : wheel.put)→locationIndex.put→(durable? awaitCommit)。
      * 返回实际分配槽位(wheel 路径为 put 捕获的真实槽;tail 路径为 locate 的占位)。
-     * createIntent 与 persistIntentState 共用,避免副本漂移。
+     * createIntent 与 persistStateChangePutOnly 共用,避免副本漂移。
      */
     private SlotLocation persistToWheel(Intent intent, boolean durable) {
         String id = intent.getIntentId();
@@ -708,18 +778,6 @@ public final class IntentCommandService {
             commitBarrier.awaitCommit();
         }
         return loc;
-    }
-
-    /**
-     * 持久化 intent 当前态到 PHTW 并同步索引。状态变更操作（update/cancel/fireNow 正常路径）
-     * 经此方法恒为 DURABLE；fireNow 认领分支不调用本方法——在途投递即为效果，不落盘
-     * SCHEDULED@now（避免崩溃恢复将其判 overdue 丢弃）。
-     *
-     * <p>非终态状态变更分配新槽,旧槽残留;终态原地覆写 + 单槽回收。recovery 按 intentId 取
-     * max revision 胜者,故旧槽不会引发 ghost 投递。</p>
-     */
-    private void persistIntentState(Intent intent, AckMode ackMode) {
-        persistToWheel(intent, resolveWalMode(intent, ackMode) == WalMode.DURABLE);
     }
 
     /**
@@ -784,5 +842,32 @@ public final class IntentCommandService {
         if (!running.get()) {
             throw new IllegalStateException("Engine is not running");
         }
+    }
+
+    /**
+     * 判定 intentId 是否已有"活跃"副本（非终态）。
+     *
+     * <p>磁盘为权威：locationIndex 指向的最新槽非终态即活跃。终态（含补偿 CANCELED，
+     * 其索引条目在补偿后仍保留）允许同 id 重建——这是"创建失败后幂等重试"的合法路径。
+     * tail 位置经 {@code scanFrom} 解码判定（终态化 tail 条目走回退追加，同样可判）。
+     * 槽空但索引在（不一致状态）按活跃保守拒绝。
+     */
+    private boolean hasActiveDuplicate(String intentId) {
+        SlotLocation loc = locationIndex.get(intentId);
+        if (loc == null) {
+            return false;
+        }
+        if (loc.inTail()) {
+            var it = tailIndex.scanFrom(loc.bucketKey());
+            while (it.hasNext()) {
+                Intent cur = SlotCodec.decode(it.next().encodedSlot());
+                if (intentId.equals(cur.getIntentId()) && !cur.getStatus().isTerminal()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        Intent cur = wheelStore.readSlot(loc);
+        return cur != null && !cur.getStatus().isTerminal();
     }
 }

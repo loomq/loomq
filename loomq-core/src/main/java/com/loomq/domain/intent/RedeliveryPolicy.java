@@ -78,6 +78,9 @@ public class RedeliveryPolicy {
             // 添加 ±20% 的抖动
             double jitterFactor = 0.8 + Math.random() * 0.4;
             delay = (long) (delay * jitterFactor);
+            // jitter 后再次钳制:±20% 抖动不得突破 maxDelayMs 硬上限
+            // (旧实现 jitter 在钳制之后,50% 概率返回 maxDelayMs 的 1.0~1.2 倍)。
+            delay = Math.min(delay, maxDelayMs);
         }
 
         return delay;

@@ -150,20 +150,32 @@ public final class GroupCommitBarrier implements AutoCloseable {
         } finally { lock.unlock(); }
     }
 
-    /** 内联 force 主体(在平台线程执行):snapshot 已取,force 后推进 frontier 并唤醒等待者。 */
+    /**
+     * 内联 force 主体(在平台线程执行):snapshot 已取,force 成功后推进 frontier 并唤醒等待者。
+     *
+     * <p><b>失败不发布</b>:forceDirty/flush 抛异常(ENOSPC/EIO/段已关闭)时,字节并未落盘,
+     * 推进 frontier 会让其他在兜底分支等待的写者误判"已被覆盖"而返回成功——虚假的 DURABLE
+     * 确认,崩溃即丢数据。与 daemon loop 一致:仅成功后发布;失败时唤醒等待者使其接管重试,
+     * 异常上抛给本轮执行者(其 awaitCommit 抛错,由调用方决策补偿)。
+     */
     private void doInlineForce(long pending) {
         try {
             store.forceDirty();
             tail.flush();
-        } finally {
+        } catch (RuntimeException e) {
             lock.lock();
             try {
-                if (pending > flushedTicket) {   // 不回退:daemon 可能已推进更高 frontier
-                    flushedTicket = pending;
-                }
-                committed.signalAll();
+                committed.signalAll();   // 唤醒等待者重试/自行接管 force;frontier 不动
             } finally { lock.unlock(); }
+            throw e;
         }
+        lock.lock();
+        try {
+            if (pending > flushedTicket) {   // 不回退:daemon 可能已推进更高 frontier
+                flushedTicket = pending;
+            }
+            committed.signalAll();
+        } finally { lock.unlock(); }
     }
 
     public long currentGeneration() { return flushedTicket; }
