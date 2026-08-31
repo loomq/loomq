@@ -592,7 +592,9 @@ public class LoomqEngine implements AutoCloseable {
      * 获取 Intent 存储只读视图。
      *
      * 返回的视图仅暴露读操作，写操作抛出 UnsupportedOperationException。
-     * 需要写入 Intent 请通过 {@link #getCommandService()}。
+     * 需要写入 Intent 请通过引擎命令方法:{@link #createIntent(Intent, AckMode)}、
+     * {@link #updateIntent(String, Consumer, Instant)}、{@link #cancelIntent(String)}、
+     * {@link #fireNow(String)}(IntentCommandService 不再直接暴露)。
      */
     public IntentStore getIntentStore() {
         return new ReadOnlyIntentStoreView(intentStore);
@@ -603,13 +605,6 @@ public class LoomqEngine implements AutoCloseable {
      */
     IntentStore getIntentStoreInternal() {
         return intentStore;
-    }
-
-    /**
-     * 获取命令服务。
-     */
-    public IntentCommandService getCommandService() {
-        return commandService;
     }
 
     /**

@@ -661,7 +661,7 @@ class IntentUpdater {
      * P1-2 post-check(round 14 收口至 ColdHotReconciler;update/fireNow 冷命令共用本路由;
      * post-check 为竞态兜底——stale 副本的主收口是窗口内 fresh 副本 upsert 本身)。
      *
-     * <p><b>为什么窗口内也注册 cohort(spec 4.4 安全网)</b>:promote 回调的复核回滚是<b>条件
+     * <p><b>为什么窗口内也注册 cohort(round 13 冷改期设计的安全网)</b>:promote 回调的复核回滚是<b>条件
      * 回滚</b>(round 15 终审 F2:索引失配且热副本 revision 不高于载入 revision 才回滚,判据以
      * upsert 前捕获的载入 revision 为基准)——曾表述的"无条件按 id 删热副本、在途旧 promote
      * 交错时误删刚热载新副本"窗口已被该守卫关闭。cohort 注册仍保留为自愈安全网:覆盖副本

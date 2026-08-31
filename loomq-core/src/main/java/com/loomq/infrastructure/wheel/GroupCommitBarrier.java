@@ -250,7 +250,14 @@ public final class GroupCommitBarrier implements AutoCloseable {
         }
     }
 
-    /** 仅停止 daemon，不执行最终 force（test-only：供 simulateCrash 使用；非生产 API）。 */
+    /**
+     * 仅停止 daemon,不执行最终 force——<b>非生产 API,唯一合法调用方是
+     * {@code com.loomq.LoomqEngine#simulateCrash()}(跨包调用,故保持 public,不得收窄
+     * 为包私有或下沉测试桥)</b>。语义 = 模拟进程崩溃:刻意跳过 {@link #close()} 的最终
+     * forceDirty。生产关闭路径必须走 {@link #close()}:最终 force 是 AckMode.DURABLE
+     * 「awaitCommit 返回即已 msync」契约的收口,绕过它即打开 DURABLE 虚假确认窗口。
+     * 新增调用方视为契约变更,须先修订本 javadoc 并在引擎层留等效警示。
+     */
     public void stopWithoutFlush() {
         running.set(false);
     }

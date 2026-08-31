@@ -50,13 +50,22 @@ stateDiagram-v2
     DUE --> CANCELED
     DISPATCHING --> DELIVERED
     DISPATCHING --> DEAD_LETTERED
+    DISPATCHING --> EXPIRED
     DELIVERED --> ACKED
     DELIVERED --> EXPIRED
+    SCHEDULED --> EXPIRED
+    SCHEDULED --> DEAD_LETTERED
+    DUE --> EXPIRED
+    DUE --> DEAD_LETTERED
+    DISPATCHING --> SCHEDULED : RETRY (重试退避后重排)
+    DEAD_LETTERED --> SCHEDULED : revive
     CANCELED --> [*]
     ACKED --> [*]
     EXPIRED --> [*]
     DEAD_LETTERED --> [*]
 ```
+
+> 注:本图为可读性投影(简化图);唯一权威是 `Intent.validateTransition`(含 DEAD_LETTERED→SCHEDULED revive 与全部终态入口)。图与 switch 不一致时以 switch 为准,修图不改 switch。
 
 The current code defines the lifecycle in [`IntentStatus`](../../loomq-core/src/main/java/com/loomq/domain/intent/IntentStatus.java).
 
@@ -91,7 +100,7 @@ LoomQ 的持久性保证取决于创建 Intent 时选择的 `AckMode`。理解�
 |:--------|:---------|:------------|:---------|:---------|
 | `ASYNC` | 写入 WheelStore/TailIndex 的 mmap，不等 msync | 写入内存后立即返回 | **有 — API 返回成功不等于数据已持久化，进程崩溃后 Intent 可能丢失** | 低延迟、明确接受 at-most-once 语义 |
 | `DURABLE`（默认） | 阻塞至 group-commit msync 完成 | 等待 group-commit msync 落盘 | 无 — PHTW 已落盘 | 大多数业务场景 |
-| `REPLICATED` | 预留：多副本确认 | 等待多副本 ack | 无 — 多副本保障 | 金融、交易等零丢失场景（未来集群） |
+| `REPLICATED` | **预留（当前映射 DURABLE）**：多副本确认未实现，持久化写入与 DURABLE 同臂（`IntentCommandService` 守卫 switch 实证） | 等同 DURABLE | 等同 DURABLE — **无**多副本保障 | 金融、交易等零丢失场景（待未来集群能力落地后另行实现） |
 
 ### 崩溃窗口详解（ASYNC 模式）
 
@@ -116,7 +125,7 @@ LoomQ 的持久性保证取决于创建 Intent 时选择的 `AckMode`。理解�
 
 | 操作 | 持久化模式 | 说明 |
 |:-----|:---------|:-----|
-| `createIntent` | 由 `ackLevel` 参数决定 | 可选 ASYNC/DURABLE/REPLICATED |
+| `createIntent` | 由 `ackMode` 参数决定 | 可选 ASYNC/DURABLE（REPLICATED 预留，当前映射 DURABLE） |
 | `updateIntent` | 始终 DURABLE | 硬编码 `AckMode.DURABLE` |
 | `cancelIntent` | 始终 DURABLE | 硬编码 `AckMode.DURABLE` |
 | `fireNow` | 始终 DURABLE | 硬编码 `AckMode.DURABLE` |

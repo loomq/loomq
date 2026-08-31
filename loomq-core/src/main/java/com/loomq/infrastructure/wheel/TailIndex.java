@@ -178,7 +178,7 @@ public final class TailIndex implements AutoCloseable {
      * appendTombstone→applyRemove,使每条提升对并发 {@link #put}/{@link #remove} 原子。
      * {@code store.put} 是 mmap memcpy(无 I/O),持锁期间开销可忽略。</p>
      *
-     * <p><b>崩溃窗口(v1 已知限制,spec §11 接受)</b>:若进程在 {@code store.put}(已分配
+     * <p><b>崩溃窗口(v1 已知限制,设计权衡接受)</b>:若进程在 {@code store.put}(已分配
      * wheel 槽)与 tombstone 追加之间崩溃,recovery 会重新提升该 intentId → 同一 intentId
      * 在 wheel 中分配第二个槽。{@code WheelRecovery}(Task 8)按 intentId 去重(取最大
      * revision),故不会重复投递——仅浪费一个过期后即删的桶槽。v1 选择"宁可多分配,

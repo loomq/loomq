@@ -135,9 +135,10 @@ public final class WheelRecovery {
                 } else {
                     maxRevisions.put(id, intent.getRevision());
                     // C18-1a(r18): 终态多槽胜者也补标 multiSlot——overdue 变体(P0-2 经
-                    // overwriteSlot 直接终态化)不产生任何进程内簿记,count>1 时陈旧兄弟槽
-                    // 留盘,同进程重建→终态→回收→再重建的链条在本进程内即可复现遮蔽;补标后
-                    // 重建终态 !singleSlot → tombstoneIds.add → 永久保护。
+                    // overwriteSlot 直接终态化)在 r19 之前不产生任何进程内簿记(r19 起 overdue
+                    // 臂自带同款补标,本臂兜底恢复时刻磁盘上已存在的终态多槽残留),count>1 时
+                    // 陈旧兄弟槽留盘,同进程重建→终态→回收→再重建的链条在本进程内即可复现遮蔽;
+                    // 补标后重建终态 !singleSlot → tombstoneIds.add → 永久保护。
                     if (count > 1) {
                         multiSlot.add(id);
                     }
@@ -163,6 +164,18 @@ public final class WheelRecovery {
                     // 同进程重建会种子到与终态墓碑平票的 revision,重启去重(严格 >,平票
                     // 先扫到者胜)被过去时刻的终态槽遮蔽。
                     maxRevisions.put(id, intent.getRevision());
+                    // C18-1a 对称臂(r19): overdue count>1 时陈旧兄弟槽留盘,补标 multiSlot——同进程重建
+                    // incarnation 终态时 persistTerminalInPlace 判 !singleSlot → tombstoneIds.add,
+                    // 重建槽按多槽墓碑语义保留(与 terminal else 臂 r18 补标对齐;缺此标则重建终态被
+                    // 误判单槽回收 → maxRevisions.remove → 再重建被本墓碑遮蔽)。
+                    if (count > 1) {
+                        multiSlot.add(id);
+                    }
+                    // C18-1b 对称臂(r19): overdue 终态槽(原地覆写)在下一次重启前始终是磁盘残留
+                    // (wheel 单槽残留至重启 freeSlot 自愈;tail 终态永不回收,C3-3)→ 注入墓碑集,
+                    // 保护 maxRevisions 种子映射不被本进程内重建 incarnation 的单槽终态回收移除(C4-1)。
+                    // 无条件补标:count==1 时残留同样存在(覆写槽自身),count>1 由上一行覆盖多槽态。
+                    tombstonedIds.add(id);
                     // 终态原地覆写,不分配新槽:原实现 store.put 会为过期 executeAt 分配新槽,
                     // 旧 SCHEDULED 槽残留(stale 兄弟),同 id 槽数恒为 2 → 终态槽因 count>1
                     // 永不回收,只能等桶文件过期(31 天)被 BucketReclaimer 删除;tail 来源的

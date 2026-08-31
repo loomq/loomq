@@ -96,11 +96,17 @@ stateDiagram-v2
     DELIVERED --> ACKED : 投递成功闭环
     SCHEDULED --> EXPIRED : 超过 deadline (分频检查)
     DUE --> EXPIRED : 超过 deadline
+    SCHEDULED --> DEAD_LETTERED : DEAD_LETTER (过期/重排后判死)
+    DUE --> DEAD_LETTERED : DEAD_LETTER (过期判死)
+    DELIVERED --> EXPIRED : 超过 deadline
+    DEAD_LETTERED --> SCHEDULED : revive
     CANCELED --> [*]
     ACKED --> [*]
     EXPIRED --> [*]
     DEAD_LETTERED --> [*]
 ```
+
+> 注:本图为可读性投影(简化图);唯一权威是 `Intent.validateTransition`(含 DEAD_LETTERED→SCHEDULED revive 与全部终态入口)。图与 switch 不一致时以 switch 为准,修图不改 switch。
 
 | 状态 | 含义 | 终态 |
 |------|------|------|
@@ -183,7 +189,7 @@ stateDiagram-v2
 
 - 每层一 wheel：`SEC(1s×60)` / `MIN(60s×60)` / `HOUR(1h×24)` / `DAY(24h×horizonDays)`，默认视界 30 天；`pickTier(delta)` 按延迟选层。
 - 桶 = 一个 mmap 文件：`<dataDir>/<tier>/<bucketKey>.bin`，`bucketKey = floor(executeAt / windowMs)` 绝对寻址（非滚动）。每桶 `slotsPerBucket`（默认 **1024**）个 **256B 定长槽**，桶文件创建即 truncate 到定长。
-- 槽格式（`SlotCodec`）：`status(1) | revision(8) | CRC32(4) | executeAt(8) | idLen(1) | intentId(≤24B) | payload(≤210B)`。CRC 覆盖 revision 之后的字节，撕裂写可检出并跳过。
+- 槽格式（`SlotCodec`）：`status(1) | revision(8) | CRC32(4) | executeAt(8) | idLen(1) | intentId(≤24B) | payload(≤210B)`。CRC 覆盖 status+revision（[0..8]）与 executeAt..end（[13..255]）两段，仅跳过 CRC 字段自身（[9..12]），撕裂写可检出并跳过（权威表述见 `SlotCodec` 类头注释）。
 - **单槽 compaction + 溢出链**：`alloc()` 无锁分槽，先服 free-list（回收槽复用）再 `next` 单调分配；启动时 `rebuildFreeList()` 全桶扫描，空槽入 free-list、`next` 置 `slotsPerBucket`（防 free-list 耗尽后 mint 已发索引）。终态经 `persistTerminalInPlace` 原地覆写最新槽 + `reclaimTerminal` 清空入 free-list；重排程过的多槽 Intent 保留终态槽作 tombstone。桶满走溢出链 spill（SEC→MIN→HOUR→DAY）。同一 intentId 的多版本由恢复时按 **max revision 去重**裁决。
 - 底层使用 Java FFM API（`Arena.ofShared()` + `MemorySegment`）做 mmap；`forceDirty()` 只对"写计数 > 已刷计数"的脏桶 `seg.force()`。
 - **终态记录语义**：wheel 是"当前真相"而非"投递历史"。在途期间 update 内容后，终态落盘记录携带的是最新内容而非首轮投递内容。终态槽回收 + 陈旧槽由 recovery 按 max revision 去重，不构成投递历史。

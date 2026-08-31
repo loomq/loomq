@@ -450,7 +450,14 @@ public class Intent {
     }
 
     /**
-     * 更新最后投递 ID
+     * 更新最后投递 ID。
+     *
+     * <p><b>预留字段——当前无生产写入者(C18-5,r19 记档)</b>:全库零调用方。槽格式通道
+     * 已就绪(SlotCodec TLV 0x0C 编解码对称)但编码端因字段恒 null 从不写出,反序列化值
+     * 恒为 null;{@code SettlementEngine.shouldRedeliver} 以 intentId 回退充当
+     * RedeliveryDecider 的 deliveryId 上下文。保留字段位与 TLV 标签以稳定槽格式;
+     * 接线(派发时生成 deliveryId,如 intentId:attempt)或删除(动槽格式,round 11
+     * shardKey 先例)均属产品决策,留给真实用户诉求驱动,内核内不得顺手处理。</p>
      */
     public void setLastDeliveryId(String deliveryId) {
         this.lastDeliveryId = deliveryId;

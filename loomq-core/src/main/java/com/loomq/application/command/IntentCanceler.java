@@ -238,7 +238,7 @@ final class IntentCanceler {
                     // 并发取消互不阻塞 → double-write + double 计数。按 intentId 串行化:第二个取消者
                     // 串行进入后重读索引拿到先到者写入的 CANCELED 新槽(terminal)→ transitionTo
                     // 抛 ISE → 返回 false。
-                    Intent cold = wheelStore.readSlot(latest);
+                    Intent cold = persistence.readColdSlot(intentId, latest);   // A12(r19): 统一走冷读缝(本分支 latest 必非 tail,表达式逐字等价;缝用户 2/3 → 3/3)
                     if (cold == null) {
                         // 槽位缺失/损坏(空槽、撕裂写或桶已回收):无法持久化取消。
                         // 不可谎报成功——返回 false,调用方得知取消未生效(索引与 cohort 保持原状)。

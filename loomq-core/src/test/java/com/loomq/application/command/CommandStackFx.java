@@ -15,6 +15,7 @@ import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.infrastructure.wheel.WheelStore;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.testutil.TestWheelConfigs;
 import com.loomq.tracing.IntentTraceStore;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -33,10 +34,9 @@ import java.util.function.LongSupplier;
  * start 三件套(barrier/daemon/scheduler)与 close 五件套(scheduler → daemon → barrier →
  * tail → store)配对收口;投递桩统一 DEAD_LETTER 完成态。
  *
- * <p>旋钮化五处既有语义分叉(时钟/promote 回调/revision 种子/是否启动调度器),分叉依据见
- * round 16 spec §4.5——种子与否、启动与否逐字保留各测试原语义,不做顺手统一。失败注入桩
+ * <p>旋钮化五处既有语义分叉(时钟/promote 回调/revision 种子/是否启动调度器),分叉依据为 round 16 夹具收口时的既定决定——种子与否、启动与否逐字保留各测试原语义,不做顺手统一。失败注入桩
  * (PrecisionScheduler/WheelPersistence 子类、go 门闩、探针)仍留各测试文件本地,本夹具只承载
- * 真实组件栈。先例:testutil/TestWheelConfigs 共享工厂模式。</p>
+ * 真实组件栈。WheelConfig 构造复用 testutil/TestWheelConfigs 共享工厂(A6,r19)。</p>
  */
 final class CommandStackFx implements AutoCloseable {
 
@@ -80,9 +80,9 @@ final class CommandStackFx implements AutoCloseable {
 
     CommandStackFx(Path dir, Options options) {
         this.options = options;
-        // T2 后 7 参便捷构造:30d / 16 槽 / 1ms / 10s / 60min / 60s(retention/compaction 走默认)
-        WheelConfig cfg = new WheelConfig(dir.toString(), 30, 16, 1, 10_000L,
-            HOT_BOUNDARY_MS, PROMOTION_LEAD_MS);
+        // A6(r19): WheelConfig 默认参数单点取自 TestWheelConfigs.defaults(逐字等价),
+        // 防双工厂漂移;HOT_BOUNDARY_MS/PROMOTION_LEAD_MS 常量保留(:96/:101 仍引用)。
+        WheelConfig cfg = TestWheelConfigs.defaults(dir);
         store = new WheelStore(cfg, options.clock());
         tail = new TailIndex(dir, options.clock());
         barrier = new GroupCommitBarrier(store, tail, 1, 10_000);
