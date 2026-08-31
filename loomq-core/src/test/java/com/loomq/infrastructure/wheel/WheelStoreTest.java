@@ -1,13 +1,19 @@
 package com.loomq.infrastructure.wheel;
-
 import static org.junit.jupiter.api.Assertions.*;
 
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.testutil.TestWheelConfigs;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -16,7 +22,7 @@ class WheelStoreTest {
     @TempDir Path tmp;
 
     private WheelStore newStore(AtomicLong clock) {
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         return new WheelStore(cfg, clock::get);
     }
 
@@ -54,7 +60,7 @@ class WheelStoreTest {
                 s.put(it);
             }
             List<Intent> found = new ArrayList<>();
-            s.scanFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(found::add);
+            s.scanSlotsFrom(Instant.ofEpochMilli(clock.get())).forEachRemaining(e -> found.add(e.intent()));
             assertEquals(3, found.size());
         }
     }
@@ -74,7 +80,7 @@ class WheelStoreTest {
     @Test
     void shouldNotOverwriteExistingSlotsOnRestart() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         // Phase 1: write 3 intents into the same future bucket, close.
         String id1, id2, id3;
         try (WheelStore s1 = newStore(clock)) {
@@ -97,10 +103,10 @@ class WheelStoreTest {
             d.transitionTo(IntentStatus.SCHEDULED);
             s2.put(d);
 
-            // scanFrom must return all 4 (3 original + 1 new), none overwritten
-            var iter = s2.scanFrom(Instant.ofEpochMilli(clock.get()));
+            // scanSlotsFrom must return all 4 (3 original + 1 new), none overwritten
+            var iter = s2.scanSlotsFrom(Instant.ofEpochMilli(clock.get()));
             java.util.Set<String> ids = new java.util.HashSet<>();
-            while (iter.hasNext()) ids.add(iter.next().getIntentId());
+            while (iter.hasNext()) ids.add(iter.next().intent().getIntentId());
             assertTrue(ids.contains(id1), "id1 must survive restart");
             assertTrue(ids.contains(id2), "id2 must survive restart");
             assertTrue(ids.contains(id3), "id3 must survive restart");
@@ -120,7 +126,7 @@ class WheelStoreTest {
     @Test
     void deleteBucketMustNotDeleteRecreatedBucketFile() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 16, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = TestWheelConfigs.defaults(tmp);
         // 过去 40 天的 executeAt(> retention = 31 天),SEC 桶
         long pastMs = clock.get() - 40L * 24 * 60 * 60_000L;
 
@@ -151,5 +157,64 @@ class WheelStoreTest {
             assertEquals(1, slots.size(), "recreated bucket file must survive deleteBucket (TOCTOU guard)");
             assertEquals("intent_reclaim_b001", slots.get(0).getIntentId());
         }
+    }
+
+    /**
+     * deleteBucket 与在途 put 的竞态:put 已取到桶引用后,桶被回收(close)并删文件。
+     * 旧代码写入已关闭桶的映射段(映射段在 channel close 后仍可写,静默成功)→ 字节随
+     * 文件消失,create 返回成功但 Intent 静默丢失。此竞态无需时钟回拨:IntentValidator
+     * 不禁止过去时刻 executeAt,create(executeAt=深过去) 与 reclaimer 回收同桶即可命中。
+     * 修复:write() 在 forceLock readLock 内检测 closed 抛 {@link BucketClosedException},
+     * put() 捕获后移除死桶引用、重试进新桶(有界),绝不把 loc 落入已关闭桶。
+     */
+    @Test
+    void putMustNotReturnLocationIntoClosedBucket() throws Exception {
+        AtomicLong clock = new AtomicLong(Instant.parse("2026-06-30T00:00:00Z").toEpochMilli());
+        try (WheelStore store = newStore(clock)) {
+            long pastMs = clock.get() - 40L * 24 * 60 * 60_000L;  // 过去 40 天,同 TOCTOU 测试
+            Intent a = new Intent("intent_closed_a001");
+            a.setExecuteAt(Instant.ofEpochMilli(pastMs));
+            a.transitionTo(IntentStatus.SCHEDULED);
+            SlotLocation locA = store.put(a);
+            assertFalse(locA.inTail());
+
+            // 模拟 deleteBucket:桶已 close(回收),文件已删;put 仍持旧桶引用
+            Object closedBucket = bucketOf(store, locA);
+            closeBucket(closedBucket);
+            Path bucketFile = Paths.get(tmp.toString(), locA.tier().name().toLowerCase(),
+                String.format("%020d.bin", locA.bucketKey()));
+            Files.deleteIfExists(bucketFile);
+
+            Intent c = new Intent("intent_closed_b001");
+            c.setExecuteAt(Instant.ofEpochMilli(pastMs));
+            c.transitionTo(IntentStatus.SCHEDULED);
+            SlotLocation locC = store.put(c);  // 必须重试进新桶,不得落入已关闭桶
+
+            Object freshBucket = bucketOf(store, locC);
+            assertNotSame(closedBucket, freshBucket, "put must retry into a fresh bucket");
+            assertFalse(isBucketClosed(freshBucket));
+            assertEquals(c.getIntentId(), store.readSlot(locC).getIntentId());
+        }
+    }
+
+    private static Object bucketOf(WheelStore store, SlotLocation loc) throws Exception {
+        Field wheelsField = WheelStore.class.getDeclaredField("wheels");
+        wheelsField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<WheelTier, ConcurrentHashMap<Long, Object>> wheels =
+            (Map<WheelTier, ConcurrentHashMap<Long, Object>>) wheelsField.get(store);
+        return wheels.get(loc.tier()).get(loc.bucketKey());
+    }
+
+    private static void closeBucket(Object bucket) throws Exception {
+        Method close = bucket.getClass().getDeclaredMethod("close");
+        close.setAccessible(true);
+        close.invoke(bucket);
+    }
+
+    private static boolean isBucketClosed(Object bucket) throws Exception {
+        Field closed = bucket.getClass().getDeclaredField("closed");
+        closed.setAccessible(true);
+        return (boolean) closed.get(bucket);
     }
 }

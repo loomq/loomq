@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 投递上下文
@@ -126,7 +127,7 @@ public class DeliveryContext {
     public boolean isTimeout() {
         return hasException() &&
                (exception instanceof java.net.SocketTimeoutException ||
-                exception instanceof java.util.concurrent.TimeoutException);
+                exception instanceof TimeoutException);
     }
 
     /**

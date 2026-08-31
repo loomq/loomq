@@ -1,5 +1,10 @@
 package com.loomq.infrastructure.wheel;
 
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
@@ -40,15 +45,12 @@ public final class GroupCommitBarrier implements AutoCloseable {
     private final AtomicBoolean inlineForceInFlight = new AtomicBoolean(false);
     /** 内联 force 兜底执行器(平台线程):msync 是 native 阻塞,在 VT 上会 pin carrier,
      *  慢盘下批量 pin 致 VT 调度雪崩。移交平台线程,调用 VT 在 future.get() 上 park(不 pin)。 */
-    private final java.util.concurrent.ExecutorService inlineForceExecutor =
-        java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+    private final ExecutorService inlineForceExecutor =
+        Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "wheel-inline-force");
             t.setDaemon(true);
             return t;
         });
-    /** 内联 force 兜底触发次数(可观测慢盘压力)。 */
-    private final AtomicLong inlineForceFallbacks = new AtomicLong(0);
-    public long getInlineForceFallbacks() { return inlineForceFallbacks.get(); }
 
     public GroupCommitBarrier(WheelStore store, TailIndex tail, long intervalMs, long awaitCommitTimeoutMs) {
         this.store = store;
@@ -109,10 +111,15 @@ public final class GroupCommitBarrier implements AutoCloseable {
             if (inlineForceInFlight.compareAndSet(false, true)) {
                 // 本轮由我执行内联 force
                 final long pending = writeTicket.get();
-                inlineForceFallbacks.incrementAndGet();
                 try {
                     inlineForceExecutor.submit(() -> doInlineForce(pending)).get();
-                } catch (java.util.concurrent.ExecutionException ee) {
+                } catch (RejectedExecutionException ree) {
+                    // R21: close() 已关执行器(stop/close 交错)——写者字节已在 mmap,若按
+                    // 失败回滚而字节已持久化,重启后 SCHEDULED 槽复活 = 幽灵投递(正是段 2
+                    // 兜底要防的窗口)。shutdown 期间在调用线程同步 force(接受短暂 pin,
+                    // 正确性优先);force 成功即发布 frontier,写者按成功返回。
+                    doInlineForce(pending);
+                } catch (ExecutionException ee) {
                     Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
                     throw new RuntimeException("inline force fallback failed, ticket=" + myTicket, cause);
                 } catch (InterruptedException ie) {
@@ -188,7 +195,12 @@ public final class GroupCommitBarrier implements AutoCloseable {
                 tail.flush();                       // forces tail run file buffer (>30-day Intent writes) to disk
                 lock.lock();
                 try {
-                    flushedTicket = pending;        // publish: writes with ticket <= pending are now forced
+                    // C2-11: 单调发布守卫(镜像 doInlineForce)——daemon force 期间可能有超时
+                    // 写者走内联 force 并发布了更高 frontier;无条件回退发布会让 frontier
+                    // 非单调(违反 javadoc 表述)。守卫仅保守多等,无虚假成功。
+                    if (pending > flushedTicket) {
+                        flushedTicket = pending;    // publish: writes with ticket <= pending are now forced
+                    }
                     committed.signalAll();
                 } finally { lock.unlock(); }
             } catch (Exception e) {
@@ -200,31 +212,36 @@ public final class GroupCommitBarrier implements AutoCloseable {
     }
 
     @Override public void close() {
-        if (!running.compareAndSet(true, false)) return;
-        // Drain in-flight DURABLE writers: a final force covers all writes whose bytes are
-        // already in mmap, then publish the durability frontier so blocked awaitCommit callers
-        // return success. Without this, close() stops the loop without advancing flushedTicket;
-        // in-flight writers would each hit the configurable awaitCommit timeout and fall back to
-        // their own inline force — racing wheelStore.close()'s force during shutdown. The drain
-        // makes shutdown deterministic and fast.
-        try {
-            store.forceDirty();
-            tail.flush();
-            long pending = writeTicket.get();
-            lock.lock();
+        boolean wasRunning = running.compareAndSet(true, false);
+        if (wasRunning) {
+            // Drain in-flight DURABLE writers: a final force covers all writes whose bytes are
+            // already in mmap, then publish the durability frontier so blocked awaitCommit callers
+            // return success. Without this, close() stops the loop without advancing flushedTicket;
+            // in-flight writers would each hit the configurable awaitCommit timeout and fall back to
+            // their own inline force — racing wheelStore.close()'s force during shutdown. The drain
+            // makes shutdown deterministic and fast.
             try {
-                flushedTicket = pending;
-                committed.signalAll();
-            } finally { lock.unlock(); }
-        } catch (Exception e) {
-            log.error("final group-commit force on close failed", e);
+                store.forceDirty();
+                tail.flush();
+                long pending = writeTicket.get();
+                lock.lock();
+                try {
+                    if (pending > flushedTicket) {   // C2-11: 单调发布(同 daemon loop)
+                        flushedTicket = pending;
+                    }
+                    committed.signalAll();
+                } finally { lock.unlock(); }
+            } catch (Exception e) {
+                log.error("final group-commit force on close failed", e);
+            }
         }
+        // 无论是否曾启动，都尝试中断/join 线程；未启动线程的 join 会立即返回。
         thread.interrupt();
         try { thread.join(5000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-        // 关闭内联 force 执行器(平台线程)
+        // 关闭内联 force 执行器(平台线程)。即使 barrier 从未 start，也必须释放该线程池。
         inlineForceExecutor.shutdown();
         try {
-            if (!inlineForceExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            if (!inlineForceExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 inlineForceExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {
@@ -233,7 +250,14 @@ public final class GroupCommitBarrier implements AutoCloseable {
         }
     }
 
-    /** 仅停止 daemon，不执行最终 force（test-only：供 simulateCrash 使用；非生产 API）。 */
+    /**
+     * 仅停止 daemon,不执行最终 force——<b>非生产 API,唯一合法调用方是
+     * {@code com.loomq.LoomqEngine#simulateCrash()}(跨包调用,故保持 public,不得收窄
+     * 为包私有或下沉测试桥)</b>。语义 = 模拟进程崩溃:刻意跳过 {@link #close()} 的最终
+     * forceDirty。生产关闭路径必须走 {@link #close()}:最终 force 是 AckMode.DURABLE
+     * 「awaitCommit 返回即已 msync」契约的收口,绕过它即打开 DURABLE 虚假确认窗口。
+     * 新增调用方视为契约变更,须先修订本 javadoc 并在引擎层留等效警示。
+     */
     public void stopWithoutFlush() {
         running.set(false);
     }

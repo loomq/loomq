@@ -5,6 +5,7 @@ import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.domain.intent.PrecisionTierCatalog;
+import com.loomq.domain.intent.RedeliveryPolicy;
 import com.loomq.domain.intent.WalMode;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -92,6 +93,20 @@ public final class SlotCodec {
         return decodePayload(payload, intentId, statusOrd, revision, executeAtPacked);
     }
 
+    /**
+     * 防御性解码:CRC/格式/未知状态码等任何异常一律返回 null(调用方按"损坏条目跳过"处理)。
+     * 收敛 IntentCreator.hasActiveDuplicate(round 10 前在 IntentCommandService) /
+     * TailIndex.promoteInto / WheelRecovery
+     * 三处手写 try/catch(损坏 tail 记录中断启动/创建的历史故障点)。
+     */
+    public static Intent decodeSafe(byte[] slot) {
+        try {
+            return decode(slot);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     public static boolean isOccupied(byte[] slot) {
         return slot != null && slot.length == SLOT_SIZE && slot[OFF_STATUS] != 0;
     }
@@ -117,14 +132,26 @@ public final class SlotCodec {
         if (intent.getExpiredAction() != null) putByte(b, (byte) 0x05, (byte) intent.getExpiredAction().ordinal());
         if (intent.getPrecisionTier() != null) putByte(b, (byte) 0x06, (byte) intent.getPrecisionTier().ordinal());
         if (intent.getWalMode() != null) putByte(b, (byte) 0x07, (byte) intent.getWalMode().ordinal());
-        if (intent.getShardKey() != null) putStr(b, (byte) 0x08, intent.getShardKey());
-        if (intent.getShardId() != null) putStr(b, (byte) 0x09, intent.getShardId());
+        // round 11 弃用 shardKey/shardId 持久化（原 TLV 0x08/0x09）：内核无 Shard 路由概念，
+        // 字段恒写读往返无消费者。tag 号弃置不复用；旧盘数据由 decode 的 default-skip 兼容。
         if (intent.getAttempts() > 0) putInt(b, (byte) 0x0B, intent.getAttempts());
         if (intent.getLastDeliveryId() != null) putStr(b, (byte) 0x0C, intent.getLastDeliveryId());
         if (intent.getIdempotencyKey() != null) putStr(b, (byte) 0x0D, intent.getIdempotencyKey());
         // ADAPTATION: brief 原始 encodePayload 未编码 tags,但 shouldRejectOversizedPayload
         // 依赖 tags 作为业务负载触发溢出。补齐 tags 的 TLV 编解码(0x0E)。
         putTags(b, (byte) 0x0E, intent.getTags());
+        // R20: redelivery 策略必须随槽持久化——重试语义是 Intent 的耐久契约,崩溃恢复后
+        // 丢失会静默回退默认(5000ms/5 次),maxAttempts=2 变 5 次(超契约投递)或
+        // maxAttempts=100 提前死信。仅非 null 时写入(默认 Intent 无策略,零额外体积)。
+        RedeliveryPolicy rp = intent.getRedelivery();
+        if (rp != null) {
+            putInt(b, (byte) 0x0F, rp.getMaxAttempts());
+            putStr(b, (byte) 0x10, rp.getBackoff());
+            putLong(b, (byte) 0x11, rp.getInitialDelayMs());
+            putLong(b, (byte) 0x12, rp.getMaxDelayMs());
+            putDouble(b, (byte) 0x13, rp.getMultiplier());
+            putByte(b, (byte) 0x14, (byte) (rp.isJitter() ? 1 : 0));
+        }
         byte[] result = new byte[b.position()];
         System.arraycopy(b.array(), 0, result, 0, result.length);
         return result;
@@ -134,9 +161,11 @@ public final class SlotCodec {
         ByteBuffer b = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
         String traceId = null; long createdAt = 0, updatedAt = 0, deadline = 0;
         ExpiredAction expiredAction = null; PrecisionTier tier = null; WalMode walMode = null;
-        String shardKey = null, shardId = null;
         int attempts = 0; String lastDeliveryId = null, idempotencyKey = null;
         Map<String, String> tags = null; // ADAPTATION: 支持 tags 回读
+        boolean hasRedelivery = false;
+        int maxAttempts = 0; String backoff = null;
+        long initialDelayMs = 0, maxDelayMs = 0; double multiplier = 0; boolean jitter = false;
 
         while (b.hasRemaining()) {
             byte type = b.get();
@@ -151,27 +180,48 @@ public final class SlotCodec {
                 case 0x02 -> createdAt = b.getLong();
                 case 0x03 -> updatedAt = b.getLong();
                 case 0x04 -> deadline = b.getLong();
-                case 0x05 -> expiredAction = ExpiredAction.values()[b.get()];
+                case 0x05 -> {
+                    // R21: ordinal 有界守卫(同 decodeWalMode/tierByOrdinal 约定)——
+                    // 未来版本新增枚举值后降级运行旧版本,越界会裸 AIOOBE。未知值按
+                    // null 回退(构造器默认 DISCARD),与其余枚举回退语义一致。
+                    int ordinal = b.get() & 0xFF;
+                    expiredAction = ordinal < ExpiredAction.values().length
+                        ? ExpiredAction.values()[ordinal] : null;
+                }
                 case 0x06 -> tier = PrecisionTierCatalog.defaultCatalog().tierByOrdinal(b.get() & 0xFF);
                 case 0x07 -> walMode = decodeWalMode(b.get() & 0xFF);
-                case 0x08 -> shardKey = getStr(b, len);
-                case 0x09 -> shardId = getStr(b, len);
                 case 0x0B -> attempts = b.getInt();
                 case 0x0C -> lastDeliveryId = getStr(b, len);
                 case 0x0D -> idempotencyKey = getStr(b, len);
                 case 0x0E -> tags = getTags(b, len); // ADAPTATION: tags 回读
+                case 0x0F -> { maxAttempts = b.getInt(); hasRedelivery = true; }
+                case 0x10 -> backoff = getStr(b, len);
+                case 0x11 -> initialDelayMs = b.getLong();
+                case 0x12 -> maxDelayMs = b.getLong();
+                case 0x13 -> multiplier = b.getDouble();
+                case 0x14 -> jitter = b.get() != 0;
                 default -> b.position(start + len);
             }
             if (b.position() != start + len) b.position(start + len); // safety
         }
 
+        // R21: statusOrd 有界守卫——未来版本新增 IntentStatus 后降级运行旧版本,越界
+        // 会裸 AIOOBE 且恢复扫描路径无 try/catch(引擎启动失败且原因不明)。
+        // 状态无合理回退值,明确 fail-loudly(与"格式不匹配即响亮失败"契约一致)。
+        if (statusOrd < 1 || statusOrd > IntentStatus.values().length) {
+            throw new IllegalStateException("unknown intent status ordinal: " + statusOrd);
+        }
         IntentStatus status = IntentStatus.values()[statusOrd - 1];
-        return Intent.restore(traceId, intentId, status,
+        return Intent.restore(new Intent.Snapshot(
+            traceId, intentId, status,
             Instant.ofEpochMilli(createdAt), Instant.ofEpochMilli(updatedAt),
             unpackExecuteAt(executeAtPacked),
             deadline == 0 ? null : Instant.ofEpochMilli(deadline),
-            expiredAction, tier, walMode, shardKey, shardId,
-            null, null, idempotencyKey, tags, attempts, lastDeliveryId, revision);
+            expiredAction, tier, walMode,
+            null, // callback 不持久化：重启/恢复/冷路径载入后恒 null
+            hasRedelivery ? new RedeliveryPolicy(maxAttempts, backoff, initialDelayMs, maxDelayMs,
+                multiplier, jitter) : null,
+            idempotencyKey, tags, attempts, lastDeliveryId, revision));
     }
 
     /**
@@ -195,6 +245,7 @@ public final class SlotCodec {
     private static void putLong(ByteBuffer b, byte type, long v) { b.put(type); b.putInt(8); b.putLong(v); }
     private static void putInt(ByteBuffer b, byte type, int v) { b.put(type); b.putInt(4); b.putInt(v); }
     private static void putByte(ByteBuffer b, byte type, byte v) { b.put(type); b.putInt(1); b.put(v); }
+    private static void putDouble(ByteBuffer b, byte type, double v) { b.put(type); b.putInt(8); b.putDouble(v); }
     private static String getStr(ByteBuffer b, int len) {
         short sl = b.getShort();
         byte[] bs = new byte[sl]; b.get(bs);
@@ -240,8 +291,6 @@ public final class SlotCodec {
         if (intent.getExpiredAction() != null) n += 6;
         if (intent.getPrecisionTier() != null) n += 6;
         if (intent.getWalMode() != null) n += 6;
-        if (intent.getShardKey() != null) n += 7 + utf8Len(intent.getShardKey());
-        if (intent.getShardId() != null) n += 7 + utf8Len(intent.getShardId());
         if (intent.getAttempts() > 0) n += 9;
         if (intent.getLastDeliveryId() != null) n += 7 + utf8Len(intent.getLastDeliveryId());
         if (intent.getIdempotencyKey() != null) n += 7 + utf8Len(intent.getIdempotencyKey());
@@ -252,6 +301,15 @@ public final class SlotCodec {
                 t += 2 + utf8Len(e.getKey()) + 2 + utf8Len(e.getValue());
             }
             n += 5 + t; // type(1) + len(4) + value
+        }
+        RedeliveryPolicy rp = intent.getRedelivery();
+        if (rp != null) {
+            n += 9;  // maxAttempts int
+            n += rp.getBackoff() == null ? 0 : 7 + utf8Len(rp.getBackoff());
+            n += 13; // initialDelayMs
+            n += 13; // maxDelayMs
+            n += 13; // multiplier double
+            n += 6;  // jitter byte
         }
         return n;
     }

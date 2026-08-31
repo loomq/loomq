@@ -47,6 +47,7 @@ benchmark/
 | `CreateIntentBenchmark` | createIntent / createIntents 批量 DURABLE 吞吐 | `RESULT\|create\|` |
 | `DeliveryPathBenchmark` | 4 档（ULTRA/FAST/STANDARD/MILLI）schedule→deliver→ACKED 吞吐与延迟 + 档位配置盘点 | `RESULT\|delivery\|` / `RESULT\|tier_config\|` |
 | `PrecisionLatencyBenchmark` | 全 4 档（MILLI/ULTRA/FAST/STANDARD）触发精度 p50/p99/p999 + 空闲 CPU | `RESULT\|precision\|` |
+| `StallDetectionTest` | ULTRA 闭合稳态负载停摆检测：投递 `stallThresholdMs`（默认 3000）内零完成即判停摆并抓 JVM 线程转储取证；`-Dstall.expectReproduce=true` 为调查模式（不断言） | `RESULT\|stall\|` |
 
 MILLI 档为 1ms 事件驱动直插桶，吞吐语义与批量档不同（单发、信号驱动），但同一套投递测量逻辑适用。
 
@@ -60,6 +61,8 @@ MILLI 档为 1ms 事件驱动直插桶，吞吐语义与批量档不同（单发
 | `-Scenario <name>` / `--scenario=<name>` | 场景: all / create / delivery / precision | all |
 | `-NoCompile` / `--no-compile` | 跳过编译 | false |
 | `-Compare` / `--compare` | 查看最近一次报告 | false |
+| `-SweepConsumers` / `--sweep-consumers` | 消费者数扫参 | false |
+| `-JavaHome <path>` | JDK 路径 (ps1; sh 用 LOOMQ_JAVA_HOME 环境变量) | 见各脚本默认 |
 
 ### 示例
 
@@ -113,6 +116,8 @@ MD 报告包含五部分：
 {
   "slo": {
     "ULTRA":    { "p95_wakeup_ms": 15,  "p99_wakeup_ms": 25,  "p95_e2e_ms": 50,  "p99_e2e_ms": 100 },
+    "FAST":     { "p95_wakeup_ms": 50,  "p99_wakeup_ms": 60,  "p95_e2e_ms": 100, "p99_e2e_ms": 200 },
+    "STANDARD": { "p95_wakeup_ms": 500, "p99_wakeup_ms": 600, "p95_e2e_ms": 800, "p99_e2e_ms": 1500 },
     "MILLI":    { "p95_wakeup_ms": 1,   "p99_wakeup_ms": 5,   "p95_e2e_ms": 5,   "p99_e2e_ms": 20 }
   },
   "rotation": { "keep_recent": 10 }

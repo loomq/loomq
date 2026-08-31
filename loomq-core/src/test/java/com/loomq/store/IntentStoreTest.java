@@ -292,7 +292,6 @@ class IntentStoreTest {
         Intent intent = new Intent(id);
         intent.setExecuteAt(Instant.now().plusSeconds(60));
         intent.setDeadline(Instant.now().plusSeconds(300));
-        intent.setShardKey("test-shard");
 
         Callback callback = new Callback();
         callback.setUrl("http://example.com/webhook");

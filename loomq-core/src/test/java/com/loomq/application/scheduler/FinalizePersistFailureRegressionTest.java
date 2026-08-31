@@ -2,12 +2,14 @@ package com.loomq.application.scheduler;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -18,7 +20,7 @@ import org.junit.jupiter.api.Test;
 /**
  * Issue B 回归：终态持久化失败不得吞掉 onDelivered / 不得死锁。
  *
- * <p>根因（见 docs/development/issue-b-rootcause-2026-08-07.md）：SEC 轮桶容量溢出时，
+ * <p>根因：SEC 轮桶容量溢出时，
  * finalizeIntent 的 persistStateChange 抛 SlotOverflowException，异常在 synchronized 块内
  * 传播、跳过 notifyObservers(onDelivered)，导致已投递 intent 的通知被吞、基准槽位永久
  * 泄漏、引擎停摆死锁。</p>
@@ -29,6 +31,7 @@ import org.junit.jupiter.api.Test;
 class FinalizePersistFailureRegressionTest {
 
     private PrecisionScheduler scheduler;
+    private MetricsCollector metrics;
     private ConcurrentIntentStore intentStore;
 
     @AfterEach
@@ -42,10 +45,11 @@ class FinalizePersistFailureRegressionTest {
 
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         intentStore = new ConcurrentIntentStore();
-        scheduler = new PrecisionScheduler(intentStore, handler, null);
+        metrics = new MetricsCollector();
+        scheduler = new PrecisionScheduler(intentStore, handler, null, null, metrics, new IntentTraceStore());
 
         // 注入恒失败的终态持久化（模拟 SEC 桶 SlotOverflowException）。
-        scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
+        scheduler.setStateChangeSink(new StateChangeSink() {
             @Override public void persist(Intent intent) {
                 throw new IllegalStateException("bucket overflow: SEC/x (slotsPerBucket=65536)");
             }
@@ -73,6 +77,6 @@ class FinalizePersistFailureRegressionTest {
 
         assertTrue(onDelivered.await(5, TimeUnit.SECONDS),
             "终态持久化失败时 onDelivered 必须仍触发（否则槽位泄漏死锁）");
-        assertTrue(scheduler.getPersistFailures() >= 1, "应记录持久化失败（persistFailures>=1）");
+        assertTrue(metrics.getPersistFailuresTotal() >= 1, "应记录持久化失败（persistFailures>=1）");
     }
 }

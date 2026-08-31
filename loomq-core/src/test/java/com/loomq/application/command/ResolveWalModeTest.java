@@ -6,6 +6,7 @@ import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.domain.intent.PrecisionTier;
+import com.loomq.domain.intent.PrecisionTierCatalog;
 import com.loomq.domain.intent.WalMode;
 import org.junit.jupiter.api.Test;
 
@@ -18,7 +19,7 @@ class ResolveWalModeTest {
         intent.transitionTo(IntentStatus.SCHEDULED);
         intent.setWalMode(WalMode.ASYNC);
 
-        WalMode resolved = IntentCommandService.resolveWalModeForTest(intent, AckMode.DURABLE);
+        WalMode resolved = IntentCommandService.resolveWalMode(PrecisionTierCatalog.defaultCatalog(), intent, AckMode.DURABLE);
         assertSame(WalMode.DURABLE, resolved, "explicit AckMode.DURABLE must win over intent walMode");
     }
 
@@ -33,7 +34,7 @@ class ResolveWalModeTest {
         intent.setPrecisionTier(PrecisionTier.STANDARD);
         intent.transitionTo(IntentStatus.SCHEDULED);
         // 不设 walMode、不传 ackMode → 走 tier-default 路径
-        WalMode resolved = IntentCommandService.resolveWalModeForTest(intent, null);
+        WalMode resolved = IntentCommandService.resolveWalMode(PrecisionTierCatalog.defaultCatalog(), intent, null);
         assertSame(WalMode.DURABLE, resolved, "STANDARD tier default is DURABLE");
     }
 
@@ -51,7 +52,7 @@ class ResolveWalModeTest {
         intent.setPrecisionTier(PrecisionTier.fromString("HIGH"));
         intent.transitionTo(IntentStatus.SCHEDULED);
         // 不设 walMode、不传 ackMode → path-3 tier-default
-        WalMode resolved = IntentCommandService.resolveWalModeForTest(intent, null);
+        WalMode resolved = IntentCommandService.resolveWalMode(PrecisionTierCatalog.defaultCatalog(), intent, null);
         assertSame(PrecisionTier.FAST, intent.getPrecisionTier(), "HIGH must remap to FAST");
         assertSame(WalMode.DURABLE, resolved, "remapped FAST tier default is DURABLE");
     }

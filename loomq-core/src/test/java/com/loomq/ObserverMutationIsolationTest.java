@@ -11,6 +11,7 @@ import com.loomq.domain.intent.RedeliveryPolicy;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
+import com.loomq.testutil.TestEngines;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -99,7 +100,7 @@ class ObserverMutationIsolationTest {
                 "onScheduled must be invoked");
             assertTrue(observer.delivered.await(10, TimeUnit.SECONDS),
                 "onDelivered must be invoked");
-            awaitTerminal(engine, id, Duration.ofSeconds(10));
+            TestEngines.awaitTerminal(engine, id, Duration.ofSeconds(10));
 
             Optional<Intent> result = engine.getIntent(id);
             assertTrue(result.isPresent(), "intent must still be in store after ACKED");
@@ -124,16 +125,4 @@ class ObserverMutationIsolationTest {
         Thread.sleep(200);
     }
 
-    private void awaitTerminal(LoomqEngine engine, String id, Duration timeout)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            Optional<Intent> cur = engine.getIntent(id);
-            if (cur.isPresent() && cur.get().getStatus().isTerminal()) {
-                return;
-            }
-            Thread.sleep(20);
-        }
-        throw new AssertionError("intent " + id + " did not reach terminal within " + timeout);
-    }
 }

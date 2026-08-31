@@ -14,11 +14,13 @@ import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.EnumMap;
 import java.util.concurrent.CompletableFuture;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
 /**
  * 背压行为测试：dispatch queue 满时触发 backpressure 指标 + intent 回退重排。
  */
+@Tag("slow")
 class BackpressureBehaviorTest {
 
     private PrecisionTierCatalog tinyQueueCatalog() {

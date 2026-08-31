@@ -63,7 +63,7 @@ class OverflowSpillEngineTest {
             long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
             while (delivered.get() < 100 && System.currentTimeMillis() < deadline) Thread.sleep(50);
             assertEquals(100, delivered.get(), "spill 吸收溢出：同秒 100 突发全部投递");
-            assertEquals(0, engine.getScheduler().getPersistFailures(),
+            assertEquals(0, engine.getMetricsCollector().getPersistFailuresTotal(),
                 "溢出被 spill 吸收，无持久化失败（无 SlotOverflowException 冒泡到 finalize）");
         }
     }

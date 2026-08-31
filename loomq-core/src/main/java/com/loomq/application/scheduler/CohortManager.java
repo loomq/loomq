@@ -44,18 +44,21 @@ public final class CohortManager {
     private final Consumer<Collection<Intent>> scanTrigger;
     private final MetricsCollector metrics;
 
-    /** 非 final：stop() 后 start() 需重建（Java 线程不可重启）。 */
-    private Thread wakeThread;
+    /**
+     * 非 final：stop() 后 start() 需重建（Java 线程不可重启）。
+     * volatile:register()/stop() 跨线程读——stop/start 重建后,并发 register 若读到
+     * 旧(已死)线程引用会把 unpark 投给死线程,新 wakeLoop 在空表上 park 时该次注册的
+     * cohort 唤醒信号永久丢失(延迟到下一次注册才自愈)。
+     */
+    private volatile Thread wakeThread;
     private final AtomicBoolean running;
 
-    // Observability counters (CSA impact measurement)
-    private final AtomicLong totalRegistered = new AtomicLong(0);
-    private final AtomicLong totalFlushed = new AtomicLong(0);
-    private final AtomicLong wakeEventCount = new AtomicLong(0);
-    /** wakeLoop 异常计数（诊断：park 时长溢出等会让 wakeLoop 每 100ms 报错空转）。 */
-    private final AtomicLong wakeLoopErrors = new AtomicLong(0);
-
-    long getWakeLoopErrors() { return wakeLoopErrors.get(); }
+    /**
+     * wakeLoop 代际令牌：stop() 时递增。旧 wakeLoop 每轮校验
+     * {@code gen == generation.get()}——即使 stop() 的 join(2000) 因巨型 flush 超时、
+     * 旧线程仍未退出,重启(start())后旧线程也在下一轮迭代退出,杜绝双 wakeLoop 僵尸线程。
+     */
+    private final AtomicLong generation = new AtomicLong();
 
     CohortManager(BucketGroupManager bucketGroupManager, PrecisionTierCatalog catalog,
                   Consumer<Collection<Intent>> scanTrigger, MetricsCollector metrics) {
@@ -75,7 +78,8 @@ public final class CohortManager {
 
     void start() {
         if (running.compareAndSet(false, true)) {
-            // stop() 后重启：旧线程已 join，重建（Java 线程不可二次 start）。
+            // stop() 后重启:旧线程可能因 join 超时仍存活,由代际令牌兜底退出(见 generation 注释);
+            // 此处仍重建新线程(Java 线程不可二次 start)。
             wakeThread = Thread.ofPlatform()
                 .name("cohort-waker")
                 .daemon(true)
@@ -87,8 +91,9 @@ public final class CohortManager {
 
     void stop() {
         running.set(false);
+        generation.incrementAndGet();
         LockSupport.unpark(wakeThread);
-        // 等旧线程退出，杜绝重启后双 wake 线程（旧线程观察到 running=true 会继续跑）
+        // 等旧线程退出;join 超时(巨型 flush)由代际令牌兜底,不阻塞重启
         try {
             wakeThread.join(2000);
         } catch (InterruptedException e) {
@@ -111,11 +116,18 @@ public final class CohortManager {
      * unpark the wake thread so it re-evaluates its sleep target.
      */
     void register(Intent intent) {
+        String intentId = intent.getIntentId();
         long key = cohortKey(intent);
+        Long previous = intentIdToCohortKey.put(intentId, key);
+        if (previous != null) {
+            // 同一 intent 重复注册时，先摘除旧 cohort 条目，维持单持有者不变量。
+            ConcurrentLinkedDeque<Intent> old = cohorts.get(previous);
+            if (old != null) {
+                old.removeIf(i -> intentId.equals(i.getIntentId()));
+            }
+        }
         cohorts.computeIfAbsent(key, k -> new ConcurrentLinkedDeque<>())
                .addLast(intent);
-        intentIdToCohortKey.put(intent.getIntentId(), key);
-        totalRegistered.incrementAndGet();
         // Signal: a new cohort may be earlier than the current sleep target
         LockSupport.unpark(wakeThread);
     }
@@ -180,9 +192,6 @@ public final class CohortManager {
         return first != null ? first.getPrecisionTier().name() : "UNKNOWN";
     }
 
-    public long getTotalRegistered() { return totalRegistered.get(); }
-    public long getTotalFlushed()    { return totalFlushed.get(); }
-    public long getWakeEventCount()  { return wakeEventCount.get(); }
 
     private long cohortKey(Intent intent) {
         long precisionWindowMs = catalog.precisionWindowMs(intent.getPrecisionTier());
@@ -201,7 +210,8 @@ public final class CohortManager {
     private static final long MAX_PARK_MS = 24L * 60 * 60_000L; // 24h
 
     private void wakeLoop() {
-        while (running.get()) {
+        long gen = generation.get();
+        while (running.get() && gen == generation.get()) {
             try {
                 var firstEntry = cohorts.firstEntry();
                 if (firstEntry == null) {
@@ -228,7 +238,12 @@ public final class CohortManager {
 
                 List<Intent> validIntents = new ArrayList<>(cohort.size());
                 for (Intent intent : cohort) {
-                    intentIdToCohortKey.remove(intent.getIntentId());
+                    // 条件移除：仅当 mapping 仍指向当前 cohort 时才删除，避免误删并发
+                    // re-register 到新 cohort 的映射。
+                    Long currentKey = intentIdToCohortKey.get(intent.getIntentId());
+                    if (currentKey != null && currentKey == bucketKey) {
+                        intentIdToCohortKey.remove(intent.getIntentId(), currentKey);
+                    }
                     // Only skip terminal intents (cancelled/expired after registration).
                     // Timing-based filtering is handled by BucketGroup.scanDue().
                     if (intent.getStatus().isTerminal()) {
@@ -237,8 +252,6 @@ public final class CohortManager {
                     validIntents.add(intent);
                 }
                 if (!validIntents.isEmpty()) {
-                    totalFlushed.addAndGet(validIntents.size());
-                    wakeEventCount.incrementAndGet();
                     long flushStartNanos = System.nanoTime();
                     bucketGroupManager.addAll(validIntents);
                     if (scanTrigger != null) {
@@ -252,7 +265,7 @@ public final class CohortManager {
                     }
                 }
             } catch (Exception e) {
-                wakeLoopErrors.incrementAndGet();
+                metrics.incrementWakeLoopErrors();
                 logger.error("CohortManager wake loop error", e);
                 LockSupport.parkNanos(Duration.ofMillis(100).toNanos());
             }

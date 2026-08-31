@@ -286,6 +286,12 @@ public class BucketGroup {
                     }
 
                     Intent intent = entry.getValue().intent();
+                    // R21: CAS 认领与重读 executeAt 之间的 cancel/expire 竞态——终态
+                    // intent 不得重入桶或投递(consumer 终态守卫能拦投递,但 addForced
+                    // 会把终态条目注册回桶+索引:pendingCount 虚增、驻留到原时刻)。
+                    if (intent.getStatus().isTerminal()) {
+                        continue;
+                    }
                     if (!intent.getExecuteAt().isAfter(now)) {
                         dueIntents.add(intent);
                     } else {

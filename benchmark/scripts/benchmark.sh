@@ -218,11 +218,14 @@ MD_FILE="$REPORTS_DIR/benchmark-report-$TIMESTAMP.md"
     echo ""
 } > "$MD_FILE"
 
-# ---- rotate reports (keep recent N) ----
+# ---- rotate reports + logs (keep recent N) ----
 KEEP=10
 SC=$(grep -o '"keep_recent"[[:space:]]*:[[:space:]]*[0-9]*' "$CONFIG" 2>/dev/null | grep -o '[0-9]*' | head -1)
 if [ -n "$SC" ]; then KEEP=$SC; fi
 ls -1t "$REPORTS_DIR"/benchmark-report-*.md 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f --
+# logs/raw 产物同样按 keep_recent 轮转,避免 benchmark-*.log 与 raw-*.txt 无限累积
+ls -1t "$LOGS_DIR"/benchmark-*.log 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f --
+ls -1t "$LOGS_DIR"/raw-*.txt 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f --
 
 echo ""
 echo "报告已生成: $MD_FILE"

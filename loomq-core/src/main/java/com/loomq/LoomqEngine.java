@@ -5,6 +5,7 @@ import com.loomq.application.recovery.WheelRecovery;
 import com.loomq.application.recovery.WheelRecoveryReport;
 import com.loomq.application.scheduler.BucketGroupManager;
 import com.loomq.application.scheduler.PrecisionScheduler;
+import com.loomq.application.scheduler.StateChangeSink;
 import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
@@ -26,6 +27,7 @@ import com.loomq.store.ConcurrentIntentStore;
 import com.loomq.store.IdempotencyResult;
 import com.loomq.store.IntentStore;
 import com.loomq.store.ReadOnlyIntentStoreView;
+import com.loomq.tracing.IntentTraceStore;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,12 +35,17 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,6 +85,7 @@ public class LoomqEngine implements AutoCloseable {
     private final MetricsCollector metricsCollector;
     private final PrecisionScheduler scheduler;
     private final IntentCommandService commandService;
+    private final IntentTraceStore traceStore;
     private final BucketReclaimer bucketReclaimer;
 
     // ========== 观察器 ==========
@@ -85,12 +93,16 @@ public class LoomqEngine implements AutoCloseable {
 
     // ========== 回调机制 ==========
     private final Executor callbackExecutor;
-    private final java.util.concurrent.ExecutorService operationExecutor;
+    private final ExecutorService operationExecutor;
 
     // ========== 状态 ==========
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final AtomicBoolean started = new AtomicBoolean(false);
+    /** 是否有 daemon 已启动；用于 start() 失败时判断是否还能安全重试。 */
+    private boolean daemonsStarted = false;
+    /** 上次 start() 在 daemon 启动后失败，禁止再次 start()，但允许 close() 清理资源。 */
+    private volatile boolean retryUnsupported = false;
     private final AtomicLong sequenceNumber = new AtomicLong(0);
 
     // ========== 配置 ==========
@@ -98,6 +110,8 @@ public class LoomqEngine implements AutoCloseable {
     private final String nodeId;
     private final PrecisionTier defaultTier;
     private final boolean deliveryHandlerConfigured;
+    /** tail run 文件 compaction 阈值(close 时触发,见 {@link #close()})。 */
+    private final long compactionThresholdBytes;
 
     private LoomqEngine(Builder builder) {
         this.nodeId = builder.nodeId != null ? builder.nodeId : "default-node";
@@ -121,6 +135,7 @@ public class LoomqEngine implements AutoCloseable {
                 wheelConfig = WheelConfig.defaultConfig().withDataDir(dir.toString());
             }
             this.dataDir = Path.of(wheelConfig.dataDir());
+            this.compactionThresholdBytes = wheelConfig.compactionThresholdBytes();
             Files.createDirectories(dataDir);
 
             // 初始化组件
@@ -136,35 +151,46 @@ public class LoomqEngine implements AutoCloseable {
                 wheelConfig.groupCommitIntervalMs(),
                 wheelConfig.awaitCommitTimeoutMs());
             this.locationIndex = new IntentLocationIndex();
-            this.metricsCollector = builder.metricsCollector != null ? builder.metricsCollector : new MetricsCollector();
+            this.metricsCollector = builder.metricsCollector != null
+                ? builder.metricsCollector
+                : new MetricsCollector(builder.precisionTierCatalog);
 
             // 初始化调度器(未配置 deliveryHandler 时使用默认 DEAD_LETTER 处理器)
             DeliveryHandler deliveryHandler = builder.deliveryHandler != null
                 ? builder.deliveryHandler
                 : DEFAULT_DELIVERY_HANDLER;
+            // R21: traceStore 单实例——调度器与命令服务共享(冷 create/取消的 trace 归命令服务管)
+            this.traceStore = builder.intentTraceStore != null
+                ? builder.intentTraceStore : new IntentTraceStore();
             this.scheduler = new PrecisionScheduler(
                 intentStore,
                 deliveryHandler,
                 builder.redeliveryDecider,
                 builder.precisionTierCatalog,
                 metricsCollector,
-                builder.intentTraceStore != null ? builder.intentTraceStore : new com.loomq.tracing.IntentTraceStore()
+                traceStore
             );
 
             // 初始化冷→热提升 daemon:到点把冷 Intent 从磁盘载入内存并调度
-            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, (intent, loc) -> {
-                if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
-                    intentStore.upsert(intent);          // 幂等:已在内存则跳过
-                    scheduler.schedule(intent);
-                    // P1-2: promote↔cancelCold TOCTOU 收口(promote 侧)。promote 读槽→落地
-                    // 期间若发生冷取消,索引已迁移到 CANCELED 槽或被移除。复核不匹配则回滚
-                    // 热载,杜绝 ghost 投递。与 cancelCold 末尾的 store 复查形成双向清理,
-                    // 确定性关闭竞态窗口(两可见动作 upsert 与 index.put 有全序,后到者必见先到者)。
-                    SlotLocation after = locationIndex.get(intent.getIntentId());
-                    if (after == null || !after.equals(loc)) {
-                        scheduler.removeFromSchedule(intent);
-                        intentStore.delete(intent.getIntentId());
-                        logger.warn("Promotion rolled back for intent {} (raced with cold cancel)", intent.getIntentId());
+            // (匿名类而非 lambda:回调体内引用 final 字段 commandService,而其赋值在下方——
+            // javac 定值分析对 lambda 引用未初始化 blank final 报错,匿名类方法体不受限;
+            // 回调仅 start() 后触发,届时 commandService 恒非空。)
+            this.promotionDaemon = new PromotionDaemon(wheelStore, tailIndex, locationIndex, System::currentTimeMillis, new BiConsumer<>() {
+                @Override
+                public void accept(Intent intent, SlotLocation loc) {
+                    if (intentStore.findByIdInternal(intent.getIntentId()) == null) {
+                        // F2(round 15 终审): upsert 前捕获载入 revision——upsert 的 P 与后续热写者
+                        // 推进的是同一可变对象,复核须以载入时 revision 为判据基准,否则
+                        // hot.getRevision() > promoted.getRevision() 对同引用恒 false(同对象盲区),
+                        // 推进后的副本仍被误 demote。
+                        long promotedRevision = intent.getRevision();
+                        intentStore.upsert(intent);          // 幂等:已在内存则跳过
+                        scheduler.schedule(intent);
+                        // P1-2 → round 14:promote 侧 TOCTOU 复核收口至 ColdHotReconciler(单一权威
+                        // 实现,经命令服务委托;索引失配/已清且热副本 revision 不高于载入 revision
+                        // 才回滚热载——热写者推进后的新副本不误删,杜绝 ghost 投递/旧内容热载)。
+                        // commandService 字段在下方赋值,回调仅 start() 后触发,此处恒非空。
+                        commandService.reconcilePromotion(intent, loc, promotedRevision);
                     }
                 }
             }, wheelConfig.promotionLeadMs());
@@ -172,36 +198,38 @@ public class LoomqEngine implements AutoCloseable {
             this.wheelRecovery = new WheelRecovery(wheelStore, tailIndex, wheelConfig.hotBoundaryMs(), metricsCollector);
 
             this.commandService = new IntentCommandService(
-                intentStore, scheduler, wheelStore, tailIndex, commitBarrier,
-                locationIndex, promotionDaemon,
+                intentStore, scheduler,
+                new IntentCommandService.PhtwStack(wheelStore, tailIndex, commitBarrier, locationIndex, promotionDaemon),
                 metricsCollector, callbackExecutor, running, sequenceNumber,
-                builder.callbackHandler, defaultTier, wheelConfig.groupCommitIntervalMs(),
-                wheelConfig.hotBoundaryMs());
+                builder.callbackHandler,
+                new IntentCommandService.CommandConfig(defaultTier, wheelConfig.groupCommitIntervalMs(),
+                    wheelConfig.hotBoundaryMs(), builder.precisionTierCatalog),
+                traceStore);
 
             // Fix 6: 把重试重排程的 DURABLE 落盘接到调度器,使崩溃恢复能看到新调度。
-            scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
-                @Override public void persist(Intent intent) { commandService.persistStateChangePutOnly(intent); }
+            scheduler.setStateChangeSink(new StateChangeSink() {
+                @Override public void persist(Intent intent) {
+                    // C18-2(r18) 起为接口抽象方法的桥接兜底(StatePersistence 已改走
+                    // persistIfFresh);守卫即 persistStateChangePutOnly 本体(F6/round 15
+                    // 终审:门面唯一持久化写口),返回值在此丢弃。
+                    commandService.persistStateChangePutOnly(intent);
+                }
+                @Override public boolean persistIfFresh(Intent intent) {
+                    // C18-2(r18): W4 skip 信号回传——stale(未写盘,revision 已回滚)返回
+                    // false,结算链中止重排与内存镜像(杜绝幽灵投递/权威覆写)。
+                    return commandService.persistStateChangePutOnly(intent);
+                }
                 @Override public void persistTerminalInPlace(Intent intent) { commandService.persistTerminalInPlace(intent); }
                 @Override public void awaitCommit() { commandService.awaitDurableCommit(); }
                 @Override public void reclaimTerminal(String intentId) { commandService.reclaimTerminal(intentId); }
             });
 
-            // Spec B: 终态 Intent 从 locationIndex 移除(桶回收依赖索引判断活跃桶)。
-            // 调度器的 finalizeIntent/handleExpired/handleDeliveryFailure 经 observer 回调清理,
-            // cancelIntent(热路径)和 cancelCold 在 IntentCommandService 内直接清理。
-            scheduler.addObserver(new IntentObserver() {
-                @Override public void onScheduled(Intent intent) { /* no-op */ }
-                @Override public void onDelivered(Intent i, com.loomq.spi.DeliveryHandler.DeliveryResult r) {
-                    locationIndex.remove(i.getIntentId());
-                }
-                @Override public void onDeadLettered(Intent i) {
-                    locationIndex.remove(i.getIntentId());
-                }
-                @Override public void onExpired(Intent i) {
-                    locationIndex.remove(i.getIntentId());
-                }
-                @Override public void onDeliveryFailed(Intent i, Throwable e) { /* no-op */ }
-            });
+            // C4-8: 不再注册构造期 observer——setObservers(observers) 在 start() 会整体清空
+            // 调度器观察器列表,该 observer 从未在运行期生效(死代码);且 onDelivered 若生效
+            // 会把非终态 DELIVERED 的索引摘除(hasActiveDuplicate——IntentCreator,command 包,
+            // 误放行同 id 重建),反而有害。
+            // 终态索引清理由 reclaimTerminal(调度器终态路径)/cancelIntent/cancelCold
+            // (IntentCanceler,command 包)覆盖。
 
             this.bucketReclaimer = new BucketReclaimer(wheelStore, locationIndex, wheelConfig.bucketRetentionMs());
 
@@ -222,15 +250,15 @@ public class LoomqEngine implements AutoCloseable {
         if (closed.get()) {
             throw new IllegalStateException("Engine has been closed and cannot be restarted");
         }
+        if (retryUnsupported) {
+            throw new IllegalStateException(
+                "Engine start previously failed after daemons were started; cannot restart, call close()");
+        }
         if (!started.compareAndSet(false, true)) {
             throw new IllegalStateException("Engine is already running");
         }
         try {
-            logger.info("╔════════════════════════════════════════════════════════╗");
-            logger.info("║       LoomQ Core Engine Starting...                    ║");
-            logger.info("║       Mode: Embedded                                   ║");
-            logger.info("║       Persistence: PHTW (Layered Time Wheel)           ║");
-            logger.info("╚════════════════════════════════════════════════════════╝");
+            logger.info("LoomQ Core Engine Starting... Mode=Embedded, Persistence=PHTW (Layered Time Wheel)");
 
             if (!deliveryHandlerConfigured) {
                 logger.warn("No DeliveryHandler configured; intents will be silently dead-lettered. "
@@ -252,8 +280,23 @@ public class LoomqEngine implements AutoCloseable {
                 commandService.markMultiSlot(recoveryReport.multiSlotIntentIds());
             }
 
+            // R8:恢复期注入磁盘历史最高 revision,使 createIntent 重建同 intentId 时能把新
+            // Intent 的 revision 抬升到旧终态墓碑之上——否则 recovery max-revision 去重会
+            // 遮蔽重建的新 Intent(静默丢失)。
+            if (!recoveryReport.maxRevisions().isEmpty()) {
+                commandService.markMaxRevisions(recoveryReport.maxRevisions());
+            }
+
+            // C18-1(r18): 恢复期注入磁盘终态墓碑 id 集——这些 id 的 maxRevisions 种子映射不可在
+            // 后续单槽 incarnation 终态回收时移除(C4-1),否则同进程重建×终态回收后再重建被旧
+            // 墓碑遮蔽(重启静默丢失)。兑现 WheelPersistence.tombstoneIds javadoc 的恢复注入承诺。
+            if (!recoveryReport.tombstonedIds().isEmpty()) {
+                commandService.markTombstones(recoveryReport.tombstonedIds());
+            }
+
             // 2. 启动 group-commit daemon(DURABLE 写者依赖其 msync)
             commitBarrier.start();
+            daemonsStarted = true;
 
             // 3. 启动 promotion daemon(冷->热提升 cohort)
             promotionDaemon.start();
@@ -275,7 +318,14 @@ public class LoomqEngine implements AutoCloseable {
             try { promotionDaemon.close(); } catch (Exception ignored) {}
             try { scheduler.stop(); } catch (Exception ignored) {}
             try { bucketReclaimer.close(); } catch (Exception ignored) {}
-            started.set(false);  // 允许重试
+            // 注意：仅 recovery 阶段失败时可安全重试；若已有 daemon 启动（commitBarrier /
+            // promotionDaemon / bucketReclaimer 的 thread 均为一次性），再次 start() 会抛
+            // IllegalThreadStateException。因此这里标记 retryUnsupported，禁止重试但保留 close() 清理能力。
+            started.set(false);
+            if (daemonsStarted) {
+                retryUnsupported = true;
+                logger.error("Engine start failed after daemons were started; retry is not supported, call close()", e);
+            }
             throw e;
         }
     }
@@ -297,7 +347,7 @@ public class LoomqEngine implements AutoCloseable {
         // 须在 daemon/scheduler 停止之前完成,使在途 create 仍能正常完成调度。
         operationExecutor.shutdown();
         try {
-            if (!operationExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+            if (!operationExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 operationExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {
@@ -322,6 +372,15 @@ public class LoomqEngine implements AutoCloseable {
 
         // 关闭时间轮(强制脏桶落盘)
         wheelStore.close();
+
+        // C3-9: 关闭期压缩 tail run 文件(javadoc 承诺的"优雅关闭时(所有写入已停止)"时机)。
+        // 长运行进程中 run 文件只增不减(PUT+TOMBSTONE 累积),若不压缩只能等下次启动;
+        // 此时所有写入已停止(operationExecutor 已排空、daemon 已停),compaction 安全。
+        try {
+            tailIndex.compactIfNeeded(compactionThresholdBytes);
+        } catch (Exception e) {
+            logger.error("Tail compaction on close failed; run file left uncompacted", e);
+        }
 
         // 关闭 tail run 文件
         tailIndex.close();
@@ -405,17 +464,22 @@ public class LoomqEngine implements AutoCloseable {
      * @return true 如果成功取消
      */
     public boolean cancelIntent(String intentId) {
-        return commandService.cancelIntent(intentId);
+        return runDrained(() -> commandService.cancelIntent(intentId));
     }
 
     /**
      * 立即触发 Intent
      *
+     * <p>冷 Intent(round 14):不在内存热窗口(>hotBoundaryMs 未提升或超 day 视界落 tail)
+     * 时同样生效——磁盘槽 executeAt 改写为 now 并 DURABLE 落新槽(per-id 冷锁串行化),
+     * 随后立即热载调度,下个扫描 tick 投递。与热路径一致不校验 deadline;
+     * 不存在/已终态/冷槽不可读时返回 false。</p>
+     *
      * @param intentId Intent ID
-     * @return true 如果成功触发
+     * @return true 如果成功触发;不存在或已终态时为 false(冷槽不可读亦为 false)
      */
     public boolean fireNow(String intentId) {
-        return commandService.fireNow(intentId);
+        return runDrained(() -> commandService.fireNow(intentId));
     }
 
     /**
@@ -425,10 +489,17 @@ public class LoomqEngine implements AutoCloseable {
      *
      * @param intentId Intent ID
      * @param updater  修改函数
-     * @return 更新后的 Intent；不存在时返回 empty
+     * @return 更新后的 Intent；不存在或冷槽不可读时返回 empty;冷 Intent 现已支持更新与改期
+     *         (已终态冷 Intent 亦返回 empty;热 Intent 已终态则返回未修改副本 no-op)
+     *
+     * <p><b>冷 Intent(round 13):</b>Intent 不在内存热窗口(>hotBoundaryMs 未提升或超 day 视界
+     * 落 tail)时同样生效:经磁盘槽位读-改-写(per-id 串行化),DURABLE 落新槽;统一重注册
+     * promotion cohort 作安全网(窗口内外皆注册,到点见热副本则幂等 no-op),改期后进入
+     * 热窗口的还会立即热载调度。返回 empty 表示不存在(或并发取消
+     * 已生效);终态冷 Intent 返回 empty。</p>
      */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater) {
-        return commandService.updateIntent(intentId, updater, null);
+        return runDrained(() -> commandService.updateIntent(intentId, updater, null));
     }
 
     /**
@@ -437,10 +508,36 @@ public class LoomqEngine implements AutoCloseable {
      * @param intentId Intent ID
      * @param updater 修改函数
      * @param newExecuteAt 新的执行时间，传 null 表示不调整调度
-     * @return 更新后的 Intent；不存在时返回 empty
+     * @return 更新后的 Intent；不存在或冷槽不可读时返回 empty;冷 Intent 现已支持更新与改期
+     *         (已终态冷 Intent 亦返回 empty;热 Intent 已终态则返回未修改副本 no-op)
      */
     public Optional<Intent> updateIntent(String intentId, Consumer<Intent> updater, Instant newExecuteAt) {
-        return commandService.updateIntent(intentId, updater, newExecuteAt);
+        return runDrained(() -> commandService.updateIntent(intentId, updater, newExecuteAt));
+    }
+
+    /**
+     * 经 operationExecutor 执行命令(C4-6):cancel/update/fireNow 与 createIntent 同排空
+     * 语义——close() 先排空 operationExecutor 再停 daemon/wheel,在途命令确定性地在
+     * 组件停止前完成,消除"关闭期间直连命令命中已停调度器/已关回调执行器"的竞态
+     * (与 C4-2 的提交后失败修复叠加,关闭竞态降级为可观察的失败,无状态翻转)。
+     * 异常类型保持(ExecutionException 解包为原始 RuntimeException/Error)。
+     */
+    private <T> T runDrained(Callable<T> command) {
+        try {
+            return operationExecutor.submit(command).get();
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException re) {
+                throw re;
+            }
+            if (cause instanceof Error er) {
+                throw er;
+            }
+            throw new RuntimeException(cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
     }
 
     /**
@@ -495,7 +592,9 @@ public class LoomqEngine implements AutoCloseable {
      * 获取 Intent 存储只读视图。
      *
      * 返回的视图仅暴露读操作，写操作抛出 UnsupportedOperationException。
-     * 需要写入 Intent 请通过 {@link #getCommandService()}。
+     * 需要写入 Intent 请通过引擎命令方法:{@link #createIntent(Intent, AckMode)}、
+     * {@link #updateIntent(String, Consumer, Instant)}、{@link #cancelIntent(String)}、
+     * {@link #fireNow(String)}(IntentCommandService 不再直接暴露)。
      */
     public IntentStore getIntentStore() {
         return new ReadOnlyIntentStoreView(intentStore);
@@ -509,25 +608,11 @@ public class LoomqEngine implements AutoCloseable {
     }
 
     /**
-     * 获取命令服务。
-     */
-    public IntentCommandService getCommandService() {
-        return commandService;
-    }
-
-    /**
      * 获取 intent 位置索引(包级可见,供同包测试断言冷取消后的索引状态)。
      * 不作为公共 API:生产调用方应通过 commandService 间接操作。
      */
     IntentLocationIndex getLocationIndex() {
         return locationIndex;
-    }
-
-    /**
-     * 获取运行状态标志。
-     */
-    public AtomicBoolean getRunning() {
-        return running;
     }
 
     /**
@@ -557,14 +642,6 @@ public class LoomqEngine implements AutoCloseable {
         );
     }
 
-    // ========== 内部方法 ==========
-
-    private void ensureRunning() {
-        if (!running.get()) {
-            throw new IllegalStateException("Engine is not running");
-        }
-    }
-
     // ========== Builder ==========
 
     public static Builder builder() {
@@ -582,7 +659,7 @@ public class LoomqEngine implements AutoCloseable {
         private PrecisionTier defaultTier;
         private IntentStore intentStore;
         private MetricsCollector metricsCollector;
-        private com.loomq.tracing.IntentTraceStore intentTraceStore;
+        private IntentTraceStore intentTraceStore;
         private PrecisionTierCatalog precisionTierCatalog;
 
         /**
@@ -648,7 +725,7 @@ public class LoomqEngine implements AutoCloseable {
         }
 
         /** Inject a custom IntentTraceStore (default: new instance per engine). */
-        public Builder intentTraceStore(com.loomq.tracing.IntentTraceStore store) {
+        public Builder intentTraceStore(IntentTraceStore store) {
             this.intentTraceStore = store;
             return this;
         }

@@ -24,8 +24,8 @@ class TailIndexPromoteOverflowRegressionTest {
     @Test
     void promoteIntoMustNotBrickOnFullDayBucket() {
         AtomicLong clock = new AtomicLong(Instant.parse("2026-08-12T10:00:00Z").toEpochMilli());
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 2, 2, 1, 10_000L,
-            60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 2, 2, 1, 10_000L,
+            60L * 60_000L, 60_000L);
         try (WheelStore store = new WheelStore(cfg, clock::get);
              TailIndex tail = new TailIndex(tmp, clock::get)) {
             long t0 = clock.get();

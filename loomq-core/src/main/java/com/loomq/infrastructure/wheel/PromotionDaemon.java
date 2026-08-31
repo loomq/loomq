@@ -1,6 +1,7 @@
 package com.loomq.infrastructure.wheel;
 
 import com.loomq.domain.intent.Intent;
+import java.time.Duration;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -54,8 +55,15 @@ public final class PromotionDaemon implements AutoCloseable {
     public void register(String intentId, SlotLocation loc, long executeAtMs) {
         long wakeAt = executeAtMs - promotionLeadMs;
         ColdHandle handle = new ColdHandle(intentId, loc);
+        Long previous = intentIdToCohortKey.put(intentId, wakeAt);
+        if (previous != null) {
+            // 同一 intent 重复注册时，先摘除旧 cohort 条目，维持单持有者不变量。
+            ConcurrentLinkedDeque<ColdHandle> old = cohorts.get(previous);
+            if (old != null) {
+                old.removeIf(h -> intentId.equals(h.intentId()));
+            }
+        }
         cohorts.computeIfAbsent(wakeAt, k -> new ConcurrentLinkedDeque<>()).addLast(handle);
-        intentIdToCohortKey.put(intentId, wakeAt);
         LockSupport.unpark(thread);
     }
 
@@ -80,7 +88,12 @@ public final class PromotionDaemon implements AutoCloseable {
             ConcurrentLinkedDeque<ColdHandle> cohort = cohorts.remove(e.getKey());
             if (cohort == null || cohort.isEmpty()) continue;
             for (ColdHandle h : cohort) {
-                intentIdToCohortKey.remove(h.intentId());
+                // 条件移除：仅当 mapping 仍指向当前 cohort 时才删除，避免误删并发
+                // re-register 到新 cohort 的映射。
+                Long currentKey = intentIdToCohortKey.get(h.intentId());
+                if (currentKey != null && currentKey.equals(e.getKey())) {
+                    intentIdToCohortKey.remove(h.intentId(), currentKey);
+                }
                 promote(h);
             }
         }
@@ -103,14 +116,22 @@ public final class PromotionDaemon implements AutoCloseable {
                 intent = null;
                 while (it.hasNext()) {
                     var te = it.next();
-                    Intent decoded = SlotCodec.decode(te.encodedSlot());
+                    // C3-6: 防御解码(与 hasActiveDuplicate/promoteInto/WheelRecovery 同款)——
+                    // 损坏 tail 条目裸 decode 抛 CRC ISE 会被外层 catch 吞掉,该 intent 本进程
+                    // 内永不提升、不投递、不终态化,且 cohort 条目已摘除无重试。
+                    Intent decoded = SlotCodec.decodeSafe(te.encodedSlot());
+                    if (decoded == null) {
+                        log.warn("PromotionDaemon: skipping corrupt tail entry for intent {}", h.intentId());
+                        continue;
+                    }
                     if (h.intentId().equals(decoded.getIntentId())) { intent = decoded; break; }
                 }
             } else {
                 intent = store.readSlot(h.loc());
             }
             if (intent == null || intent.getStatus().isTerminal()) return;
-            // 把读槽用的 loc 传给回调,供其做提升后复核(P1-2:与 cancelCold 的 TOCTOU 收口)。
+            // 把读槽用的 loc 传给回调,供其做提升后复核(round 14:复核协议收口至 command 包
+            // ColdHotReconciler——单一权威实现,语义见其类 javadoc)。
             onHotPromotion.accept(intent, h.loc());
         } catch (Exception ex) {
             log.error("promote failed for {}", h.intentId(), ex);
@@ -127,7 +148,7 @@ public final class PromotionDaemon implements AutoCloseable {
                     // 钳制 park 时长：executeAt 超远（>292 年）时 Duration.toNanos 溢出为负，
                     // parkNanos 立即返回 → 空转烧核。24h 上限分片 park，无功能影响。
                     long parkMs = Math.min(first.getKey() - now, MAX_PARK_MS);
-                    LockSupport.parkNanos(java.time.Duration.ofMillis(parkMs).toNanos());
+                    LockSupport.parkNanos(Duration.ofMillis(parkMs).toNanos());
                     continue;
                 }
                 tickOnce();

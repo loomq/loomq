@@ -5,12 +5,19 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
+import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.infrastructure.wheel.SlotLocation;
 import com.loomq.infrastructure.wheel.WheelConfig;
 import com.loomq.infrastructure.wheel.WheelStore;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -150,5 +157,92 @@ class LoomqEnginePhtwIntegrationTest {
         } finally {
             reopened.close();
         }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Tag("integration")
+    @org.junit.jupiter.api.Timeout(30)
+    @DisplayName("冷改期跨重启:改期后的 executeAt/内容在恢复后按新时间投递恰好一次")
+    void coldRescheduleSurvivesRestartAndDeliversOnceAtNewTime() throws Exception {
+        // hotBoundary=1s:+15s 冷(>1s);改期到 +8s(更新时仍冷);promotionLead=100ms——秒级完成 E2E
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L, 1_000L, 100L);
+        String id = "intent_rst00000001";
+        LoomqEngine engine = LoomqEngine.builder().wheelConfig(cfg)
+            .deliveryHandler(it -> java.util.concurrent.CompletableFuture.completedFuture(
+                com.loomq.spi.DeliveryHandler.DeliveryResult.SUCCESS))
+            .build();
+        engine.start();
+        try {
+            Intent cold = new Intent(id);
+            cold.setExecuteAt(Instant.now().plusSeconds(15));
+            cold.setPrecisionTier(PrecisionTier.STANDARD);
+            engine.createIntent(cold, AckMode.DURABLE).join();
+            Optional<Intent> updated = engine.updateIntent(id, i -> i.setTags(Map.of("v", "new")),
+                Instant.now().plusSeconds(8));
+            assertTrue(updated.isPresent(), "冷改期必须生效(hotBoundary=1s,+8s 仍冷)");
+            assertEquals("new", updated.get().getTags().get("v"));
+        } finally {
+            engine.close();
+        }
+        // 重启:恢复 + promotion cohort 按新时间(+8s)热载投递,内容为改期后
+        CountDownLatch delivered = new CountDownLatch(1);
+        AtomicInteger deliveryCount = new AtomicInteger();
+        AtomicReference<String> tags = new AtomicReference<>();
+        LoomqEngine reopened = LoomqEngine.builder().wheelConfig(cfg)
+            .deliveryHandler(it -> {
+                if (id.equals(it.getIntentId())) {
+                    tags.set(it.getTags().get("v"));
+                    deliveryCount.incrementAndGet();
+                    delivered.countDown();
+                }
+                return java.util.concurrent.CompletableFuture.completedFuture(
+                    com.loomq.spi.DeliveryHandler.DeliveryResult.SUCCESS);
+            })
+            .build();
+        reopened.start();
+        try {
+            assertTrue(delivered.await(20, TimeUnit.SECONDS), "改期后的新时间必须投递(约 +8s)");
+            assertEquals("new", tags.get(), "投递内容必须是改期后的");
+            assertEquals(1, deliveryCount.get(), "必须恰好投递一次(重复投递回归守卫)");
+        } finally {
+            reopened.close();
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Tag("integration")
+    @org.junit.jupiter.api.Timeout(30)
+    @DisplayName("冷 fireNow:立即热载投递恰好一次,内容保持")
+    void coldFireNowDeliversImmediatelyOnce() throws Exception {
+        // hotBoundary=1s:+3600s 冷;fireNow 后 executeAt=now → 立即热载投递
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 16, 1, 10_000L, 1_000L, 100L);
+        String id = "intent_fnow0000001";
+        CountDownLatch delivered = new CountDownLatch(1);
+        AtomicInteger deliveryCount = new AtomicInteger();
+        AtomicReference<String> tags = new AtomicReference<>();
+        LoomqEngine engine = LoomqEngine.builder().wheelConfig(cfg)
+            .deliveryHandler(it -> {
+                if (id.equals(it.getIntentId())) {
+                    tags.set(it.getTags().get("v"));
+                    deliveryCount.incrementAndGet();
+                    delivered.countDown();
+                }
+                return java.util.concurrent.CompletableFuture.completedFuture(
+                    com.loomq.spi.DeliveryHandler.DeliveryResult.SUCCESS);
+            })
+            .build();
+        engine.start();
+        try {
+            Intent cold = new Intent(id);
+            cold.setExecuteAt(Instant.now().plusSeconds(3600));   // 冷(>1s hotBoundary)
+            cold.setTags(Map.of("v", "fired"));
+            engine.createIntent(cold, AckMode.DURABLE).join();
+            assertTrue(engine.fireNow(id), "冷 fireNow 必须生效");
+            assertTrue(delivered.await(15, TimeUnit.SECONDS), "冷 fireNow 必须立即投递");
+            assertEquals("fired", tags.get(), "投递内容保持");
+        } finally {
+            engine.close();
+        }
+        assertEquals(1, deliveryCount.get(), "必须恰好投递一次(重复投递回归守卫)");
     }
 }

@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -60,6 +61,19 @@ public final class TailIndex implements AutoCloseable {
     /** 序列化 put/remove(内存变更 + run 追加)以保证重放顺序与内存顺序一致、记录不撕裂。 */
     private final Object appendLock = new Object();
 
+    /**
+     * run 文件 append 完成计数(C18-4,r18;镜像 WheelStore.Bucket P1-4 单调计数器。
+     * TailIndex 写侧 put/remove/promoteInto 已全部串行于 {@link #appendLock},无需 Bucket
+     * 为并发 memcpy 写者设计的 RW 锁,appendLock 互斥 force 临界区即可)。appendRecord 写
+     * 完成后 +1——字节写完严格先于计数(程序序):计数值 n 覆盖的字节必已在文件内。
+     */
+    private final AtomicLong appendCount = new AtomicLong();
+    /** 已被 force 覆盖的前缀计数。flush 的 check+force+publish 原子于 appendLock,永不虚报。 */
+    private volatile long flushedAppendCount = 0;
+
+    /** 上次 loadRun 是否遇到中段结构损坏(未知 type 字节)。true 时禁止截断尾部。 */
+    private boolean lastLoadCorrupted = false;
+
     public TailIndex(Path dataDir, LongSupplier clock) {
         this.clock = clock;
         this.runFile = dataDir.resolve("tail").resolve("tail.log");
@@ -72,7 +86,10 @@ public final class TailIndex implements AutoCloseable {
             long validLen = loadRun();
             // 截断撕裂的尾部字节:若不截断,后续 APPEND 写入会落在撕裂字节之后,下次重启时
             // loadRun 会把撕裂头 + 后续合法字节误解析为一条垃圾 PUT(幻影条目 + 丢失真实条目)。
-            truncateTornTail(validLen);
+            // 中段结构损坏(非物理尾部撕裂)不截断——见 loadRun 注释。
+            if (!lastLoadCorrupted) {
+                truncateTornTail(validLen);
+            }
             this.runChannel = FileChannel.open(
                 runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
         } catch (IOException e) {
@@ -129,6 +146,18 @@ public final class TailIndex implements AutoCloseable {
         }
     }
 
+    /**
+     * 按 intentId 读取当前 tail 记录并解码(冷改期读路径,round 13)。
+     * 返回 null 表示无记录或解码失败(CRC 损坏——防御解码,promoteInto/promote 同款,不抛异常)。
+     * 只读,不加 appendLock:byId 是并发容器,记录内容(byte[])不可变,并发 put 下读到旧或新
+     * 完整记录均安全。
+     */
+    public Intent readById(String intentId) {
+        TailRecord r = byId.get(intentId);
+        if (r == null) return null;
+        return SlotCodec.decodeSafe(r.encodedSlot());
+    }
+
     /** 从 fromMs(含)起按 executeAtMs 升序扫描 tail 项(快照迭代器)。 */
     public Iterator<TailEntry> scanFrom(long fromMs) {
         List<TailEntry> acc = new ArrayList<>();
@@ -149,7 +178,7 @@ public final class TailIndex implements AutoCloseable {
      * appendTombstone→applyRemove,使每条提升对并发 {@link #put}/{@link #remove} 原子。
      * {@code store.put} 是 mmap memcpy(无 I/O),持锁期间开销可忽略。</p>
      *
-     * <p><b>崩溃窗口(v1 已知限制,spec §11 接受)</b>:若进程在 {@code store.put}(已分配
+     * <p><b>崩溃窗口(v1 已知限制,设计权衡接受)</b>:若进程在 {@code store.put}(已分配
      * wheel 槽)与 tombstone 追加之间崩溃,recovery 会重新提升该 intentId → 同一 intentId
      * 在 wheel 中分配第二个槽。{@code WheelRecovery}(Task 8)按 intentId 去重(取最大
      * revision),故不会重复投递——仅浪费一个过期后即删的桶槽。v1 选择"宁可多分配,
@@ -168,14 +197,12 @@ public final class TailIndex implements AutoCloseable {
                     TailRecord r = byId.get(intentId);
                     if (r == null) continue; // 并发 remove 已摘除
                     if (r.executeAtMs() > horizon) continue; // 并发 re-PUT 到更远的 ms
-                    Intent it;
-                    try {
-                        // P1-6 同款防御:tail 记录无 isTorn 预检(wheel 槽有),一条 CRC 损坏即让
-                        // decode 抛异常中断整个 promoteInto(recover 第一步)→ 引擎起不来。
-                        // 损坏条目跳过并告警,与 WheelRecovery 尾部扫描的防御解码保持一致。
-                        it = SlotCodec.decode(r.encodedSlot());
-                    } catch (RuntimeException dex) {
-                        log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId, dex);
+                    // P1-6 同款防御:tail 记录无 isTorn 预检(wheel 槽有),一条 CRC 损坏即让
+                    // decode 抛异常中断整个 promoteInto(recover 第一步)→ 引擎起不来。
+                    // 损坏条目跳过并告警,与 WheelRecovery 尾部扫描的防御解码保持一致。
+                    Intent it = SlotCodec.decodeSafe(r.encodedSlot());
+                    if (it == null) {
+                        log.warn("promoteInto: skipping corrupt tail entry for intent {}", intentId);
                         continue;
                     }
                     try {
@@ -199,13 +226,34 @@ public final class TailIndex implements AutoCloseable {
         return promoted;
     }
 
-    /** 强制 run 文件缓冲写落盘(GroupCommitBarrier 在 ack DURABLE 写者前调用)。 */
+    /**
+     * 强制 run 文件缓冲写落盘(GroupCommitBarrier 在 ack DURABLE 写者前调用)。
+     *
+     * <p>C18-4(r18): 旧 volatile boolean dirty 存在 lost-update——flush 的 check→force→clear
+     * 不持 appendLock,clear 与并发 append 的置位交错会丢标志 → DURABLE 虚假确认。
+     * 改单调计数 + appendLock 互斥:check+force+publish 原子于 append;无锁快路径保持
+     * "无写跳过 syscall"。正确性:flush 的 before 读取先于 force syscall → 计入 before 的
+     * 所有字节必已在 force 快照内 → {@code flushedAppendCount = before} 永不虚报;before
+     * 之后 increment 的 append 不被本次发布,下一轮 flush 覆盖 → 无丢失、无虚报。
+     * compaction 换 channel 不重置计数(至多多 force 一次,无害)。</p>
+     */
     public void flush() {
-        try {
-            runChannel.force(false);
-        } catch (IOException e) {
-            throw new RuntimeException("flush tail run file failed: " + runFile, e);
+        if (appendCount.get() == flushedAppendCount) return;   // 无锁快路径(无 tail 写跳过 syscall)
+        synchronized (appendLock) {                            // C18-4: check+force+publish 原子于 append
+            long before = appendCount.get();
+            if (before == flushedAppendCount) return;
+            try {
+                runChannel.force(true);
+                flushedAppendCount = before;                   // 只发布"本次 force 前已完成的写"
+            } catch (IOException e) {
+                throw new RuntimeException("flush tail run file failed: " + runFile, e);
+            }
         }
+    }
+
+    /** 白盒测试缝(镜像 WheelStore.Bucket.hasUnflushed):run 文件是否存在未 force 覆盖的 append。 */
+    boolean hasUnflushed() {
+        return appendCount.get() > flushedAppendCount;
     }
 
     public int size() {
@@ -249,16 +297,12 @@ public final class TailIndex implements AutoCloseable {
                             while (buf.hasRemaining()) ch.write(buf);
                             buf.clear();
                         }
-                        buf.put(TYPE_PUT);
-                        buf.putLong(execMs);
-                        buf.put((byte) idBytes.length);
-                        buf.put(idBytes);
-                        buf.put(r.encodedSlot());
+                        putRecord(buf, TYPE_PUT, intentId, execMs, r.encodedSlot());
                     }
                 }
                 buf.flip();
                 while (buf.hasRemaining()) ch.write(buf);
-                ch.force(false);
+                ch.force(true);   // 新文件长度元数据一并落盘(与 flush() 的 force(true) 同旨)
             }
 
             // 2. Atomic replace: close old channel -> move -> reopen
@@ -267,6 +311,7 @@ public final class TailIndex implements AutoCloseable {
             Files.move(compactFile, runFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
             runChannel = FileChannel.open(runFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND);
             channelClosed = false;
+            // C18-4: 不重置 append 计数——compact 文件已 force,计数落后至多多 force 一次,无害。
 
             log.info("Tail compaction: {} bytes -> {} bytes ({} live entries)",
                 fileSize, Files.size(runFile), byId.size());
@@ -302,8 +347,14 @@ public final class TailIndex implements AutoCloseable {
      * 从 run 文件起始逐条重放到正确终态。PUT → 入内存;TOMBSTONE → 撤内存。
      * 文件不存在或为空时 no-op。尾部撕裂记录(长度不足)按"截断"处理,停止重放。
      *
+     * <p><b>中段结构损坏(未知 type 字节)不截断</b>:撕裂只发生在崩溃 mid-append 的
+     * 物理尾部;中段损坏是位翻转(头部无 CRC 保护),截断会静默销毁损坏点之后可能仍
+     * 有效的 DURABLE 记录。中段损坏时停止重放、保留文件字节(error 日志)供取证——
+     * 解析无法继续(无记录级 CRC 无法重定位),但数据不被主动销毁。</p>
+     *
      * @return 最后一条有效记录的结束字节偏移(validLen);之后的字节(若有)是撕裂尾部,
-     *     需由调用方截断,否则下次 APPEND 会污染日志。
+     *     需由调用方截断,否则下次 APPEND 会污染日志。中段损坏时返回偏移前的长度
+     *     但标记 {@link #lastLoadCorrupted},调用方不得截断。
      */
     private long loadRun() {
         if (!Files.isRegularFile(runFile)) return 0L;
@@ -336,7 +387,13 @@ public final class TailIndex implements AutoCloseable {
                 applyRemove(intentId);
                 pos = afterId;
             } else {
-                break; // 未知记录类型,按截断停止
+                // 中段结构损坏(非物理尾部撕裂):停止重放但绝不截断——截断会静默销毁
+                // 损坏点之后可能仍有效的 DURABLE 记录。保留字节供取证与人工修复。
+                lastLoadCorrupted = true;
+                log.error("tail run file corrupted at byte {}: unknown record type {}; "
+                        + "stopping replay and PRESERVING the file ({} bytes) for forensics",
+                    pos, type & 0xFF, len);
+                break;
             }
         }
         // pos 即最后一条有效记录的结束字节偏移;之后的字节(若有)是撕裂尾部,需截断。
@@ -369,21 +426,28 @@ public final class TailIndex implements AutoCloseable {
 
     // ===== run 文件追加 =====
 
-    private void appendRecord(byte type, String intentId, long execMs, byte[] encodedSlot) {
+    /** 序列化单条 run 记录到 buf(type+execMs+idLen+id+slot)。append 与 compact 共用,格式演进只改一处。 */
+    private static void putRecord(ByteBuffer buf, byte type, String intentId, long execMs, byte[] encodedSlot) {
         byte[] idBytes = intentId.getBytes(StandardCharsets.UTF_8);
         if (idBytes.length > 0xFF) {
             throw new IllegalArgumentException("intentId too long for run record: " + idBytes.length);
         }
-        int slotLen = (type == TYPE_PUT) ? SlotCodec.SLOT_SIZE : 0;
-        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 1 + idBytes.length + slotLen).order(ByteOrder.BIG_ENDIAN);
         buf.put(type);
         buf.putLong(execMs);
         buf.put((byte) idBytes.length);
         buf.put(idBytes);
         if (type == TYPE_PUT) buf.put(encodedSlot);
+    }
+
+    private void appendRecord(byte type, String intentId, long execMs, byte[] encodedSlot) {
+        byte[] idBytes = intentId.getBytes(StandardCharsets.UTF_8);
+        int slotLen = (type == TYPE_PUT) ? SlotCodec.SLOT_SIZE : 0;
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 1 + idBytes.length + slotLen).order(ByteOrder.BIG_ENDIAN);
+        putRecord(buf, type, intentId, execMs, encodedSlot);
         buf.flip();
         try {
             while (buf.hasRemaining()) runChannel.write(buf);
+            appendCount.incrementAndGet();   // C18-4: 写完成严格先于计数(程序序,见 flush javadoc)
         } catch (IOException e) {
             throw new RuntimeException("append tail run record failed: " + runFile, e);
         }

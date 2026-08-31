@@ -21,7 +21,7 @@ class LoomqEngineConfigHookTest {
      */
     @Test
     void builderWheelConfigHookIsHonored() throws Exception {
-        WheelConfig cfg = new WheelConfig(tmp.toString(), "t", 30, 2, 1, 10_000L, 60L * 60_000L, 60_000L, null);
+        WheelConfig cfg = new WheelConfig(tmp.toString(), 30, 2, 1, 10_000L, 60L * 60_000L, 60_000L);
         LoomqEngine engine = LoomqEngine.builder().wheelConfig(cfg).build();
         engine.start();
         try {

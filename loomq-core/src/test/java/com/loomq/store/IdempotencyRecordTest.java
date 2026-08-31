@@ -256,7 +256,6 @@ class IdempotencyRecordTest {
         Intent intent = new Intent(id);
         intent.setExecuteAt(Instant.now().plusSeconds(60));
         intent.setDeadline(Instant.now().plusSeconds(300));
-        intent.setShardKey("test-shard");
         intent.setIdempotencyKey(idempotencyKey);
 
         Callback callback = new Callback();

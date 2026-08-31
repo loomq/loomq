@@ -7,8 +7,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Semaphore with cross-tier borrowing support.
  *
  * Extends {@link Semaphore} for zero-overhead acquire/tryAcquire on the hot path.
- * Only {@link #release()} is overridden to pair with {@link #decrementBorrowed()}
- * via the scheduler's {@code releasePermit} helper.
+ * {@link #release()} 继承自 Semaphore 不做覆写;跨档借用的 permit 释放统一走调度器的
+ * {@code releasePermit},与 {@link #decrementBorrowed()} 配对,杜绝借用计数泄漏。
  *
  * <p>Runtime resizing ({@code resize}/{@code resizeImmediate}) was removed as dead code
  * (no production caller). If dynamic concurrency adjustment is needed in the future,

@@ -10,12 +10,109 @@ import java.util.UUID;
  *
  * Intent 是对外暴露的核心资源，代表一个未来必须触发的事件。
  *
+ * <p><b>变异契约（updatedAt 推进语义）</b>——updateIntent(Consumer) 的失败还原
+ * 依赖以下分组，调用方不得依赖未列出的隐式行为：</p>
+ * <ul>
+ *   <li>触碰 updatedAt：transitionTo / incrementAttempts / incrementRevision /
+ *       setLastDeliveryId / setExecuteAt / setDeadline / setExpiredAction /
+ *       setPrecisionTier / setWalMode</li>
+ *   <li>不触碰 updatedAt：setCallback / setRedelivery / setIdempotencyKey /
+ *       setTags / setAttempts；回滚家族（rollbackVolatileState / rollbackRevision）
+ *       与 seedRevision 为显式赋值语义</li>
+ * </ul>
+ * 注意易混淆差异：setAttempts 不触碰但 incrementAttempts 触碰；setLastDeliveryId 触碰。
+ *
  * @author loomq
  */
 public class Intent {
 
     /** intentId 最大 UTF-8 字节数（槽格式上限；SlotCodec 布局与入口校验的单一约束来源）。 */
     public static final int MAX_ID_BYTES = 24;
+
+    /**
+     * 持久化管道专用快照载体（SlotCodec ↔ Intent 边界），embedder 无需直接使用。
+     *
+     * <p>具名字段取代历史上的 19 参位置参数 restore——相邻同型 String
+     * （traceId/intentId）的位置错配与构造体内赋值错位风险由此根除；
+     * 新增字段时归一化逻辑只动私有构造器一处（各调用点实参表仍需同步）。</p>
+     *
+     * <p>本类不做深拷贝：callback/redelivery 的防御性拷贝由构造方负责
+     * （copy() 在组装点深拷贝；SlotCodec 解码路径传 null callback）。</p>
+     */
+    public static final class Snapshot {
+
+        private final String traceId;
+        private final String intentId;
+        private final IntentStatus status;
+        private final Instant createdAt;
+        private final Instant updatedAt;
+        private final Instant executeAt;
+        private final Instant deadline;
+        private final ExpiredAction expiredAction;
+        private final PrecisionTier precisionTier;
+        private final WalMode walMode;
+        private final Callback callback;
+        private final RedeliveryPolicy redelivery;
+        private final String idempotencyKey;
+        private final Map<String, String> tags;
+        private final int attempts;
+        private final String lastDeliveryId;
+        private final long revision;
+
+        public Snapshot(String traceId,
+                        String intentId,
+                        IntentStatus status,
+                        Instant createdAt,
+                        Instant updatedAt,
+                        Instant executeAt,
+                        Instant deadline,
+                        ExpiredAction expiredAction,
+                        PrecisionTier precisionTier,
+                        WalMode walMode,
+                        Callback callback,
+                        RedeliveryPolicy redelivery,
+                        String idempotencyKey,
+                        Map<String, String> tags,
+                        int attempts,
+                        String lastDeliveryId,
+                        long revision) {
+            this.traceId = traceId;
+            this.intentId = intentId;
+            this.status = status;
+            this.createdAt = createdAt;
+            this.updatedAt = updatedAt;
+            this.executeAt = executeAt;
+            this.deadline = deadline;
+            this.expiredAction = expiredAction;
+            this.precisionTier = precisionTier;
+            this.walMode = walMode;
+            this.callback = callback;
+            this.redelivery = redelivery;
+            this.idempotencyKey = idempotencyKey;
+            this.tags = tags;
+            this.attempts = attempts;
+            this.lastDeliveryId = lastDeliveryId;
+            this.revision = revision;
+        }
+
+        public String traceId() { return traceId; }
+        public String intentId() { return intentId; }
+        public IntentStatus status() { return status; }
+        public Instant createdAt() { return createdAt; }
+        public Instant updatedAt() { return updatedAt; }
+        public Instant executeAt() { return executeAt; }
+        public Instant deadline() { return deadline; }
+        public ExpiredAction expiredAction() { return expiredAction; }
+        public PrecisionTier precisionTier() { return precisionTier; }
+        public WalMode walMode() { return walMode; }
+        public Callback callback() { return callback; }
+        public RedeliveryPolicy redelivery() { return redelivery; }
+        public String idempotencyKey() { return idempotencyKey; }
+        public Map<String, String> tags() { return tags; }
+        public int attempts() { return attempts; }
+        public String lastDeliveryId() { return lastDeliveryId; }
+        public long revision() { return revision; }
+    }
 
     // ========== 系统字段 ==========
 
@@ -71,18 +168,6 @@ public class Intent {
      * null 表示使用精度档位的默认 walMode。
      */
     private WalMode walMode;
-
-    // ========== 路由字段 ==========
-
-    /**
-     * 分片键，用于路由到具体 Shard
-     */
-    private String shardKey;
-
-    /**
-     * 所属分片 ID
-     */
-    private String shardId;
 
     // ========== 回调字段 ==========
 
@@ -153,89 +238,31 @@ public class Intent {
         this.revision = 0L;
     }
 
-    private Intent(String traceId,
-                   String intentId,
-                   IntentStatus status,
-                   Instant createdAt,
-                   Instant updatedAt,
-                   Instant executeAt,
-                   Instant deadline,
-                   ExpiredAction expiredAction,
-                   PrecisionTier precisionTier,
-                   WalMode walMode,
-                   String shardKey,
-                   String shardId,
-                   Callback callback,
-                   RedeliveryPolicy redelivery,
-                   String idempotencyKey,
-                   Map<String, String> tags,
-                   int attempts,
-                   String lastDeliveryId,
-                   long revision) {
-        this.traceId = traceId != null ? traceId : generateTraceId();
-        this.intentId = Objects.requireNonNullElse(intentId, generateIntentId());
-        this.status = status != null ? status : IntentStatus.CREATED;
-        this.createdAt = createdAt != null ? createdAt : Instant.now();
-        this.updatedAt = updatedAt != null ? updatedAt : this.createdAt;
-        this.executeAt = executeAt;
-        this.deadline = deadline;
-        this.expiredAction = expiredAction != null ? expiredAction : ExpiredAction.DISCARD;
-        this.precisionTier = precisionTier != null ? precisionTier : defaultPrecisionTier();
-        this.walMode = walMode;
-        this.shardKey = shardKey;
-        this.shardId = shardId;
-        this.callback = callback;
-        this.redelivery = redelivery;
-        this.idempotencyKey = idempotencyKey;
-        this.tags = tags != null && !tags.isEmpty() ? Map.copyOf(tags) : null;
-        this.attempts = attempts;
-        this.lastDeliveryId = lastDeliveryId;
-        this.revision = Math.max(0L, revision);
+    private Intent(Snapshot s) {
+        this.traceId = s.traceId() != null ? s.traceId() : generateTraceId();
+        this.intentId = Objects.requireNonNullElse(s.intentId(), generateIntentId());
+        this.status = s.status() != null ? s.status() : IntentStatus.CREATED;
+        this.createdAt = s.createdAt() != null ? s.createdAt() : Instant.now();
+        this.updatedAt = s.updatedAt() != null ? s.updatedAt() : this.createdAt;
+        this.executeAt = s.executeAt();
+        this.deadline = s.deadline();
+        this.expiredAction = s.expiredAction() != null ? s.expiredAction() : ExpiredAction.DISCARD;
+        this.precisionTier = s.precisionTier() != null ? s.precisionTier() : defaultPrecisionTier();
+        this.walMode = s.walMode();
+        this.callback = s.callback();
+        this.redelivery = s.redelivery();
+        this.idempotencyKey = s.idempotencyKey();
+        this.tags = copyTags(s.tags());
+        this.attempts = s.attempts();
+        this.lastDeliveryId = s.lastDeliveryId();
+        this.revision = Math.max(0L, s.revision());
     }
 
     /**
      * 从持久化状态恢复 Intent。
      */
-    public static Intent restore(String traceId,
-                                 String intentId,
-                                 IntentStatus status,
-                                 Instant createdAt,
-                                 Instant updatedAt,
-                                 Instant executeAt,
-                                 Instant deadline,
-                                 ExpiredAction expiredAction,
-                                 PrecisionTier precisionTier,
-                                 WalMode walMode,
-                                 String shardKey,
-                                 String shardId,
-                                 Callback callback,
-                                 RedeliveryPolicy redelivery,
-                                 String idempotencyKey,
-                                 Map<String, String> tags,
-                                 int attempts,
-                                 String lastDeliveryId,
-                                 long revision) {
-        return new Intent(
-            traceId,
-            intentId,
-            status,
-            createdAt,
-            updatedAt,
-            executeAt,
-            deadline,
-            expiredAction,
-            precisionTier,
-            walMode,
-            shardKey,
-            shardId,
-            callback,
-            redelivery,
-            idempotencyKey,
-            tags,
-            attempts,
-            lastDeliveryId,
-            revision
-        );
+    public static Intent restore(Snapshot snapshot) {
+        return new Intent(snapshot);
     }
 
     /**
@@ -246,7 +273,15 @@ public class Intent {
      * --结算必须作用于 store 中的活对象。</p>
      */
     public Intent copy() {
-        return restore(
+        return restore(snapshotOfSelf());
+    }
+
+    /**
+     * 组装自身快照。callback/redelivery 的深拷贝在此执行（唯一深拷贝点），
+     * 与既有 copy() 行为一致；tags 保持引用，归一化拷贝由私有构造器统一做。
+     */
+    private Snapshot snapshotOfSelf() {
+        return new Snapshot(
             traceId,
             intentId,
             status,
@@ -257,8 +292,6 @@ public class Intent {
             expiredAction,
             precisionTier,
             walMode,
-            shardKey,
-            shardId,
             callback != null ? callback.copy() : null,
             redelivery != null ? redelivery.copy() : null,
             idempotencyKey,
@@ -283,6 +316,16 @@ public class Intent {
     }
 
     /**
+     * R21: 防御性拷贝(构造器与 setTags 共用本归一化)——内核不得持有用户可变引用:用户在 setTags 后
+     * 并发变异(写入 null 值/结构性修改)会让消费者快照 Map.copyOf 抛 NPE/CME,
+     * 杀死无监督的消费者 VT(固定 Thread[],投递容量永久减员 + permit 泄漏)。
+     * 非法输入(null key/value)在此边界即抛,而非在投递路径炸消费者。
+     */
+    private static Map<String, String> copyTags(Map<String, String> tags) {
+        return tags != null && !tags.isEmpty() ? Map.copyOf(tags) : null;
+    }
+
+    /**
      * 状态转换
      */
     public void transitionTo(IntentStatus newStatus) {
@@ -292,28 +335,31 @@ public class Intent {
     }
 
     /**
-     * 回滚状态（绕过状态机校验）。
+     * 还原易变状态对（status + updatedAt），绕过状态机校验。
      *
-     * <p>仅限命令服务在持久化失败时回滚内存状态，不应在正常业务路径使用。</p>
+     * <p>仅限 application.command 包命令服务在校验拒绝/持久化失败时回滚内存状态，
+     * 不应在正常业务路径或其他模块使用。revision 不在本入口还原——需要连同 revision
+     * 一起还原时使用三元组重载。</p>
      *
-     * @param oldStatus   要回滚到的状态
+     * @param oldStatus    要回滚到的状态
      * @param oldUpdatedAt 要恢复的 updatedAt 时间戳
      */
-    public void rollbackStatus(IntentStatus oldStatus, Instant oldUpdatedAt) {
+    public void rollbackVolatileState(IntentStatus oldStatus, Instant oldUpdatedAt) {
         this.status = oldStatus;
         this.updatedAt = oldUpdatedAt;
     }
 
     /**
-     * 回滚状态和修订号（绕过状态机校验）。
+     * 还原易变状态三元组（status + updatedAt + revision），绕过状态机校验。
      *
-     * <p>仅限命令服务在持久化失败时回滚内存状态，不应在正常业务路径使用。</p>
+     * <p>仅限 application.command 包命令服务在持久化失败时回滚内存状态
+     * （提交后失败不回滚磁盘的 C4-2/C4-3 语义不受影响——本方法只作用于内存态）。</p>
      *
      * @param oldStatus    要回滚到的状态
      * @param oldUpdatedAt 要恢复的 updatedAt 时间戳
      * @param oldRevision  要恢复的修订号
      */
-    public void rollbackStatus(IntentStatus oldStatus, Instant oldUpdatedAt, long oldRevision) {
+    public void rollbackVolatileState(IntentStatus oldStatus, Instant oldUpdatedAt, long oldRevision) {
         this.status = oldStatus;
         this.updatedAt = oldUpdatedAt;
         this.revision = oldRevision;
@@ -328,6 +374,17 @@ public class Intent {
      */
     public void rollbackRevision(long oldRevision) {
         this.revision = oldRevision;
+    }
+
+    /**
+     * 种子化修订号(用于重建 Intent 时把 revision 抬升到磁盘历史最高值之上)。
+     *
+     * <p>仅限命令服务在 {@code createIntent} 重建路径使用:同 intentId 终态后重建的新
+     * Intent 若从 0 起步,recovery 按 max revision 去重时会被旧终态墓碑(更高 revision)
+     * 遮蔽,新 Intent 静默丢失。重建前需把 revision 抬升到历史最高值之上。</p>
+     */
+    public void seedRevision(long revision) {
+        this.revision = revision;
     }
 
     /**
@@ -375,13 +432,6 @@ public class Intent {
     }
 
     /**
-     * 检查是否可以执行
-     */
-    public boolean isExecutable() {
-        return status == IntentStatus.DUE && !isExpired();
-    }
-
-    /**
      * 增加尝试次数
      */
     public void incrementAttempts() {
@@ -400,7 +450,14 @@ public class Intent {
     }
 
     /**
-     * 更新最后投递 ID
+     * 更新最后投递 ID。
+     *
+     * <p><b>预留字段——当前无生产写入者(C18-5,r19 记档)</b>:全库零调用方。槽格式通道
+     * 已就绪(SlotCodec TLV 0x0C 编解码对称)但编码端因字段恒 null 从不写出,反序列化值
+     * 恒为 null;{@code SettlementEngine.shouldRedeliver} 以 intentId 回退充当
+     * RedeliveryDecider 的 deliveryId 上下文。保留字段位与 TLV 标签以稳定槽格式;
+     * 接线(派发时生成 deliveryId,如 intentId:attempt)或删除(动槽格式,round 11
+     * shardKey 先例)均属产品决策,留给真实用户诉求驱动,内核内不得顺手处理。</p>
      */
     public void setLastDeliveryId(String deliveryId) {
         this.lastDeliveryId = deliveryId;
@@ -478,22 +535,15 @@ public class Intent {
         this.updatedAt = Instant.now();
     }
 
-    public String getShardKey() {
-        return shardKey;
-    }
-
-    public void setShardKey(String shardKey) {
-        this.shardKey = shardKey;
-    }
-
-    public String getShardId() {
-        return shardId;
-    }
-
-    public void setShardId(String shardId) {
-        this.shardId = shardId;
-    }
-
+    /**
+     * 返回内存态回调配置。注意:
+     * <ul>
+     *   <li><b>不持久化</b>:SlotCodec 无 callback TLV——重启/恢复/冷路径载入后恒为 null,
+     *       跨重启一致的回调数据需由 embedder 自行存储,或经全局 {@code CallbackHandler} SPI 携带。</li>
+     *   <li><b>内核不派发</b>:loomq-core 零 HTTP 依赖,不执行该 URL;它只是传给
+     *       {@code CallbackHandler.onIntentEvent(intent, ...)} 的 intent 元数据。</li>
+     * </ul>
+     */
     public Callback getCallback() {
         return callback;
     }
@@ -523,7 +573,7 @@ public class Intent {
     }
 
     public void setTags(Map<String, String> tags) {
-        this.tags = tags;
+        this.tags = copyTags(tags);
     }
 
     public int getAttempts() {

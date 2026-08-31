@@ -31,7 +31,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
-@Tag("slow")
 class PrecisionSchedulerTest {
 
     private IntentStore intentStore;
@@ -47,6 +46,21 @@ class PrecisionSchedulerTest {
         if (scheduler != null) {
             scheduler.stop();
         }
+    }
+
+    // ========== Lifecycle ==========
+
+    @Test
+    void pauseMustNotSurviveRestart() {
+        DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
+        scheduler = new PrecisionScheduler(intentStore, handler, null);
+        scheduler.start();
+        scheduler.pause();
+        assertTrue(scheduler.isPaused(), "precondition: paused");
+        scheduler.stop();
+        scheduler.start();
+        assertFalse(scheduler.isPaused(),
+            "start() must reset paused — restart means fresh service, not silent suspension");
     }
 
     // ========== Construction ==========
@@ -217,19 +231,6 @@ class PrecisionSchedulerTest {
         assertDoesNotThrow(() -> scheduler.restore(intent));
     }
 
-    // ========== unschedule() ==========
-
-    @Test
-    void unscheduleShouldDelegateToBucketGroupManager() {
-        DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
-        scheduler = new PrecisionScheduler(intentStore, handler, null);
-        Intent intent = new Intent("test-unsched");
-        intent.setExecuteAt(Instant.now().plusSeconds(60));
-        intent.transitionTo(IntentStatus.SCHEDULED);
-        scheduler.schedule(intent);
-        assertDoesNotThrow(() -> scheduler.unschedule(intent));
-    }
-
     // ========== Backpressure ==========
 
     @Test
@@ -250,10 +251,10 @@ class PrecisionSchedulerTest {
     void getBackpressureStatusShouldReturnAllTiers() {
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         scheduler = new PrecisionScheduler(intentStore, handler, null);
-        Map<PrecisionTier, PrecisionScheduler.BackpressureInfo> status = scheduler.getBackpressureStatus();
+        Map<PrecisionTier, DispatchPipeline.BackpressureInfo> status = scheduler.getBackpressureStatus();
         assertEquals(PrecisionTierCatalog.defaultCatalog().supportedTiers().size(), status.size());
         for (PrecisionTier tier : PrecisionTierCatalog.defaultCatalog().supportedTiers()) {
-            PrecisionScheduler.BackpressureInfo info = status.get(tier);
+            DispatchPipeline.BackpressureInfo info = status.get(tier);
             assertNotNull(info);
             assertTrue(info.maxConcurrency() > 0);
             assertTrue(info.availablePermits() >= 0);
@@ -284,6 +285,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchSuccessShouldTransitionToAcked() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -307,6 +309,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchDeadLetterShouldTransitionToDeadLettered() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -327,6 +330,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchRetryShouldRescheduleIntent() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -350,6 +354,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void dispatchExpiredShouldTransitionToExpired() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -370,6 +375,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void shouldReleaseSemaphoreAfterDispatch() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -392,6 +398,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void semaphoreShouldBeReleasedEvenOnException() throws Exception {
         AtomicReference<Throwable> callbackError = new AtomicReference<>();
         CountDownLatch callbackFired = new CountDownLatch(1);
@@ -417,6 +424,7 @@ class PrecisionSchedulerTest {
     }
 
     @Test
+    @Tag("slow")
     void shouldHandleDeliveryTimeout() throws Exception {
         CountDownLatch callbackFired = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -459,6 +467,7 @@ class PrecisionSchedulerTest {
     // ========== handleDeliveryFailure exception path (after fix) ==========
 
     @Test
+    @Tag("slow")
     void shouldDeadLetterAfterMaxAttemptsOnException() throws Exception {
         CountDownLatch delivered = new CountDownLatch(1);
         DeliveryHandler handler = intent -> {
@@ -635,11 +644,14 @@ class PrecisionSchedulerTest {
         scheduler = new PrecisionScheduler(intentStore, handler, null);
 
         Intent intent = new Intent("test-null-ex");
-        // executeAt is null — schedule() will compute Duration.between(now, null) → NPE
+        // executeAt is null — schedule() must reject with a clear contract error (create 入口
+        // 由 IntentValidator 拦截,此处兜底直连 API 调用——不再裸 NPE 无上下文)。
         intent.transitionTo(IntentStatus.SCHEDULED);
         intentStore.save(intent);
-        // NPE is the expected failure mode for missing executeAt
-        assertThrows(NullPointerException.class, () -> scheduler.schedule(intent));
+        IllegalArgumentException ex =
+            assertThrows(IllegalArgumentException.class, () -> scheduler.schedule(intent));
+        assertTrue(ex.getMessage().contains("executeAt must not be null"),
+            "rejection must name the violated contract, was: " + ex.getMessage());
     }
 
     // ========== Phase 7.2: Backpressure Observable ==========

@@ -243,7 +243,7 @@ class IntentStateTransitionTest {
         Instant executeAt = Instant.parse("2026-01-01T00:10:00Z");
         Instant deadline = Instant.parse("2026-01-01T00:20:00Z");
 
-        Intent restored = Intent.restore(
+        Intent restored = Intent.restore(new Intent.Snapshot(
             null,
             "intent-restore",
             IntentStatus.DELIVERED,
@@ -254,8 +254,6 @@ class IntentStateTransitionTest {
             ExpiredAction.DEAD_LETTER,
             PrecisionTier.FAST,
             null,
-            "shard-a",
-            "shard-1",
             null,
             null,
             "idem-123",
@@ -263,7 +261,7 @@ class IntentStateTransitionTest {
             3,
             "delivery-7",
             7L
-        );
+        ));
 
         assertEquals("intent-restore", restored.getIntentId());
         assertEquals(IntentStatus.DELIVERED, restored.getStatus());
@@ -273,8 +271,6 @@ class IntentStateTransitionTest {
         assertEquals(deadline, restored.getDeadline());
         assertEquals(ExpiredAction.DEAD_LETTER, restored.getExpiredAction());
         assertEquals(PrecisionTier.FAST, restored.getPrecisionTier());
-        assertEquals("shard-a", restored.getShardKey());
-        assertEquals("shard-1", restored.getShardId());
         assertEquals("idem-123", restored.getIdempotencyKey());
         assertEquals(Map.of("team", "core"), restored.getTags());
         assertEquals(3, restored.getAttempts());
@@ -284,20 +280,19 @@ class IntentStateTransitionTest {
 
     @Test
     void shouldRestoreAckedIntentAsTerminal() {
-        Intent restored = Intent.restore(
+        Intent restored = Intent.restore(new Intent.Snapshot(
             null,
             "intent-acked", IntentStatus.ACKED,
             Instant.now(), Instant.now(), Instant.now(), null,
             ExpiredAction.DISCARD, PrecisionTier.FAST, null,
-            "s", "s1",
             null, null, null, Map.of(), 1, null, 2L
-        );
+        ));
         assertEquals(IntentStatus.ACKED, restored.getStatus());
         assertEquals(2L, restored.getRevision());
         assertThrows(IllegalStateException.class, () -> restored.transitionTo(IntentStatus.DUE));
     }
 
-    // ========== rollbackStatus ==========
+    // ========== rollbackVolatileState ==========
 
     @Test
     void shouldRollbackFromCanceledToScheduled() {
@@ -310,7 +305,7 @@ class IntentStateTransitionTest {
         assertEquals(IntentStatus.CANCELED, intent.getStatus());
 
         // 回滚
-        intent.rollbackStatus(IntentStatus.SCHEDULED, originalUpdatedAt);
+        intent.rollbackVolatileState(IntentStatus.SCHEDULED, originalUpdatedAt);
         assertEquals(IntentStatus.SCHEDULED, intent.getStatus());
         assertEquals(originalUpdatedAt, intent.getUpdatedAt());
     }
@@ -325,7 +320,7 @@ class IntentStateTransitionTest {
         intent.transitionTo(IntentStatus.CANCELED);
         assertEquals(IntentStatus.CANCELED, intent.getStatus());
 
-        intent.rollbackStatus(IntentStatus.DUE, originalUpdatedAt);
+        intent.rollbackVolatileState(IntentStatus.DUE, originalUpdatedAt);
         assertEquals(IntentStatus.DUE, intent.getStatus());
     }
 
@@ -336,7 +331,7 @@ class IntentStateTransitionTest {
         Instant originalUpdatedAt = intent.getUpdatedAt();
 
         intent.transitionTo(IntentStatus.CANCELED);
-        intent.rollbackStatus(IntentStatus.SCHEDULED, originalUpdatedAt);
+        intent.rollbackVolatileState(IntentStatus.SCHEDULED, originalUpdatedAt);
 
         // 回滚后应能正常进行状态转换
         assertDoesNotThrow(() -> intent.transitionTo(IntentStatus.DUE));

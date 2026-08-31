@@ -7,7 +7,7 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Per-intent trace store for observability.
  *
- * Stores the last N intent traces (default 100K) with LRU eviction.
+ * Stores the last N intent traces (default 100K) with FIFO eviction.
  * Used for real-time debugging: "why did intent X take so long?"
  */
 public final class IntentTraceStore {
@@ -23,17 +23,34 @@ public final class IntentTraceStore {
     public IntentTraceStore(int maxSize) {
         this.maxSize = maxSize;
         this.traces = new ConcurrentHashMap<>();
-        this.evictionQueue = new EvictionQueue();
+        // 队列容量必须大于 maxSize，避免在未达到淘汰阈值前发生环形覆盖。
+        this.evictionQueue = new EvictionQueue(Math.max(maxSize + 10_000, 1));
     }
 
     /**
-     * Record intent creation.
+     * 仅当 trace 缺失或 createdAt 不匹配时记录创建(幂等)。
+     *
+     * <p>收敛 createIntent/批量 create/schedule 三处复制的守卫(R21 语义:同 id 重建是
+     * 新 incarnation,旧 trace 不得继承);recordCreated 整体替换 trace,误调会清空投递历史。</p>
      */
-    public void recordCreated(String intentId, String traceId, PrecisionTier tier) {
-        long nowMs = System.currentTimeMillis();
+    public void recordCreatedIfNew(String intentId, String traceId, PrecisionTier tier, long createdAtMs) {
+        IntentTrace existing = traces.get(intentId);
+        if (existing == null || existing.createdAtMs() != createdAtMs) {
+            recordCreated(intentId, traceId, tier, createdAtMs);
+        }
+    }
+
+    /**
+     * Record intent creation with the intent's own createdAt.
+     *
+     * <p>R21: 同 id 重建(R8 支持路径)是新 incarnation——调度器据此比较 trace 的
+     * createdAt 与 intent 的 createdAt,不匹配即刷新 trace,避免新 intent 继承旧
+     * createdAt/status(如 ACKED)导致 lag 归因全错。</p>
+     */
+    public void recordCreated(String intentId, String traceId, PrecisionTier tier, long createdAtMs) {
         IntentTrace trace = new IntentTrace(
             intentId, traceId, tier, IntentStatus.CREATED,
-            nowMs, 0, 0, 0, 0,
+            createdAtMs, 0, 0, 0, 0,
             0, 0, 0, 0,
             null, null
         );
@@ -93,27 +110,6 @@ public final class IntentTraceStore {
         return traces.get(intentId);
     }
 
-    /**
-     * Check if trace exists.
-     */
-    public boolean contains(String intentId) {
-        return traces.containsKey(intentId);
-    }
-
-    /**
-     * Remove trace by intent ID (for test cleanup).
-     */
-    public void remove(String intentId) {
-        traces.remove(intentId);
-    }
-
-    /**
-     * Get current size.
-     */
-    public int size() {
-        return traces.size();
-    }
-
     private void put(String intentId, IntentTrace trace) {
         IntentTrace existing = traces.put(intentId, trace);
         if (existing == null) {
@@ -142,8 +138,8 @@ public final class IntentTraceStore {
         private int tail = 0;
         private final Object lock = new Object();
 
-        EvictionQueue() {
-            this.buffer = new String[110_000]; // Slightly larger than maxSize
+        EvictionQueue(int capacity) {
+            this.buffer = new String[capacity];
         }
 
         void add(String intentId) {

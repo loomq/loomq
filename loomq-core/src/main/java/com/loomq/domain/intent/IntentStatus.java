@@ -6,21 +6,27 @@ package com.loomq.domain.intent;
  * 状态流转：
  * CREATED → SCHEDULED ─────────────────► CANCELED
  *              │
- *              ▼
- *            DUE
- *              │
- *              ▼
- *         DISPATCHING
- *              │
- *              ├─────────────────────► DEAD_LETTERED (达到 maxAttempts)
- *              │
+ *              ├─────────────────────► EXPIRED (超过 deadline)
+ *              ├─────────────────────► DEAD_LETTERED ◄────────┐
+ *              ▼                                              │ revive
+ *            DUE ──┬─────────────────────► CANCELED           │
+ *              │   ├─────────────────────► EXPIRED             │
+ *              │   └─────────────────────► DEAD_LETTERED ──────┤
+ *              ▼                                               │
+ *         DISPATCHING ─┬─► DELIVERED                           │
+ *              │       ├─► SCHEDULED (RETRY 重试退避后重排) ───┤
+ *              │       ├─► EXPIRED                             │
+ *              │       └─► DEAD_LETTERED ──────────────────────┘
  *              ▼
  *          DELIVERED
  *              │
  *              ├─────────────────────► EXPIRED (超过 deadline)
- *              │
  *              ▼
  *            ACKED
+ *
+ * 本图为可读性投影(简化图);唯一权威是 {@code Intent.validateTransition}
+ * (含 DEAD_LETTERED→SCHEDULED revive 与全部终态入口)。图与 switch 不一致时
+ * 以 switch 为准,修图不改 switch。
  *
  * 状态说明：
  * - CREATED: 初始状态（瞬时）
@@ -97,40 +103,5 @@ public enum IntentStatus {
      */
     public boolean isTerminal() {
         return terminal;
-    }
-
-    /**
-     * 判断是否可取消
-     */
-    public boolean isCancellable() {
-        return this == SCHEDULED || this == DUE;
-    }
-
-    /**
-     * 判断是否可修改
-     */
-    public boolean isModifiable() {
-        return !terminal && this != DELIVERED && this != ACKED;
-    }
-
-    /**
-     * 判断是否需要投递
-     */
-    public boolean needsDispatch() {
-        return this == DUE || this == DELIVERED;
-    }
-
-    /**
-     * 判断是否允许重投
-     */
-    public boolean allowsRedelivery() {
-        return this == DELIVERED;
-    }
-
-    /**
-     * 判断是否已过期处理
-     */
-    public boolean isExpiredOrDeadLetter() {
-        return this == EXPIRED || this == DEAD_LETTERED;
     }
 }

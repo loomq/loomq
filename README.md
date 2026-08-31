@@ -18,7 +18,7 @@
 - **持久化内核，重启不丢** — 基于 PHTW（持久化分层时间轮：4 层 mmap 时间轮 + TailIndex）落盘，**无 WAL、无快照**，重启扫描重建。
 - **四档精度** — `MILLI`(1ms) / `ULTRA`(10ms) / `FAST`(50ms) / `STANDARD`(500ms)，按需取舍吞吐与触发精度。
 - **冷 / 热分层** — 60 分钟热窗口驻留内存；更远的冷 Intent 只落盘、不占内存，靠 `PromotionDaemon` 提前唤醒。
-- **虚拟线程并发** — 全部基于 Virtual Threads，无传统线程池调参。
+- **虚拟线程并发** — 消费者/操作执行基于 Virtual Threads，无传统线程池调参；扫描/回收 daemon 为平台线程。
 - **崩溃恢复** — `WheelRecovery` 扫描重建，终态不补投，避免对下游产生过时事件。
 - **重试编排 + 死信 + 过期处理** — 内置重投退避、`DEAD_LETTER`、`EXPIRED` 分支。
 - **SPI 扩展点** — `DeliveryHandler` / `CallbackHandler` / `IntentObserver` / `RedeliveryDecider`，内核不内置任何投递机制。
@@ -113,7 +113,7 @@ flowchart LR
 | `FAST` | 50 ms | 固定轮询 | 150 | 12 | 2400 | DURABLE |
 | `STANDARD` | 500 ms | 固定轮询 | 50 | 3 | 800 | DURABLE |
 
-`MILLI` / `ULTRA` 走事件驱动扫描 + 信号驱动消费，空闲 CPU 不劣化；`FAST` / `STANDARD` 走固定轮询 + 批量消费，吞吐优先。
+`MILLI` / `ULTRA` 走事件驱动扫描 + 信号驱动消费，空闲 CPU 不劣化；`FAST` 走固定轮询 + 单发消费（batchSize=1），`STANDARD` 走固定轮询 + 批量消费，吞吐优先。
 
 ---
 
@@ -153,16 +153,20 @@ flowchart LR
 
 > MILLI / STANDARD 的数值受其档位配置（MILLI 直接入桶 + cohort 降级、STANDARD 批量窗口 100ms）约束，偏高延迟与低吞吐反映持续负载下的档位取舍，非引擎全局瓶颈。ULTRA 是持续稳态吞吐甜点（~30k QPS）。
 
-**WSL (Ubuntu, 原生 ext4)** · 22 核 · openjdk 25.0.4
+**WSL (Ubuntu, 原生 ext4)** · Linux 6.6.87.2 (WSL2) · 22 核 · openjdk 25.0.4 · commit `f287621`
 
-> 待在新方法（持续稳态闭环）下重测。下表为早期突发峰值方法的历史数据，仅作参考，不可与上表直接对比。
+| 创建吞吐 | 单发 | 批量 |
+|---------|------:|-----:|
+| **QPS (median)** | 54,218 | 54,981 |
 
-| 档位 | QPS | e2e p50/p99 | 触发精度 p50/p99/p999 |
-|------|----:|-------------|----------------------|
-| MILLI | 119,048 | 3 / 6 ms | 0 / 1 / 1 ms |
-| ULTRA | 192,308 | 2 / 3 ms | 0 / 1 / 1 ms |
-| FAST | 26,316 | 13 / 29 ms | 10 / 25 / 25 ms |
-| STANDARD | 2,024 | 138 / 481 ms | 100 / 250 / 250 ms |
+| 档位 | QPS (median) | wake p50/p99 | e2e p50/p99 | 触发精度 p50/p99/p999 |
+|------|----:|-------------|-------------|----------------------|
+| MILLI | 21,641 | 0 / 1 ms | 1 / 4 ms | 0 / 1 / 1 ms |
+| ULTRA | 17,595 | 5 / 10 ms | 8 / 13 ms | 0 / 1 / 10 ms |
+| FAST | 2,994 | 25 / 25 ms | 47 / 49 ms | 10 / 25 / 25 ms |
+| STANDARD | 100 | 250 / 250 ms | 496 / 499 ms | 100 / 250 / 250 ms |
+
+> 同方法两轮实测中位数差异 <1%（创建 54.2k vs 54.7k、ULTRA 17.6k vs 17.5k，延迟与精度逐位一致）。STANDARD 的数值受其档位配置（批量窗口 100ms）约束，偏高延迟与低吞吐反映持续负载下的档位取舍，非引擎全局瓶颈；WSL 上 MILLI / ULTRA 均达持续稳态万级 QPS。
 
 ---
 
@@ -172,7 +176,7 @@ LoomQ 内核**不**负责以下职责，它们留给上层 shell（如未来的 
 
 - 不内置 HTTP / gRPC 传输层。
 - 不做集群复制、leader 选举、租约与 fencing。
-- 冷 Intent（超过 60min 热窗口）支持**取消**，但暂不支持冷改期 / 冷 fireNow。
+- 冷 Intent（超过 60min 热窗口）支持**取消**、**改期**与 **fireNow**（`updateIntent`/`fireNow`，round 13/14）。
 - 单节点内核定位；`REPLICATED` 为多副本能力预留。
 
 ---
@@ -181,7 +185,7 @@ LoomQ 内核**不**负责以下职责，它们留给上层 shell（如未来的 
 
 - **loomqex shell** — HTTP / gRPC 传输层 + 集群复制 + 租约 / 选举。
 - **REPLICATED 落地** — 真正的多副本确认。
-- **冷操作补全** — 冷改期 / 冷 fireNow。
+- **冷操作补全（已完成 round 13/14）** — 冷取消/冷改期/冷 fireNow。
 - **SlotCodec 改按 name 持久化** — 解除枚举 ordinal 耦合（当前新增档位必须追加到枚举末尾）。
 
 ---

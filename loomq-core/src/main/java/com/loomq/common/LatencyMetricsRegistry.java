@@ -1,130 +1,48 @@
 package com.loomq.common;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
-
 /**
  * 通用延迟指标注册表。
  *
- * 负责触发、唤醒、webhook 和端到端延迟的分桶、P95 近似计算与 Prometheus 导出。
+ * <p>round 12 起仅承载两条活链路(finalize 结算耗时、cohort flush 耗时),直方图/分位
+ * 实现统一走 {@link Histogram};trigger/wake/total 三组零调用直方图已删除。
+ * 名为 webhook 的历史直方图更名 finalize——其唯一写点是结算任务的 finally
+ * (SettlementEngine),统计的是单次结算全程耗时(状态转换 + awaitCommit 等待),非 webhook 执行。</p>
  */
 final class LatencyMetricsRegistry {
 
-    private static final int[] LATENCY_BOUNDS = {0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+    // finalize 结算全程耗时,毫秒;写点 SettlementEngine.runFinalizeTask finally
+    private static final int[] FINALIZE_BOUNDS = {0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+    private final Histogram finalizeDuration = new Histogram(FINALIZE_BOUNDS);
 
-    private final ConcurrentHashMap<Integer, AtomicLong> triggerLatencyBuckets = new ConcurrentHashMap<>();
-    private final AtomicLong triggerLatencySampleCount = new AtomicLong(0);
-
-    private final ConcurrentHashMap<Integer, AtomicLong> wakeLatencyBuckets = new ConcurrentHashMap<>();
-    private final AtomicLong wakeLatencySampleCount = new AtomicLong(0);
-
-    private final ConcurrentHashMap<Integer, AtomicLong> webhookLatencyBuckets = new ConcurrentHashMap<>();
-    private final AtomicLong webhookLatencySampleCount = new AtomicLong(0);
-
-    private final ConcurrentHashMap<Integer, AtomicLong> totalLatencyBuckets = new ConcurrentHashMap<>();
-    private final AtomicLong totalLatencySampleCount = new AtomicLong(0);
-
-    // Cohort flush 耗时 histogram（微秒）
+    // Cohort flush 耗时(微秒);写点 CohortManager wakeLoop flush
     private static final int[] COHORT_FLUSH_BOUNDS = {0, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000};
-    private final ConcurrentHashMap<Integer, AtomicLong> cohortFlushBuckets = new ConcurrentHashMap<>();
-    private final AtomicLong cohortFlushSampleCount = new AtomicLong(0);
+    private final Histogram cohortFlushDuration = new Histogram(COHORT_FLUSH_BOUNDS);
 
-    LatencyMetricsRegistry() {
-        for (int i = 0; i < LATENCY_BOUNDS.length; i++) {
-            triggerLatencyBuckets.put(i, new AtomicLong(0));
-            wakeLatencyBuckets.put(i, new AtomicLong(0));
-            webhookLatencyBuckets.put(i, new AtomicLong(0));
-            totalLatencyBuckets.put(i, new AtomicLong(0));
-        }
-        for (int i = 0; i < COHORT_FLUSH_BOUNDS.length; i++) {
-            cohortFlushBuckets.put(i, new AtomicLong(0));
-        }
-    }
-
-    void recordTriggerLatency(long latencyMs) {
-        triggerLatencySampleCount.incrementAndGet();
-        triggerLatencyBuckets.get(findBucket(latencyMs)).incrementAndGet();
-    }
-
-    void recordWakeLatency(long latencyMs) {
-        wakeLatencySampleCount.incrementAndGet();
-        wakeLatencyBuckets.get(findBucket(latencyMs)).incrementAndGet();
-    }
-
-    void recordWebhookLatency(long latencyMs) {
-        webhookLatencySampleCount.incrementAndGet();
-        webhookLatencyBuckets.get(findBucket(latencyMs)).incrementAndGet();
-    }
-
-    void recordTotalLatency(long latencyMs) {
-        totalLatencySampleCount.incrementAndGet();
-        totalLatencyBuckets.get(findBucket(latencyMs)).incrementAndGet();
+    void recordFinalizeDuration(long durationMs) {
+        finalizeDuration.record(durationMs);
     }
 
     void recordCohortFlushDuration(long durationUs) {
-        cohortFlushSampleCount.incrementAndGet();
-        cohortFlushBuckets.get(findCohortFlushBucket(durationUs)).incrementAndGet();
+        cohortFlushDuration.record(durationUs);
     }
 
-    long calculateP95Latency() {
-        return calculateP95(triggerLatencyBuckets, triggerLatencySampleCount.get());
-    }
-
-    long calculateP95WakeLatency() {
-        return calculateP95(wakeLatencyBuckets, wakeLatencySampleCount.get());
-    }
-
-    long calculateP95WebhookLatency() {
-        return calculateP95(webhookLatencyBuckets, webhookLatencySampleCount.get());
-    }
-
-    long calculateP95TotalLatency() {
-        return calculateP95(totalLatencyBuckets, totalLatencySampleCount.get());
+    long calculateP95FinalizeDuration() {
+        return finalizeDuration.percentile(0.95);
     }
 
     long calculateP95CohortFlushDuration() {
-        return calculatePercentile(cohortFlushBuckets, cohortFlushSampleCount.get(), 0.95, COHORT_FLUSH_BOUNDS);
+        return cohortFlushDuration.percentile(0.95);
     }
 
     void appendPrometheusMetrics(StringBuilder sb) {
-        sb.append("# HELP loomq_trigger_latency_ms_p95 P95 trigger latency in milliseconds\n");
-        sb.append("# TYPE loomq_trigger_latency_ms_p95 gauge\n");
-        sb.append(formatMetric("loomq_trigger_latency_ms_p95", calculateP95Latency()));
+        sb.append("# HELP loomq_finalize_duration_ms_p95 P95 finalize duration in milliseconds (state transition + durable persist wait, per settlement task)\n");
+        sb.append("# TYPE loomq_finalize_duration_ms_p95 gauge\n");
+        sb.append(formatMetric("loomq_finalize_duration_ms_p95", calculateP95FinalizeDuration()));
         sb.append("\n");
 
-        sb.append("# HELP loomq_trigger_latency_samples Total trigger latency samples\n");
-        sb.append("# TYPE loomq_trigger_latency_samples counter\n");
-        sb.append(formatMetric("loomq_trigger_latency_samples", triggerLatencySampleCount.get()));
-        sb.append("\n");
-
-        sb.append("# HELP loomq_wake_latency_ms_p95 P95 wake latency (sleep end to dispatch start) - internal scheduling precision\n");
-        sb.append("# TYPE loomq_wake_latency_ms_p95 gauge\n");
-        sb.append(formatMetric("loomq_wake_latency_ms_p95", calculateP95WakeLatency()));
-        sb.append("\n");
-
-        sb.append("# HELP loomq_wake_latency_samples Total wake latency samples\n");
-        sb.append("# TYPE loomq_wake_latency_samples counter\n");
-        sb.append(formatMetric("loomq_wake_latency_samples", wakeLatencySampleCount.get()));
-        sb.append("\n");
-
-        sb.append("# HELP loomq_webhook_latency_ms_p95 P95 webhook execution latency (request to response)\n");
-        sb.append("# TYPE loomq_webhook_latency_ms_p95 gauge\n");
-        sb.append(formatMetric("loomq_webhook_latency_ms_p95", calculateP95WebhookLatency()));
-        sb.append("\n");
-
-        sb.append("# HELP loomq_webhook_latency_samples Total webhook latency samples\n");
-        sb.append("# TYPE loomq_webhook_latency_samples counter\n");
-        sb.append(formatMetric("loomq_webhook_latency_samples", webhookLatencySampleCount.get()));
-        sb.append("\n");
-
-        sb.append("# HELP loomq_total_latency_ms_p95 P95 end-to-end latency (scheduled time to webhook complete) - user visible\n");
-        sb.append("# TYPE loomq_total_latency_ms_p95 gauge\n");
-        sb.append(formatMetric("loomq_total_latency_ms_p95", calculateP95TotalLatency()));
-        sb.append("\n");
-
-        sb.append("# HELP loomq_total_latency_samples Total end-to-end latency samples\n");
-        sb.append("# TYPE loomq_total_latency_samples counter\n");
-        sb.append(formatMetric("loomq_total_latency_samples", totalLatencySampleCount.get()));
+        sb.append("# HELP loomq_finalize_duration_samples Total finalize duration samples\n");
+        sb.append("# TYPE loomq_finalize_duration_samples counter\n");
+        sb.append(formatMetric("loomq_finalize_duration_samples", finalizeDuration.sampleCount()));
         sb.append("\n");
 
         sb.append("# HELP loomq_cohort_flush_duration_us_p95 P95 cohort flush duration in microseconds\n");
@@ -134,60 +52,11 @@ final class LatencyMetricsRegistry {
 
         sb.append("# HELP loomq_cohort_flush_samples Total cohort flush samples\n");
         sb.append("# TYPE loomq_cohort_flush_samples counter\n");
-        sb.append(formatMetric("loomq_cohort_flush_samples", cohortFlushSampleCount.get()));
+        sb.append(formatMetric("loomq_cohort_flush_samples", cohortFlushDuration.sampleCount()));
         sb.append("\n");
     }
 
     private String formatMetric(String name, long value) {
         return name + " " + value + "\n";
-    }
-
-    private int findBucket(long latencyMs) {
-        for (int i = LATENCY_BOUNDS.length - 1; i >= 0; i--) {
-            if (latencyMs >= LATENCY_BOUNDS[i]) {
-                return i;
-            }
-        }
-        return 0;
-    }
-
-    private int findCohortFlushBucket(long durationUs) {
-        for (int i = COHORT_FLUSH_BOUNDS.length - 1; i >= 0; i--) {
-            if (durationUs >= COHORT_FLUSH_BOUNDS[i]) {
-                return i;
-            }
-        }
-        return 0;
-    }
-
-    private long calculateP95(ConcurrentHashMap<Integer, AtomicLong> buckets, long totalSamples) {
-        return calculatePercentile(buckets, totalSamples, 0.95);
-    }
-
-    private long calculatePercentile(ConcurrentHashMap<Integer, AtomicLong> buckets,
-                                     long totalSamples,
-                                     double percentile) {
-        return calculatePercentile(buckets, totalSamples, percentile, LATENCY_BOUNDS);
-    }
-
-    private long calculatePercentile(ConcurrentHashMap<Integer, AtomicLong> buckets,
-                                     long totalSamples,
-                                     double percentile,
-                                     int[] bounds) {
-        if (totalSamples == 0) {
-            return 0;
-        }
-
-        long target = (long) Math.ceil(totalSamples * percentile);
-        long cumulative = 0;
-
-        for (int i = 0; i < bounds.length; i++) {
-            cumulative += buckets.get(i).get();
-            if (cumulative >= target) {
-                return bounds[i];
-            }
-        }
-
-        return bounds[bounds.length - 1];
     }
 }

@@ -11,17 +11,6 @@ public final class ConfigSupport {
     private ConfigSupport() {
     }
 
-    public static Properties merge(Properties base, Properties overrides) {
-        Properties merged = new Properties();
-        if (base != null) {
-            merged.putAll(base);
-        }
-        if (overrides != null) {
-            merged.putAll(overrides);
-        }
-        return merged;
-    }
-
     public static String firstNonBlank(Properties props, String... keys) {
         if (props == null || keys == null) {
             return null;

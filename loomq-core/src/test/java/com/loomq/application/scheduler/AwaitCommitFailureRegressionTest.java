@@ -2,12 +2,14 @@ package com.loomq.application.scheduler;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.loomq.common.MetricsCollector;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.IntentStatus;
 import com.loomq.spi.DeliveryHandler;
 import com.loomq.spi.DeliveryHandler.DeliveryResult;
 import com.loomq.spi.IntentObserver;
 import com.loomq.store.ConcurrentIntentStore;
+import com.loomq.tracing.IntentTraceStore;
 import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -16,7 +18,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * Issue B 残留死锁路径回归:awaitStateChangeCommit 失败(慢盘双超时)不得吞 onDelivered / 泄漏槽位。
+ * Issue B 残留死锁路径回归:awaitCommit 失败(慢盘双超时)不得吞 onDelivered / 泄漏槽位。
  *
  * <p>I6 只包住了非阻塞 put(persist/persistTerminalInPlace);若锁外的 awaitCommit 抛异常,
  * reclaimTerminal 与 notifyObservers 会被跳过 → 复现 Issue B 死锁症状。本测试断言 awaitCommit
@@ -25,6 +27,7 @@ import org.junit.jupiter.api.Test;
 class AwaitCommitFailureRegressionTest {
 
     private PrecisionScheduler scheduler;
+    private MetricsCollector metrics;
     private ConcurrentIntentStore intentStore;
 
     @AfterEach
@@ -38,10 +41,11 @@ class AwaitCommitFailureRegressionTest {
 
         DeliveryHandler handler = intent -> CompletableFuture.completedFuture(DeliveryResult.SUCCESS);
         intentStore = new ConcurrentIntentStore();
-        scheduler = new PrecisionScheduler(intentStore, handler, null);
+        metrics = new MetricsCollector();
+        scheduler = new PrecisionScheduler(intentStore, handler, null, null, metrics, new IntentTraceStore());
 
         // 注入 awaitCommit 恒抛的 sink(模拟慢盘双超时)。
-        scheduler.setStateChangeSink(new PrecisionScheduler.StateChangeSink() {
+        scheduler.setStateChangeSink(new StateChangeSink() {
             @Override public void persist(Intent intent) {}
             @Override public void persistTerminalInPlace(Intent intent) {}
             @Override public void awaitCommit() {
@@ -67,6 +71,6 @@ class AwaitCommitFailureRegressionTest {
 
         assertTrue(onDelivered.await(5, TimeUnit.SECONDS),
             "awaitCommit 失败时 onDelivered 必须仍触发(否则槽位泄漏死锁)");
-        assertTrue(scheduler.getPersistFailures() >= 1, "应记录持久化失败(persistFailures>=1)");
+        assertTrue(metrics.getPersistFailuresTotal() >= 1, "应记录持久化失败(persistFailures>=1)");
     }
 }

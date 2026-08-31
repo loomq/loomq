@@ -2,12 +2,12 @@ package com.loomq;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 import com.loomq.domain.intent.AckMode;
 import com.loomq.domain.intent.Intent;
 import com.loomq.domain.intent.PrecisionTier;
 import com.loomq.spi.DeliveryHandler;
+import com.loomq.testutil.TestEngines;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -21,7 +21,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * P1-2 认领窗口端到端测试：投递在途期间 fireNow/updateIntent 不得引发第二次投递。
+ * scanDue CAS 认领协议的认领窗口端到端测试：投递在途期间
+ * fireNow/updateIntent 不得引发第二次投递。
  *
  * <p>确定性设计：等 GateHandler 被调用即意味着 scanDue 的 CAS 已消耗索引（认领完成、
  * 投递在途），此时再调 fireNow/updateIntent 必然走认领分支。之后手动完成投递 Future，
@@ -71,7 +72,7 @@ class ClaimedInFlightRaceTest {
             assertTrue(engine.fireNow(id), "fireNow should succeed (in-flight serves as fire-now)");
 
             handler.outcome.complete(DeliveryHandler.DeliveryResult.SUCCESS);
-            awaitTerminal(engine, id, Duration.ofSeconds(10));
+            TestEngines.awaitTerminal(engine, id, Duration.ofSeconds(10));
             Thread.sleep(1500);  // 跨过至少 2 个 STANDARD 扫描周期
 
             assertEquals(1, handler.calls.get(), "claimed intent must be delivered exactly once");
@@ -103,7 +104,7 @@ class ClaimedInFlightRaceTest {
             assertTrue(updated.isPresent(), "update accepted (claimed path)");
 
             handler.outcome.complete(DeliveryHandler.DeliveryResult.SUCCESS);
-            awaitTerminal(engine, id, Duration.ofSeconds(10));
+            TestEngines.awaitTerminal(engine, id, Duration.ofSeconds(10));
             Thread.sleep(1500);
 
             assertEquals(1, handler.calls.get(), "claimed intent must be delivered exactly once");
@@ -112,15 +113,4 @@ class ClaimedInFlightRaceTest {
         Thread.sleep(200);
     }
 
-    private void awaitTerminal(LoomqEngine engine, String id, Duration timeout) throws InterruptedException {
-        long deadline = System.nanoTime() + timeout.toNanos();
-        while (System.nanoTime() < deadline) {
-            Optional<Intent> cur = engine.getIntent(id);
-            if (cur.isPresent() && cur.get().getStatus().isTerminal()) {
-                return;
-            }
-            Thread.sleep(20);
-        }
-        fail("intent " + id + " did not reach terminal state within " + timeout);
-    }
 }
